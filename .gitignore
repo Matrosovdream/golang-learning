@@ -1,0 +1,25 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+/go-project/**/main
+# Test binary, built with `go test -c`
+*.test
+# Output of `go tool cover`
+*.out
+coverage.*
+# Go workspace file
+go.work
+go.work.sum
+# Dependency vendor dir (uncomment if you don't vendor)
+# vendor/
+# Env / secrets
+.env
+*.local
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
