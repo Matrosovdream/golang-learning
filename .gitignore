@@ -23,3 +23,5 @@ go.work.sum
 .idea/
 .vscode/*
 !.vscode/extensions.json
+/practice
+/learning-plan/PROGRESS.MD
