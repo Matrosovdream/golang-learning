@@ -1,16 +1,19 @@
 # Step 12 — Errors & Error Handling · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. error is just an interface**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. error is just an interface
 - [ ] 2. errors.New for a simple error
 - [ ] 3. (result, error) + early return
 - [ ] 4. nil error means success
 - [ ] 5. fmt.Errorf for a formatted error
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 6. Sentinel errors + errors.Is
 - [ ] 7. errors.New values are distinct
 - [ ] 8. Wrapping with %w
@@ -23,7 +26,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 15. errors.As with a standard library error
 - [ ] 16. Error message style and composition
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 17. errors.Join combines multiple errors
 - [ ] 18. errors.Is on a joined error
 - [ ] 19. errors.As through a wrap chain

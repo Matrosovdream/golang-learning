@@ -1,16 +1,19 @@
 # Step 06 — Functions · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. Declaring and calling a function**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. Declaring and calling a function
 - [ ] 2. Same-type parameter shorthand
 - [ ] 3. Multiple return values
 - [ ] 4. The (value, error) idiom
 - [ ] 5. Named return values + naked return
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 6. Variadic functions
 - [ ] 7. Spreading a slice into a variadic
 - [ ] 8. Functions are values
@@ -20,7 +23,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 12. Anonymous functions & IIFE
 - [ ] 13. Recursion
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 14. Closures over the loop variable (Go 1.22+)
 - [ ] 15. defer + panic + recover → error
 - [ ] 16. Higher-order map and filter

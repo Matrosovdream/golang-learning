@@ -25,3 +25,4 @@ go.work.sum
 !.vscode/extensions.json
 /practice
 /learning-plan/PROGRESS.MD
+/tmp

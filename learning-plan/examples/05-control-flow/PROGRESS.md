@@ -1,9 +1,12 @@
 # Step 05 — Control Flow · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. if / else if / else**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. if / else if / else
 - [ ] 2. if with an init statement
 - [ ] 3. The three-part for loop
@@ -11,7 +14,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 5. for range over a slice
 - [ ] 6. Infinite loop with break
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 7. continue skips an iteration
 - [ ] 8. range over a map (sort for order)
 - [ ] 9. range over a string decodes UTF-8
@@ -21,7 +24,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 13. Multiple values in one case
 - [ ] 14. switch with an init statement
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 15. Type switch over any
 - [ ] 16. fallthrough
 - [ ] 17. Labeled break / continue

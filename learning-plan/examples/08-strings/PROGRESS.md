@@ -1,16 +1,19 @@
 # Step 08 — Strings, Runes, Bytes & Formatting · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. len is bytes; indexing gives a byte**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. len is bytes; indexing gives a byte
 - [ ] 2. Strings are immutable
 - [ ] 3. Concatenation and comparison
 - [ ] 4. Raw vs interpreted string literals
 - [ ] 5. Iterating bytes by index
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 6. Byte length vs rune count
 - [ ] 7. range decodes UTF-8
 - [ ] 8. string <-> []byte
@@ -26,7 +29,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 18. strconv: Quote / Unquote
 - [ ] 19. unicode: classifying runes
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 20. fmt: %v, %+v, %#v, %T
 - [ ] 21. fmt: integer verbs
 - [ ] 22. fmt: float verbs

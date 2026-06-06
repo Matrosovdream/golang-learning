@@ -1,16 +1,19 @@
 # Step 13 — Goroutines · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. Start a goroutine and wait for it**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. Start a goroutine and wait for it
 - [ ] 2. Why main must wait
 - [ ] 3. Many goroutines, results in an indexed slice
 - [ ] 4. Loop-variable capture (Go 1.22+)
 - [ ] 5. Anonymous goroutine with an argument
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 6. Pass *sync.WaitGroup to a helper
 - [ ] 7. Collect results over a channel, then sort
 - [ ] 8. Atomic counter
@@ -20,33 +23,33 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 12. Add before go, defer Done inside
 - [ ] 13. Concurrency vs parallelism (GOMAXPROCS)
 - [ ] 14. Fan-in: merge results from many goroutines
-- [ ] 23. RWMutex: many readers, one writer
-- [ ] 24. sync.Map for concurrent access
-- [ ] 26. atomic.Value for a shared snapshot
-- [ ] 28. Build a map concurrently under a Mutex
-- [ ] 29. Lazy singleton with sync.Once
-- [ ] 30. A two-stage pipeline
-- [ ] 31. Producer / consumer with close
-- [ ] 32. wg.Go (Go 1.25+)
-- [ ] 34. Non-blocking receive with select/default
-- [ ] 35. Return a value from a goroutine
-- [ ] 36. defer LIFO inside a goroutine
-- [ ] 39. Count completed tasks atomically
+- [ ] 15. RWMutex: many readers, one writer
+- [ ] 16. sync.Map for concurrent access
+- [ ] 17. atomic.Value for a shared snapshot
+- [ ] 18. Build a map concurrently under a Mutex
+- [ ] 19. Lazy singleton with sync.Once
+- [ ] 20. A two-stage pipeline
+- [ ] 21. Producer / consumer with close
+- [ ] 22. wg.Go (Go 1.25+)
+- [ ] 23. Non-blocking receive with select/default
+- [ ] 24. Return a value from a goroutine
+- [ ] 25. defer LIFO inside a goroutine
+- [ ] 26. Count completed tasks atomically
 
-### 🔴 hard
-- [ ] 15. Worker pool
-- [ ] 16. Give a goroutine a guaranteed exit (avoid leaks)
-- [ ] 17. Bounded concurrency with a semaphore channel
-- [ ] 18. Collect errors from goroutines
-- [ ] 19. Parallel partial sums
-- [ ] 20. Per-goroutine result structs, sorted
-- [ ] 21. Closing a channel broadcasts to all receivers
-- [ ] 22. Race-free shared counter (test with -race)
-- [ ] 25. Nested goroutines
-- [ ] 27. Lock-free max with CompareAndSwap
-- [ ] 33. Fan-out then fan-in
-- [ ] 37. Worker pool with a results map
-- [ ] 38. Parallel 'any match' with an atomic flag
+### 🔴 hard — [3-hard.md](3-hard.md)
+- [ ] 27. Worker pool
+- [ ] 28. Give a goroutine a guaranteed exit (avoid leaks)
+- [ ] 29. Bounded concurrency with a semaphore channel
+- [ ] 30. Collect errors from goroutines
+- [ ] 31. Parallel partial sums
+- [ ] 32. Per-goroutine result structs, sorted
+- [ ] 33. Closing a channel broadcasts to all receivers
+- [ ] 34. Race-free shared counter (test with -race)
+- [ ] 35. Nested goroutines
+- [ ] 36. Lock-free max with CompareAndSwap
+- [ ] 37. Fan-out then fan-in
+- [ ] 38. Worker pool with a results map
+- [ ] 39. Parallel 'any match' with an atomic flag
 - [ ] 40. A two-phase barrier
 - [ ] 41. Cancel many workers by closing a channel
 - [ ] 42. Share memory by communicating

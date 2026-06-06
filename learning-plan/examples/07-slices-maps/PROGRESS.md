@@ -1,9 +1,12 @@
 # Step 07 — Arrays, Slices & Maps · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. Arrays have a fixed length**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. Arrays have a fixed length
 - [ ] 2. Arrays are copied by value
 - [ ] 3. Slice literal and indexing
@@ -12,7 +15,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 6. Map literal and lookup
 - [ ] 7. Map comma-ok lookup
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 8. Slicing a slice
 - [ ] 9. append growth (capacity doubling)
 - [ ] 10. Slice aliasing trap
@@ -23,7 +26,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 15. Frequency counting with a map
 - [ ] 16. Arrays are comparable and usable as map keys
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 17. nil map: read ok, write panics
 - [ ] 18. Three-index slice controls capacity
 - [ ] 19. Remove an element by index

@@ -1,16 +1,19 @@
 # Step 09 — Structs · Progress
 
-Type & run each example from [README.md](README.md); tick once your output matches.
+Type & run each example; tick once your output matches. Examples are split by tier:
+[🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
+
+> ▶ **Resume here:** 🟢 **easy** tier — start with example **1. Declaring a struct + keyed literal**. None ticked yet.
 
 
-### 🟢 easy
+### 🟢 easy — [1-easy.md](1-easy.md)
 - [ ] 1. Declaring a struct + keyed literal
 - [ ] 2. Positional literal
 - [ ] 3. Zero value of a struct
 - [ ] 4. Accessing and mutating fields
 - [ ] 5. Pointer to a struct + auto-deref
 
-### 🟡 medium
+### 🟡 medium — [2-medium.md](2-medium.md)
 - [ ] 6. Structs are copied by value
 - [ ] 7. Pass by value vs by pointer
 - [ ] 8. The &T{} pointer literal
@@ -24,7 +27,7 @@ Type & run each example from [README.md](README.md); tick once your output match
 - [ ] 16. Struct comparability with ==
 - [ ] 17. A slice/map field breaks comparability
 
-### 🔴 hard
+### 🔴 hard — [3-hard.md](3-hard.md)
 - [ ] 18. Embedding: field promotion
 - [ ] 19. Embedding: method promotion
 - [ ] 20. Embedding: shadowing
