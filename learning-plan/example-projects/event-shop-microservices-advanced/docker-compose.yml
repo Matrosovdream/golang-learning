@@ -1,0 +1,77 @@
+services:
+  # ---- message broker ----
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # ---- one database per stateful service ----
+  orders-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: orders, POSTGRES_PASSWORD: orders, POSTGRES_DB: orders }
+    volumes: [orders-data:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U orders"], interval: 3s, timeout: 3s, retries: 10 }
+
+  inventory-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: inventory, POSTGRES_PASSWORD: inventory, POSTGRES_DB: inventory }
+    volumes: [inventory-data:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U inventory"], interval: 3s, timeout: 3s, retries: 10 }
+
+  payments-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: payments, POSTGRES_PASSWORD: payments, POSTGRES_DB: payments }
+    volumes: [payments-data:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U payments"], interval: 3s, timeout: 3s, retries: 10 }
+
+  # ---- services ----
+  orders:
+    build: { context: ., dockerfile: services/orders/Dockerfile }
+    environment:
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://orders:orders@orders-db:5432/orders?sslmode=disable
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    ports:
+      - "8080:8080"
+    depends_on:
+      orders-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  inventory:
+    build: { context: ., dockerfile: services/inventory/Dockerfile }
+    environment:
+      HTTP_PORT: "8081"
+      DATABASE_URL: postgres://inventory:inventory@inventory-db:5432/inventory?sslmode=disable
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    ports:
+      - "8081:8081"
+    depends_on:
+      inventory-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  payments:
+    build: { context: ., dockerfile: services/payments/Dockerfile }
+    environment:
+      DATABASE_URL: postgres://payments:payments@payments-db:5432/payments?sslmode=disable
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      payments-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  notifications:
+    build: { context: ., dockerfile: services/notifications/Dockerfile }
+    environment:
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+
+volumes:
+  orders-data:
+  inventory-data:
+  payments-data:

@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package catalog.v1;
+
+option go_package = "shop/proto/catalog/v1;catalogv1";
+
+// CatalogService owns products and stock.
+service CatalogService {
+  rpc CreateProduct(CreateProductRequest) returns (Product);
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  // ReserveStock atomically decrements stock for several products and returns
+  // the priced lines. It fails (FailedPrecondition) if any line is short.
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+}
+
+message Product {
+  int64 id = 1;
+  string name = 2;
+  int64 price_cents = 3;
+  int32 stock = 4;
+  string created_at = 5;
+}
+
+message CreateProductRequest {
+  string name = 1;
+  int64 price_cents = 2;
+  int32 stock = 3;
+}
+
+message GetProductRequest {
+  int64 id = 1;
+}
+
+message ListProductsRequest {}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+}
+
+message StockItem {
+  int64 product_id = 1;
+  int32 quantity = 2;
+}
+
+message ReserveStockRequest {
+  repeated StockItem items = 1;
+}
+
+message ReservedItem {
+  int64 product_id = 1;
+  string product_name = 2;
+  int32 quantity = 3;
+  int64 unit_price_cents = 4;
+}
+
+message ReserveStockResponse {
+  repeated ReservedItem items = 1;
+}

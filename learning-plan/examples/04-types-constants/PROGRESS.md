@@ -3,7 +3,7 @@
 Type & run each example; tick once your output matches. Examples are split by tier:
 [🟢 easy](1-easy.md) · [🟡 medium](2-medium.md) · [🔴 hard](3-hard.md).
 
-> ▶ **Resume here (2026-06-06):** 🟡 **medium** tier — next is example **15. Untyped vs typed constants**. Easy tier complete; medium 10–14 done.
+> ✅ **All 28 examples complete (2026-06-07).** Easy + medium + hard tiers done.
 
 
 ### 🟢 easy — [1-easy.md](1-easy.md)
@@ -23,22 +23,22 @@ Type & run each example; tick once your output matches. Examples are split by ti
 - [x] 12. No implicit conversion; int/float truncates
 - [x] 13. string, []byte, and []rune
 - [x] 14. Integer literal bases
-- [ ] 15. Untyped vs typed constants
-- [ ] 16. string(rune) vs strconv.Itoa
-- [ ] 17. Variable shadowing in a nested scope
-- [ ] 18. Floating-point precision
-- [ ] 19. Float infinity and NaN
-- [ ] 20. Rune arithmetic
-- [ ] 21. Typed constant overflow is a compile error
-- [ ] 22. The min and max builtins
+- [x] 15. Untyped vs typed constants
+- [x] 16. string(rune) vs strconv.Itoa
+- [x] 17. Variable shadowing in a nested scope
+- [x] 18. Floating-point precision
+- [x] 19. Float infinity and NaN
+- [x] 20. Rune arithmetic
+- [x] 21. Typed constant overflow is a compile error
+- [x] 22. The min and max builtins
 
 ### 🔴 hard — [3-hard.md](3-hard.md)
-- [ ] 23. Named types vs type aliases
-- [ ] 24. iota bit-shift size constants
-- [ ] 25. Enum with iota + Stringer
-- [ ] 26. iota bitmask flags
-- [ ] 27. Converting between named types
-- [ ] 28. Untyped constants have arbitrary precision
+- [x] 23. Named types vs type aliases
+- [x] 24. iota bit-shift size constants
+- [x] 25. Enum with iota + Stringer
+- [x] 26. iota bitmask flags
+- [x] 27. Converting between named types
+- [x] 28. Untyped constants have arbitrary precision
 
 ---
 *Global progress: [../../PROGRESS.md](../../PROGRESS.md).*

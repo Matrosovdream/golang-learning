@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "shop/proto/orders/v1;ordersv1";
+
+// OrdersService places orders. It calls UsersService (to validate the buyer)
+// and CatalogService (to price and reserve stock).
+service OrdersService {
+  rpc CreateOrder(CreateOrderRequest) returns (Order);
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
+
+message OrderItem {
+  int64 product_id = 1;
+  string product_name = 2;
+  int32 quantity = 3;
+  int64 unit_price_cents = 4;
+}
+
+message Order {
+  int64 id = 1;
+  int64 user_id = 2;
+  string status = 3;
+  int64 total_cents = 4;
+  repeated OrderItem items = 5;
+  string created_at = 6;
+}
+
+message OrderLineInput {
+  int64 product_id = 1;
+  int32 quantity = 2;
+}
+
+message CreateOrderRequest {
+  int64 user_id = 1;
+  repeated OrderLineInput items = 2;
+}
+
+message GetOrderRequest {
+  int64 id = 1;
+}

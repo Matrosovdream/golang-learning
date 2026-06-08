@@ -1,0 +1,80 @@
+services:
+  # ---- one database per service (database-per-service pattern) ----
+  users-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: users, POSTGRES_PASSWORD: users, POSTGRES_DB: users }
+    volumes: [users-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U users"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  catalog-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: catalog, POSTGRES_PASSWORD: catalog, POSTGRES_DB: catalog }
+    volumes: [catalog-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  orders-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: orders, POSTGRES_PASSWORD: orders, POSTGRES_DB: orders }
+    volumes: [orders-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ---- backend gRPC services ----
+  users:
+    build: { context: ., dockerfile: services/users/Dockerfile }
+    environment:
+      GRPC_PORT: "9001"
+      DATABASE_URL: postgres://users:users@users-db:5432/users?sslmode=disable
+    depends_on:
+      users-db: { condition: service_healthy }
+
+  catalog:
+    build: { context: ., dockerfile: services/catalog/Dockerfile }
+    environment:
+      GRPC_PORT: "9002"
+      DATABASE_URL: postgres://catalog:catalog@catalog-db:5432/catalog?sslmode=disable
+    depends_on:
+      catalog-db: { condition: service_healthy }
+
+  orders:
+    build: { context: ., dockerfile: services/orders/Dockerfile }
+    environment:
+      GRPC_PORT: "9003"
+      DATABASE_URL: postgres://orders:orders@orders-db:5432/orders?sslmode=disable
+      USERS_ADDR: users:9001
+      CATALOG_ADDR: catalog:9002
+    depends_on:
+      orders-db: { condition: service_healthy }
+      users: { condition: service_started }
+      catalog: { condition: service_started }
+
+  # ---- public REST gateway ----
+  gateway:
+    build: { context: ., dockerfile: services/gateway/Dockerfile }
+    environment:
+      HTTP_PORT: "8080"
+      USERS_ADDR: users:9001
+      CATALOG_ADDR: catalog:9002
+      ORDERS_ADDR: orders:9003
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      - users
+      - catalog
+      - orders
+
+volumes:
+  users-data:
+  catalog-data:
+  orders-data:
