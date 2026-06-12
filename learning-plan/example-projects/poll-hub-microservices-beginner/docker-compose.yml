@@ -1,0 +1,64 @@
+name: pollhub
+
+# One database + three services built from the same Dockerfile.
+# Inside this Compose network containers reach each other by service
+# name: the apps use db:5432, vote-service calls http://poll:8081.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pollhub
+      POSTGRES_PASSWORD: pollhub
+      POSTGRES_DB: pollhub
+    ports:
+      - "5433:5432"   # host access for psql/GUI only; containers use db:5432
+    volumes:
+      - pollhub-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pollhub -d pollhub"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  poll:
+    build:
+      context: .
+      args: { SERVICE: poll }
+    environment:
+      DATABASE_URL: postgres://pollhub:pollhub@db:5432/pollhub
+      PORT: "8081"
+    ports:
+      - "8081:8081"
+    depends_on:
+      db: { condition: service_healthy }
+
+  vote:
+    build:
+      context: .
+      args: { SERVICE: vote }
+    environment:
+      DATABASE_URL: postgres://pollhub:pollhub@db:5432/pollhub
+      POLL_SERVICE_URL: http://poll:8081
+      PORT: "8082"
+    ports:
+      - "8082:8082"
+    depends_on:
+      db: { condition: service_healthy }
+      poll: { condition: service_started }
+
+  stats:
+    build:
+      context: .
+      args: { SERVICE: stats }
+    environment:
+      DATABASE_URL: postgres://pollhub:pollhub@db:5432/pollhub
+      PORT: "8083"
+    ports:
+      - "8083:8083"
+    depends_on:
+      db: { condition: service_healthy }
+
+volumes:
+  pollhub-data:
