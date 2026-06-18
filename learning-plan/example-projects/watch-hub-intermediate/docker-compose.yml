@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT}
+      MAX_CONCURRENT_CHECKS: ${MAX_CONCURRENT_CHECKS}
+      RATE_PER_SEC: ${RATE_PER_SEC}
+      RATE_BURST: ${RATE_BURST}
+      MAX_RETRIES: ${MAX_RETRIES}
+      HISTORY_SIZE: ${HISTORY_SIZE}
+      MAX_MONITORS: ${MAX_MONITORS}
+      DEFAULT_TIMEOUT_MS: ${DEFAULT_TIMEOUT_MS}
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
