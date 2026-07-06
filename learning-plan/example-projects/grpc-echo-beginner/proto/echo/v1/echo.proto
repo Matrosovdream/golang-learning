@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package echo.v1;
+
+option go_package = "grpcecho/proto/echo/v1;echov1";
+
+// EchoService is the whole contract: send a message, get it back with some
+// metadata about which server handled it.
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoReply);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoReply {
+  string message = 1;      // the echoed text
+  string served_by = 2;    // hostname of the echo container that answered
+  string received_at = 3;  // RFC3339 timestamp, set by the echo service
+}

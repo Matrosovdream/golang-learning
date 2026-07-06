@@ -6,15 +6,18 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned when an order does not exist.
+// A package-level var. errors.New builds a sentinel error value; callers compare
+// against it with errors.Is.
 var ErrNotFound = errors.New("order not found")
 
-// ValidationError signals invalid input; the handler maps it to HTTP 400.
 type ValidationError struct {
 	Field   string
 	Message string
 }
 
+// Defining Error() string makes ValidationError satisfy the built-in `error`
+// interface — implicitly, with no "implements" keyword. The value receiver (e)
+// means both ValidationError and *ValidationError satisfy error.
 func (e ValidationError) Error() string {
 	if e.Field != "" {
 		return e.Field + ": " + e.Message
@@ -22,18 +25,12 @@ func (e ValidationError) Error() string {
 	return e.Message
 }
 
-// Order status lifecycle (driven by events):
-//
-//	pending ──stock.rejected──► cancelled
-//	   │
-//	   └──stock.reserved (fills items+total) ──payment.settled──► confirmed
 const (
 	StatusPending   = "pending"
 	StatusConfirmed = "confirmed"
 	StatusCancelled = "cancelled"
 )
 
-// OrderItem is a priced line, populated once inventory reserves stock.
 type OrderItem struct {
 	ProductID      int64
 	ProductName    string
@@ -41,8 +38,8 @@ type OrderItem struct {
 	UnitPriceCents int64
 }
 
-// Order is owned by this service. Its items/total/status fill in over time as
-// events arrive — the order is eventually consistent.
+// time.Time is a struct value (not a pointer). []OrderItem is a slice field
+// whose zero value is nil until something is appended to it.
 type Order struct {
 	ID         int64
 	UserID     int64
@@ -53,7 +50,8 @@ type Order struct {
 	UpdatedAt  time.Time
 }
 
-// Repository is the storage contract for orders.
+// An interface lists method signatures; any type with those methods satisfies
+// it automatically. The *Order params/returns pass orders by pointer (no copy).
 type Repository interface {
 	Create(ctx context.Context, o *Order) error
 	GetByID(ctx context.Context, id int64) (*Order, error)

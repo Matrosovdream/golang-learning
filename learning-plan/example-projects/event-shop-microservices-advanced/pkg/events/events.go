@@ -1,9 +1,9 @@
-// Package events defines the message contracts shared by every service: the
-// routing keys (event names) and the JSON payload structs. Services only depend
-// on these definitions, never on each other.
+// Package events defines the shared event types. A package comment documents
+// the package as a whole; many files can share one package name.
 package events
 
-// Routing keys published on the "shop.events" topic exchange.
+// A const block groups related constants. With no explicit type these are
+// untyped string constants — they take a type only when used.
 const (
 	OrderPlaced    = "order.placed"
 	StockReserved  = "stock.reserved"
@@ -11,20 +11,22 @@ const (
 	PaymentSettled = "payment.settled"
 )
 
-// RequestedItem is a (product, quantity) as requested at checkout.
+// A struct is a typed group of fields. The back-tick text after a field is a
+// struct tag — metadata read via reflection (here by encoding/json) to map an
+// exported Go field to a JSON key.
 type RequestedItem struct {
-	ProductID int64 `json:"product_id"`
-	Quantity  int   `json:"quantity"`
+	ProductID int64 `json:"product_id"` // int64: 64-bit signed integer
+	Quantity  int   `json:"quantity"`   // int: implementation-sized integer
 }
 
-// OrderPlaced — published by orders when a new order is created (status pending).
+// Field names must be uppercase (exported) to be visible outside the package —
+// and encoding/json only marshals exported fields.
 type OrderPlacedEvent struct {
 	OrderID int64           `json:"order_id"`
 	UserID  int64           `json:"user_id"`
-	Items   []RequestedItem `json:"items"`
+	Items   []RequestedItem `json:"items"` // []T is a slice: a growable sequence
 }
 
-// ReservedItem is a priced line after stock has been reserved.
 type ReservedItem struct {
 	ProductID      int64  `json:"product_id"`
 	ProductName    string `json:"product_name"`
@@ -32,20 +34,17 @@ type ReservedItem struct {
 	UnitPriceCents int64  `json:"unit_price_cents"`
 }
 
-// StockReserved — published by inventory after it decrements stock.
 type StockReservedEvent struct {
 	OrderID    int64          `json:"order_id"`
 	Items      []ReservedItem `json:"items"`
 	TotalCents int64          `json:"total_cents"`
 }
 
-// StockRejected — published by inventory when an order can't be fulfilled.
 type StockRejectedEvent struct {
 	OrderID int64  `json:"order_id"`
 	Reason  string `json:"reason"`
 }
 
-// PaymentSettled — published by payments after a (simulated) successful charge.
 type PaymentSettledEvent struct {
 	OrderID     int64 `json:"order_id"`
 	AmountCents int64 `json:"amount_cents"`

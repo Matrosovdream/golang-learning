@@ -1,0 +1,18 @@
+services:
+  # The echo gRPC service. Not published to the host — only the gateway,
+  # sitting on the same Docker network, can reach it by the name "echo".
+  echo:
+    build: { context: ., dockerfile: services/echo/Dockerfile }
+    environment:
+      GRPC_PORT: "50051"
+
+  # The public REST gateway. It reaches echo by Compose DNS ("echo:50051").
+  gateway:
+    build: { context: ., dockerfile: services/gateway/Dockerfile }
+    environment:
+      HTTP_PORT: "8080"
+      ECHO_ADDR: echo:50051
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      echo: { condition: service_started }

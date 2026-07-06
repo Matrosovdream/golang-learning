@@ -12,10 +12,9 @@ import (
 	"eventshop/services/inventory/internal/domain"
 )
 
-// Service holds product admin logic plus the order.placed event handler.
 type Service struct {
-	repo domain.Repository
-	bus  *broker.Broker
+	repo domain.Repository // interface field
+	bus  *broker.Broker    // pointer field
 }
 
 func New(repo domain.Repository, bus *broker.Broker) *Service {
@@ -25,7 +24,7 @@ func New(repo domain.Repository, bus *broker.Broker) *Service {
 // --- product admin (HTTP) ---
 
 func (s *Service) CreateProduct(ctx context.Context, name string, priceCents int64, stock int) (*domain.Product, error) {
-	name = strings.TrimSpace(name)
+	name = strings.TrimSpace(name) // strings: stdlib string helpers
 	if name == "" {
 		return nil, domain.ValidationError{Field: "name", Message: "is required"}
 	}
@@ -35,6 +34,7 @@ func (s *Service) CreateProduct(ctx context.Context, name string, priceCents int
 	if stock < 0 {
 		return nil, domain.ValidationError{Field: "stock", Message: "must be >= 0"}
 	}
+	// &domain.Product{...}: pointer to a new struct; Create fills in its ID.
 	p := &domain.Product{Name: name, PriceCents: priceCents, Stock: stock}
 	if err := s.repo.Create(ctx, p); err != nil {
 		return nil, err
@@ -52,12 +52,8 @@ func (s *Service) ListProducts(ctx context.Context) ([]domain.Product, error) {
 
 // --- event handler ---
 
-// OnOrderPlaced reserves stock for the order. On success it publishes
-// stock.reserved; on a business rejection (short/unknown stock) it publishes
-// stock.rejected. Either way the message is handled (acked); only infrastructure
-// failures are returned so the broker can retry them.
 func (s *Service) OnOrderPlaced(ctx context.Context, e events.OrderPlacedEvent) error {
-	lines := make([]domain.StockLine, len(e.Items))
+	lines := make([]domain.StockLine, len(e.Items)) // preallocated slice
 	for i, it := range e.Items {
 		lines[i] = domain.StockLine{ProductID: it.ProductID, Quantity: it.Quantity}
 	}
@@ -65,17 +61,19 @@ func (s *Service) OnOrderPlaced(ctx context.Context, e events.OrderPlacedEvent) 
 	reserved, err := s.repo.Reserve(ctx, lines)
 	if err != nil {
 		var stockErr domain.InsufficientStockError
+		// A tagless switch (no condition): each case is a boolean — a clean
+		// if / else-if chain.
 		switch {
-		case errors.As(err, &stockErr):
+		case errors.As(err, &stockErr): // matches a specific error type via &stockErr
 			return s.publishRejected(ctx, e.OrderID, stockErr.Error())
-		case errors.Is(err, domain.ErrProductNotFound):
+		case errors.Is(err, domain.ErrProductNotFound): // matches a sentinel value
 			return s.publishRejected(ctx, e.OrderID, "a product does not exist")
 		default:
-			return err // infrastructure error -> let the broker retry
+			return err
 		}
 	}
 
-	var total int64
+	var total int64 // zero value is 0
 	items := make([]events.ReservedItem, len(reserved))
 	for i, l := range reserved {
 		items[i] = events.ReservedItem{
@@ -84,13 +82,14 @@ func (s *Service) OnOrderPlaced(ctx context.Context, e events.OrderPlacedEvent) 
 			Quantity:       l.Quantity,
 			UnitPriceCents: l.UnitPriceCents,
 		}
-		total += l.UnitPriceCents * int64(l.Quantity)
+		total += l.UnitPriceCents * int64(l.Quantity) // int64(...) is a type conversion
 	}
 	body, _ := json.Marshal(events.StockReservedEvent{OrderID: e.OrderID, Items: items, TotalCents: total})
 	log.Printf("order %d: stock reserved (total %d cents)", e.OrderID, total)
 	return s.bus.Publish(ctx, events.StockReserved, body)
 }
 
+// Lowercase name = unexported: callable only inside this package.
 func (s *Service) publishRejected(ctx context.Context, orderID int64, reason string) error {
 	body, _ := json.Marshal(events.StockRejectedEvent{OrderID: orderID, Reason: reason})
 	log.Printf("order %d: stock rejected (%s)", orderID, reason)

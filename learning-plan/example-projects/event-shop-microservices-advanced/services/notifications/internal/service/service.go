@@ -1,6 +1,4 @@
-// Package service handles notification events. This service is intentionally
-// stateless — it just reacts to terminal events (a real one would send email /
-// push). It owns no database.
+// Package service handles notification events.
 package service
 
 import (
@@ -10,16 +8,19 @@ import (
 	"eventshop/pkg/events"
 )
 
+// An empty struct{}: zero fields, occupies no memory — used here just as a
+// receiver to hang methods on.
 type Service struct{}
 
+// New returns *Service (a pointer to a freshly allocated empty struct).
 func New() *Service { return &Service{} }
 
-// Handle logs a "notification" for the events this service cares about.
 func (s *Service) Handle(routingKey string, body []byte) error {
+	// A switch on the event-name string; each case decodes into its own struct.
 	switch routingKey {
 	case events.PaymentSettled:
 		var e events.PaymentSettledEvent
-		if err := json.Unmarshal(body, &e); err != nil {
+		if err := json.Unmarshal(body, &e); err != nil { // &e: decode into e
 			return err
 		}
 		log.Printf("NOTIFY order %d: confirmed — payment of %d cents settled", e.OrderID, e.AmountCents)

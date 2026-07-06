@@ -11,7 +11,7 @@ import (
 	"eventshop/services/inventory/internal/service"
 )
 
-// Handler is the inventory product-admin REST surface.
+// svc is a *service.Service pointer — the handler shares one service instance.
 type Handler struct {
 	svc *service.Service
 }
@@ -44,7 +44,7 @@ type productResponse struct {
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil { // &req: decode in place
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
@@ -63,6 +63,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]productResponse, len(products))
+	// One-variable range gives the index; &products[i] is the address of the
+	// i-th element (avoids copying the struct into a loop variable).
 	for i := range products {
 		out[i] = toResponse(&products[i])
 	}
@@ -83,6 +85,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(p))
 }
 
+// Pointer in (*domain.Product), value out (productResponse).
 func toResponse(p *domain.Product) productResponse {
 	return productResponse{
 		ID:         p.ID,
@@ -105,6 +108,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 
 func writeServiceError(w http.ResponseWriter, err error) {
 	var ve domain.ValidationError
+	// Tagless switch with boolean cases; errors.As/Is walk the error chain.
 	switch {
 	case errors.As(err, &ve):
 		writeError(w, http.StatusBadRequest, ve.Error())

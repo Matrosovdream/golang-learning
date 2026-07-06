@@ -23,11 +23,12 @@ const exchange = "shop.events"
 
 func main() {
 	ctx := context.Background()
+
 	dsn := db.Getenv("DATABASE_URL", "postgres://inventory:inventory@localhost:5432/inventory?sslmode=disable")
 	amqpURL := db.Getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
 	port := db.Getenv("HTTP_PORT", "8081")
 
-	pool, err := db.Connect(ctx, dsn, 15)
+	pool, err := db.Connect(ctx, dsn, 15) // pool is a *pgxpool.Pool
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -46,11 +47,11 @@ func main() {
 
 	svc := service.New(repo, bus)
 
-	// React to new orders by reserving stock.
+	// The closure receives the routing key (here ignored with _) and the body.
 	err = bus.Consume("inventory.events", []string{events.OrderPlaced},
 		func(_ string, body []byte) error {
 			var e events.OrderPlacedEvent
-			if err := json.Unmarshal(body, &e); err != nil {
+			if err := json.Unmarshal(body, &e); err != nil { // &e: decode into e
 				return err
 			}
 			return svc.OnOrderPlaced(context.Background(), e)
@@ -59,6 +60,7 @@ func main() {
 		log.Fatalf("consume: %v", err)
 	}
 
+	// &http.Server{...}: address of a struct literal built with named fields.
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      httpapi.New(svc).Routes(),
@@ -66,16 +68,16 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	go func() {
+	go func() { // goroutine: serve concurrently while main waits for a signal
 		log.Printf("inventory listening on :%s (HTTP) + consuming order.placed", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server: %v", err)
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
+	stop := make(chan os.Signal, 1) // buffered channel of OS signals
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	<-stop // blocking receive: wait until SIGINT/SIGTERM
 	log.Println("inventory shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

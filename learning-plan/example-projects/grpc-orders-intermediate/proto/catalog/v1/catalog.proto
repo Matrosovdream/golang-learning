@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package catalog.v1;
+
+option go_package = "grpcorders/proto/catalog/v1;catalogv1";
+
+// CatalogService owns products and their stock levels.
+service CatalogService {
+  rpc CreateProduct(CreateProductRequest) returns (Product);
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsReply);
+  // ReserveStock atomically decrements stock and returns the current price,
+  // so the orders service can snapshot it. Called during checkout.
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockReply);
+}
+
+message Product {
+  int64 id = 1;
+  string name = 2;
+  int64 price_cents = 3;
+  int32 stock = 4;
+}
+
+message CreateProductRequest {
+  string name = 1;
+  int64 price_cents = 2;
+  int32 stock = 3;
+}
+
+message GetProductRequest { int64 id = 1; }
+
+message ListProductsRequest {}
+message ListProductsReply { repeated Product products = 1; }
+
+message ReserveStockRequest {
+  int64 product_id = 1;
+  int32 quantity = 2;
+}
+message ReserveStockReply {
+  string name = 1;
+  int64 price_cents = 2;
+}

@@ -15,6 +15,7 @@ import (
 const exchange = "shop.events"
 
 func main() {
+	// Only the broker is needed — this service holds no Postgres pool.
 	amqpURL := db.Getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
 
 	bus, err := broker.Connect(amqpURL, exchange, 30)
@@ -23,8 +24,9 @@ func main() {
 	}
 	defer bus.Close()
 
-	svc := service.New()
+	svc := service.New() // returns a *Service
 
+	// A function literal that adapts svc.Handle to the broker's Handler type.
 	err = bus.Consume("notifications.events",
 		[]string{events.PaymentSettled, events.StockRejected},
 		func(routingKey string, body []byte) error {
@@ -35,8 +37,8 @@ func main() {
 	}
 
 	log.Println("notifications consuming payment.settled + stock.rejected")
-	stop := make(chan os.Signal, 1)
+	stop := make(chan os.Signal, 1) // buffered channel, capacity 1
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	<-stop // block here until a signal is received
 	log.Println("notifications shutting down...")
 }

@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-// Payment is a (simulated) charge against an order.
 type Payment struct {
 	ID          int64
 	OrderID     int64
@@ -14,7 +13,8 @@ type Payment struct {
 	CreatedAt   time.Time
 }
 
-// Repository is the storage contract for payments.
+// A one-method interface. The *Payment param is a pointer, so Create can write
+// the generated ID back into the caller's value.
 type Repository interface {
 	Create(ctx context.Context, p *Payment) error
 }

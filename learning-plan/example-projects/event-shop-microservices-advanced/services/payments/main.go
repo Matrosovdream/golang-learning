@@ -19,10 +19,11 @@ const exchange = "shop.events"
 
 func main() {
 	ctx := context.Background()
+
 	dsn := db.Getenv("DATABASE_URL", "postgres://payments:payments@localhost:5432/payments?sslmode=disable")
 	amqpURL := db.Getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
 
-	pool, err := db.Connect(ctx, dsn, 15)
+	pool, err := db.Connect(ctx, dsn, 15) // pool is a *pgxpool.Pool
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -42,9 +43,9 @@ func main() {
 	svc := service.New(repo, bus)
 
 	err = bus.Consume("payments.events", []string{events.StockReserved},
-		func(_ string, body []byte) error {
+		func(_ string, body []byte) error { // _ ignores the routing key
 			var e events.StockReservedEvent
-			if err := json.Unmarshal(body, &e); err != nil {
+			if err := json.Unmarshal(body, &e); err != nil { // &e: decode into e
 				return err
 			}
 			return svc.OnStockReserved(context.Background(), e)
@@ -53,9 +54,10 @@ func main() {
 		log.Fatalf("consume: %v", err)
 	}
 
+	// No HTTP server here — just block on a signal channel to stay alive.
 	log.Println("payments consuming stock.reserved")
-	stop := make(chan os.Signal, 1)
+	stop := make(chan os.Signal, 1) // buffered signal channel (capacity 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	<-stop // blocking receive: wait for Ctrl-C / SIGTERM
 	log.Println("payments shutting down...")
 }

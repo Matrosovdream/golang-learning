@@ -9,6 +9,7 @@ import (
 	"eventshop/services/payments/internal/domain"
 )
 
+// Raw string literal (back-ticks): multi-line, no escape processing.
 const schema = `
 CREATE TABLE IF NOT EXISTS payments (
     id           BIGSERIAL   PRIMARY KEY,
@@ -18,7 +19,6 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );`
 
-// PaymentRepository implements domain.Repository with raw SQL via pgx.
 type PaymentRepository struct {
 	pool *pgxpool.Pool
 }
@@ -34,6 +34,7 @@ func (r *PaymentRepository) Migrate(ctx context.Context) error {
 
 func (r *PaymentRepository) Create(ctx context.Context, p *domain.Payment) error {
 	const q = `INSERT INTO payments (order_id, amount_cents, status) VALUES ($1, $2, $3) RETURNING id, created_at`
+	// &p.ID, &p.CreatedAt: Scan writes the RETURNING columns through these pointers.
 	if err := r.pool.QueryRow(ctx, q, p.OrderID, p.AmountCents, p.Status).Scan(&p.ID, &p.CreatedAt); err != nil {
 		return fmt.Errorf("create payment: %w", err)
 	}
