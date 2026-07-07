@@ -4,7 +4,7 @@ A step-by-step path to learn Go from zero to building real backend services. Eac
 
 ## How to use this plan
 
-1. Work through steps in order (01 → 26).
+1. Work through steps in order (01 → 26); Parts 8–9 (27 → 41) are optional extensions you can take in any order.
 2. For each step:
    - Read the lesson file (`NN-title.md`).
    - Write the exercises in `/go-project/NN-title/` (you'll scaffold the module as you go — see "Stack" below).
@@ -68,6 +68,34 @@ We stay in the standard library on purpose: Go's stdlib is strong enough to buil
 - [24 — Idiomatic Go & Effective Go](24-idiomatic-go.md) — naming, the zero value, error style, `vet`/lint
 - [25 — Project Layout & Clean Architecture](25-architecture.md) — `cmd`/`internal`, layering, dependency injection
 - [26 — Capstone Project: REST API Service](26-capstone.md) — a small backend that uses everything above
+
+### Part 8 — Extensions (beyond the core plan)
+- [27 — gRPC & Microservices](27-grpc-microservices.md) — protobuf contracts, gRPC servers/clients, streaming, interceptors, **request-id logging & Prometheus/Grafana metrics between services**. Examples: [examples/27-grpc-microservices](examples/27-grpc-microservices/); projects: `grpc-echo-beginner` → `grpc-orders-intermediate` → `grpc-observability-hard`.
+
+**Design Patterns (the Go way)** — GoF patterns blended with idiomatic Go (functional options, embedding, first-class functions). Concurrency patterns stay in [15](15-sync-context.md); style in [24](24-idiomatic-go.md).
+- [28 — Design Patterns I: Creational](28-patterns-creational.md) — useful zero value, constructors, **functional options**, builders, factory/registry, singleton (`sync.Once`) vs DI, object pool (`sync.Pool`), prototype/clone. · [examples](examples/28-patterns-creational/) (17)
+- [29 — Design Patterns II: Structural](29-patterns-structural.md) — embedding vs inheritance, adapter (`HandlerFunc`), **decorator/middleware**, facade, proxy (caching/access), composite (trees), bridge, flyweight. · [examples](examples/29-patterns-structural/) (17)
+- [30 — Design Patterns III: Behavioral](30-patterns-behavioral.md) — strategy & command as function values, the Template-Method **embedding trap**, observer/pub-sub, state machines, **range-over-func iterators** (`iter.Seq`, 1.23+), chain of responsibility, visitor via type switch. · [examples](examples/30-patterns-behavioral/) (16)
+
+### Part 9 — Architecture & System Design (beyond the core plan)
+Builds on [25](25-architecture.md) (clean-arch), [27](27-grpc-microservices.md) (microservices), and the design patterns above. Take in any order; docs first, graded examples added later.
+
+*Track A — structuring one service (deepens [25](25-architecture.md)):*
+- [31 — Domain-Driven Design (tactical)](31-ddd-tactical.md) — entities, value objects, aggregates & invariants, domain events, repositories, keeping the domain framework-free, anti-corruption layer. · [examples](examples/31-ddd-tactical/) (15)
+- [32 — Hexagonal / Ports & Adapters](32-hexagonal-ports-adapters.md) — driving vs driven ports, dependency inversion, in-memory adapters for tests; how it relates to lesson 25's layered take. · [examples](examples/32-hexagonal-ports-adapters/) (15)
+- [33 — Dependency Injection & Wiring](33-dependency-injection.md) — composition root, manual DI vs `google/wire` vs `uber/fx`, killing globals/service-locators. · [examples](examples/33-dependency-injection/) (15)
+
+*Track B — coordinating services (deepens [27](27-grpc-microservices.md)):*
+- [34 — Event-Driven Architecture & the Outbox](34-event-driven-outbox.md) — async events, at-least-once + idempotent consumers, the **transactional outbox** for the dual-write problem, event versioning. · [examples](examples/34-event-driven-outbox/) (15)
+- [35 — Sagas & Distributed Transactions](35-sagas-distributed-transactions.md) — orchestration vs choreography, compensating actions, idempotency keys — the "no distributed transaction" trap solved. · [examples](examples/35-sagas-distributed-transactions/) (15)
+- [36 — Resilience Patterns](36-resilience-patterns.md) — timeout, retry-with-jitter, **circuit breaker**, bulkhead, rate limit / load shedding, graceful degradation. · [examples](examples/36-resilience-patterns/) (15)
+- [37 — CQRS & Event Sourcing](37-cqrs-event-sourcing.md) *(advanced)* — split read/write models, event log as source of truth, projections, snapshots — and when **not** to. · [examples](examples/37-cqrs-event-sourcing/) (15)
+
+*Track C — production cross-cutting:*
+- [38 — Caching Patterns](38-caching-patterns.md) — cache-aside / write-through / write-behind, TTL & invalidation, stampede protection with `singleflight`, local vs distributed. · [examples](examples/38-caching-patterns/) (15)
+- [39 — Observability: Distributed Tracing](39-observability-tracing.md) — the three pillars, OpenTelemetry spans, context propagation across hops, correlating logs ↔ metrics ↔ traces, sampling. · [examples](examples/39-observability-tracing/) (15)
+- [40 — Testing Architecture](40-testing-architecture.md) — the service test pyramid, fakes vs mocks, **testcontainers** for real infra, determinism, contract testing. · [examples](examples/40-testing-architecture/) (15)
+- [41 — API Design & Evolution](41-api-design-evolution.md) — backward-compatible change & versioning, cursor pagination, idempotency keys, RFC 9457 `problem+json`, OpenAPI. · [examples](examples/41-api-design-evolution/) (15)
 
 ## Progress
 
