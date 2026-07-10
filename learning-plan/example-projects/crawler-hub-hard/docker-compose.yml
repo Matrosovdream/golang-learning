@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY}
+      DEFAULT_MAX_DEPTH: ${DEFAULT_MAX_DEPTH}
+      DEFAULT_MAX_PAGES: ${DEFAULT_MAX_PAGES}
+      DEFAULT_RATE_PER_SEC: ${DEFAULT_RATE_PER_SEC}
+      SITE_PAGES: ${SITE_PAGES}
+      FETCH_TIMEOUT_MS: ${FETCH_TIMEOUT_MS}
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
