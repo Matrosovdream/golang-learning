@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT}
+      SUB_BUFFER: ${SUB_BUFFER}
+      MAX_TOPIC_LEN: ${MAX_TOPIC_LEN}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES}
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
