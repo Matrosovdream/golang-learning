@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT}
+      WORKER_COUNT: ${WORKER_COUNT}
+      MAX_BYTES: ${MAX_BYTES}
+      DEFAULT_TOP_N: ${DEFAULT_TOP_N}
+      MIN_WORD_LEN: ${MIN_WORD_LEN}
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
