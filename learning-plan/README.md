@@ -4,7 +4,7 @@ A step-by-step path to learn Go from zero to building real backend services. Eac
 
 ## How to use this plan
 
-1. Work through steps in order (01 → 26); Parts 8–9 (27 → 41) are optional extensions you can take in any order.
+1. Work through steps in order (01 → 26); the rest (27 → 45) are optional extensions you can take in any order.
 2. For each step:
    - Read the lesson file (`NN-title.md`).
    - Write the exercises in `/go-project/NN-title/` (you'll scaffold the module as you go — see "Stack" below).
@@ -84,18 +84,32 @@ Builds on [25](25-architecture.md) (clean-arch), [27](27-grpc-microservices.md) 
 - [31 — Domain-Driven Design (tactical)](31-ddd-tactical.md) — entities, value objects, aggregates & invariants, domain events, repositories, keeping the domain framework-free, anti-corruption layer. · [examples](examples/31-ddd-tactical/) (15)
 - [32 — Hexagonal / Ports & Adapters](32-hexagonal-ports-adapters.md) — driving vs driven ports, dependency inversion, in-memory adapters for tests; how it relates to lesson 25's layered take. · [examples](examples/32-hexagonal-ports-adapters/) (15)
 - [33 — Dependency Injection & Wiring](33-dependency-injection.md) — composition root, manual DI vs `google/wire` vs `uber/fx`, killing globals/service-locators. · [examples](examples/33-dependency-injection/) (15)
+- [45 — Polymorphic Relations & Type Registries](45-polymorphic-relations.md) — one child table for many parents via a `(type, id)` pair, the no-FK trade-off + a subject/authorization checker, and one interface + `map[Type]Repo` **registry** so generic ops never `switch` on type. Worked in the midigator capstone.
 
 *Track B — coordinating services (deepens [27](27-grpc-microservices.md)):*
 - [34 — Event-Driven Architecture & the Outbox](34-event-driven-outbox.md) — async events, at-least-once + idempotent consumers, the **transactional outbox** for the dual-write problem, event versioning. · [examples](examples/34-event-driven-outbox/) (15)
 - [35 — Sagas & Distributed Transactions](35-sagas-distributed-transactions.md) — orchestration vs choreography, compensating actions, idempotency keys — the "no distributed transaction" trap solved. · [examples](examples/35-sagas-distributed-transactions/) (15)
 - [36 — Resilience Patterns](36-resilience-patterns.md) — timeout, retry-with-jitter, **circuit breaker**, bulkhead, rate limit / load shedding, graceful degradation. · [examples](examples/36-resilience-patterns/) (15)
 - [37 — CQRS & Event Sourcing](37-cqrs-event-sourcing.md) *(advanced)* — split read/write models, event log as source of truth, projections, snapshots — and when **not** to. · [examples](examples/37-cqrs-event-sourcing/) (15)
+- [44 — Background Jobs & Task Queues](44-background-jobs-queues.md) — durable, out-of-process work with **asynq/Redis**: enqueuer + separate worker binary, at-least-once ⇒ idempotent handlers, retries/backoff/dead-letter, 202 Accepted; how the queue relates to the [34](34-event-driven-outbox.md) outbox.
 
 *Track C — production cross-cutting:*
 - [38 — Caching Patterns](38-caching-patterns.md) — cache-aside / write-through / write-behind, TTL & invalidation, stampede protection with `singleflight`, local vs distributed. · [examples](examples/38-caching-patterns/) (15)
 - [39 — Observability: Distributed Tracing](39-observability-tracing.md) — the three pillars, OpenTelemetry spans, context propagation across hops, correlating logs ↔ metrics ↔ traces, sampling. · [examples](examples/39-observability-tracing/) (15)
 - [40 — Testing Architecture](40-testing-architecture.md) — the service test pyramid, fakes vs mocks, **testcontainers** for real infra, determinism, contract testing. · [examples](examples/40-testing-architecture/) (15)
+- [49 — The Go Test Toolbox: Every Kind of Test](49-testing-kinds.md) — the **catalog** that bridges [18](18-testing.md) & [40](40-testing-architecture.md): unit, table-driven, subtests, parallel, **examples**, benchmarks, **fuzz**, golden-file, `httptest`, `TestMain`, **build-tag integration**, **property-based** (`testing/quick`), and run modes (`-race`, `-cover`, `-short`). · [examples](examples/49-testing-kinds/) (15, real `go test`)
 - [41 — API Design & Evolution](41-api-design-evolution.md) — backward-compatible change & versioning, cursor pagination, idempotency keys, RFC 9457 `problem+json`, OpenAPI. · [examples](examples/41-api-design-evolution/) (15)
+- [43 — Authorization, RBAC & Multi-Tenancy](43-authorization-rbac-multitenancy.md) — authN vs authZ (401 vs 403), identity in context, **RBAC** (rights→roles→users + pivots, `RequireRight` middleware, rights cache), per-query **tenant scoping**, and the **overposting** defense (stamp trusted fields from context). Worked in the midigator capstone.
+
+### Part 10 — Data Structures (beyond the core plan)
+Classic data structures implemented the Go way (recursive pointer structs, `nil`-as-empty, slice-as-queue). Standalone — take any time after [10](10-pointers-methods.md) (pointers) and [17](17-generics.md) (generics).
+- [42 — Trees](42-trees.md) — binary trees & the `nil`-base-case recursion, in/pre/post-order + level-order (BFS) traversals, **binary search trees** (insert/search/delete/validate), plus a generic BST, serialize/deserialize, trie, and expression tree. · [examples](examples/42-trees/) (26)
+
+### Part 11 — Performance & Low-Latency (beyond the core plan)
+Writing Go with **mechanical sympathy** — code that works *with* the runtime (allocator, GC, CPU cache) instead of against it. An escalating easy→hard track; the golden rule throughout is **measure, don't guess**. Take after [15](15-sync-context.md) (concurrency) and [18](18-testing.md) (benchmarks).
+- [46 — Low-Latency Go I: Measuring & Allocation Basics](46-low-latency-measuring.md) *(easy)* — latency vs throughput & the **tail** (p99), benchmarking (`ReportAllocs`, `benchstat`, dead-code-elimination traps), `testing.AllocsPerRun`, **escape analysis** (`-gcflags=-m`), preallocation, `strings.Builder`, `[]byte`/`string` cost, `strconv.Append*`, **inlining/devirtualization**, generics-vs-`interface{}` boxing, intro to `sync.Pool`. · [examples](examples/46-low-latency-measuring/) (17)
+- [47 — Low-Latency Go II: GC Pressure, Memory Layout & Contention](47-low-latency-gc-contention.md) *(medium)* — how the GC works (pacing, `GOGC`, **`GOMEMLIMIT`**, pointers = scan work), fewer pointers via value slices & indices, struct **field alignment/padding** & AoS-vs-SoA, `sync.Pool` done right, contention (RWMutex, **sharding**, atomics, **false sharing**), and **`pprof`** (CPU/heap/mutex/block) + the tracer. · [examples](examples/47-low-latency-gc-contention/) (15)
+- [48 — Low-Latency Go III: Lock-Free, Zero-Copy & Tail Latency](48-low-latency-lockfree-tail.md) *(hard)* — **copy-on-write** with `atomic.Pointer` & CAS loops, `unsafe.String`, zero-copy I/O (`io.Copy`, `bufio`, `net.Buffers`), **batching**/coalescing (`singleflight`)/ring buffers, and **tail engineering** (GC pauses, **hedged requests**, deadlines, load shedding, `GOMAXPROCS`, transport-level **QUIC/HTTP-3** & 0-RTT). · [examples](examples/48-low-latency-lockfree-tail/) (15)
 
 ## Progress
 

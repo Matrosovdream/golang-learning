@@ -47,8 +47,22 @@
   id, _ := res.LastInsertId()      // driver-dependent (Postgres: use RETURNING instead)
   n, _ := res.RowsAffected()
   ```
+- **Upsert with `INSERT ... ON CONFLICT`.** Create-or-update in a single statement — insert the row, and if it collides with an existing one, update instead of erroring.
+  ```go
+  const q = `INSERT INTO settings (user_id, channel) VALUES ($1, $2)
+      ON CONFLICT (user_id) DO UPDATE SET channel = EXCLUDED.channel, updated_at = now()
+      RETURNING user_id, channel`
+  err := db.QueryRowContext(ctx, q, userID, channel).Scan(&s.UserID, &s.Channel)
+  ```
+  `ON CONFLICT (user_id)` names the unique/PK column whose collision triggers the update; `EXCLUDED` refers to the row you *tried* to insert (so `EXCLUDED.channel` is the new value); `RETURNING` reads the final row back after either branch. Use `ON CONFLICT (col) DO NOTHING` when you just want idempotent inserts that silently ignore duplicates.
 - **Placeholders prevent SQL injection.** Use `$1, $2` (Postgres) or `?` (MySQL/SQLite) and pass args separately — **never** build SQL with `fmt.Sprintf` from user input. The driver parameterizes safely.
 - **`NULL` handling** — a NULL column won't scan into a plain `string`/`int`; use `sql.NullString`, `sql.NullInt64`, or pointer types (`*string`) for nullable columns.
+- **`COALESCE` to avoid nullable scans.** Rather than scan a nullable text column into a `*string`/`sql.NullString` and thread the pointer through every caller, push the default into SQL: `COALESCE(col, '')` returns `''` when the column is NULL, so it scans straight into a plain `string`.
+  ```go
+  err := db.QueryRowContext(ctx, "SELECT id, COALESCE(email,'') FROM users WHERE id = $1", id).
+      Scan(&u.ID, &u.Email)   // u.Email is a plain string; NULL comes back as ""
+  ```
+  The trade-off: you lose the NULL-vs-empty distinction. Use it for text where empty *means* absent, but keep pointers/`sql.Null*` for dates, foreign keys, and any column where NULL is semantically different from the zero value.
 - **Transactions** — group statements atomically:
   ```go
   tx, err := db.BeginTx(ctx, nil)
@@ -72,6 +86,8 @@
 6. Wrap two inserts in a transaction using the `BeginTx` / `defer Rollback` / `Commit` pattern; force the second to fail and confirm the first rolled back.
 7. Demonstrate injection safety: try to pass `'; DROP TABLE users; --` as a parameterized value and confirm it's treated as data, not SQL.
 8. Add `golang-migrate` (or `goose`) and write one up/down migration; discuss with Claude why migrations belong in their own tool.
+9. Scan a nullable text column two ways: once with `sql.NullString` (inspecting `.Valid`/`.String`), then once with `COALESCE(col,'')` into a plain `string`. Compare the two call sites and note what information you gave up.
+10. Write an upsert with `INSERT ... ON CONFLICT (col) DO UPDATE SET ... = EXCLUDED. ...`. Run it twice with the same key and prove the second run *updated* the row (same count, changed value) rather than inserting a duplicate.
 
 ## Best Practices & Pitfalls
 - **Create one `*sql.DB` for the whole app and share it.** It's a pool; opening one per request destroys performance.
@@ -80,9 +96,11 @@
 - **Use the `...Context` methods and pass the request context** so queries respect timeouts/cancellation.
 - **Use the `defer tx.Rollback()` + `Commit()` pattern** for every transaction; the deferred rollback is a no-op after a successful commit and saves you from leaks on error paths.
 - **Set pool limits** (`SetMaxOpenConns`, `SetConnMaxLifetime`) to match your DB's capacity, especially behind a connection limit / pgbouncer.
+- **Reach for `COALESCE` for nullable text, pointers/`sql.Null*` for everything where NULL ≠ zero value.** Collapsing NULL to `''` keeps scans simple, but only where empty and absent mean the same thing; preserve the distinction for dates, foreign keys, and flags.
 - **Pitfall — `sql.ErrNoRows` is not a failure for `QueryRow`;** it's the normal "not found" signal. Branch on it; don't treat it as a 500.
 - **Pitfall — scanning NULL into non-nullable types panics/errors.** Use `sql.Null*` or pointers.
 - **Pitfall — schema changes in app code.** Keep migrations in a dedicated tool, versioned and reviewed.
+- **Pitfall — `ON CONFLICT` needs a real unique constraint / PK on the conflict target;** without a unique index on the named column(s), Postgres has nothing to detect the collision and the upsert errors out.
 
 ## Checklist
 - [ ] I can open a DB with a driver (blank import) and `Ping` it.
@@ -91,6 +109,7 @@
 - [ ] I always use parameterized queries.
 - [ ] I can run a transaction with the Rollback/Commit pattern.
 - [ ] I pass `ctx` into every query and know where migrations live.
+- [ ] I can write an upsert with ON CONFLICT ... DO UPDATE and know COALESCE's trade-off.
 
 ## Resources
 - `database/sql` package: https://pkg.go.dev/database/sql
