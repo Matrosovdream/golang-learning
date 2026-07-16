@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "grpcobs/proto/orders/v1;ordersv1";
+
+// OrderService places orders, backed by its own Postgres database. Checkout calls
+// catalog over gRPC to reserve stock + snapshot prices.
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (Order);
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
+
+message OrderItem {
+  int64 product_id = 1;
+  int32 quantity = 2;
+  string name = 3;
+  int64 price_cents = 4;
+}
+
+message Order {
+  int64 id = 1;
+  string status = 2;
+  int64 total_cents = 3;
+  repeated OrderItem items = 4;
+}
+
+message CreateOrderLine {
+  int64 product_id = 1;
+  int32 quantity = 2;
+}
+
+message CreateOrderRequest {
+  repeated CreateOrderLine items = 1;
+}
+
+message GetOrderRequest { int64 id = 1; }

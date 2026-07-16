@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: default
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      # Grafana loads every dashboard JSON found under this path (mounted from
+      # ./deploy/grafana/dashboards in docker-compose.yml).
+      path: /var/lib/grafana/dashboards

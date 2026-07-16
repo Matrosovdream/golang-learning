@@ -1,0 +1,83 @@
+services:
+  # ---- database per service ----
+  catalog-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: catalog, POSTGRES_PASSWORD: catalog, POSTGRES_DB: catalog }
+    volumes: [catalog-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  orders-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: orders, POSTGRES_PASSWORD: orders, POSTGRES_DB: orders }
+    volumes: [orders-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ---- gRPC services (each exposes /metrics on :2112 for Prometheus) ----
+  catalog:
+    build: { context: ., dockerfile: services/catalog/Dockerfile }
+    environment:
+      GRPC_PORT: "9002"
+      METRICS_PORT: "2112"
+      DATABASE_URL: postgres://catalog:catalog@catalog-db:5432/catalog?sslmode=disable
+    depends_on:
+      catalog-db: { condition: service_healthy }
+
+  orders:
+    build: { context: ., dockerfile: services/orders/Dockerfile }
+    environment:
+      GRPC_PORT: "9003"
+      METRICS_PORT: "2112"
+      DATABASE_URL: postgres://orders:orders@orders-db:5432/orders?sslmode=disable
+      CATALOG_ADDR: catalog:9002
+    depends_on:
+      orders-db: { condition: service_healthy }
+      catalog: { condition: service_started }
+
+  gateway:
+    build: { context: ., dockerfile: services/gateway/Dockerfile }
+    environment:
+      HTTP_PORT: "8080"
+      CATALOG_ADDR: catalog:9002
+      ORDERS_ADDR: orders:9003
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      catalog: { condition: service_started }
+      orders: { condition: service_started }
+
+  # ---- observability stack ----
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090" # Prometheus UI: http://localhost:9090
+    depends_on:
+      catalog: { condition: service_started }
+      orders: { condition: service_started }
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"    # no login needed for this demo
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000" # Grafana UI: http://localhost:3000 (dashboard auto-provisioned)
+    depends_on:
+      prometheus: { condition: service_started }
+
+volumes:
+  catalog-data:
+  orders-data:
