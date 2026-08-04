@@ -1,6 +1,6 @@
 # Step 11 — Interfaces · 🔴 Hard
 
-Examples **19–25**. Each is a complete `package main` program: read the concept and steps,
+Examples **19–26**. Each is a complete `package main` program: read the concept and steps,
 then **retype the code block** into a scratch folder and run it.
 
 **Run any example:**
@@ -720,6 +720,73 @@ registered: noempty, reverse, upper
 pipeline ok:  out="OLLEH" err=<nil>
 pipeline err: out="" err=step "noempty" failed: noempty: refusing empty input
 pipeline err: out="" err=pipeline: no plugin named "missing"
+```
+
+---
+
+## 26. Compile-time interface guard: var _ Iface = (*T)(nil)
+
+`🔴 hard`
+
+The line `var _ Notifier = (*EmailNotifier)(nil)` asserts at COMPILE TIME that a type satisfies an interface. If a method is missing or has the wrong signature, the build fails right at the guard — a clear, local error instead of a confusing one at some far-away call site (or, worse, no error until the type is finally used as the interface).
+
+**Steps:**
+
+1. `Notifier` is a one-method contract. `EmailNotifier` implements it with a POINTER receiver, so only `*EmailNotifier` (not a plain value) satisfies the interface.
+2. The guard `var _ Notifier = (*EmailNotifier)(nil)` does the check: `(*EmailNotifier)(nil)` is a typed nil (no allocation, never dereferenced) and the blank `_` throws the value away — its only job is to make the compiler verify the interface is implemented right here.
+3. The commented note shows the exact build error you'd get if you deleted `Notify`: `*EmailNotifier does not implement Notifier (missing method Notify)`, reported AT the guard line.
+4. `main` uses the concrete type through the `Notifier` interface it is now guaranteed to satisfy, and prints a deterministic line.
+5. Put these guards near a type's definition (or in the package that owns the interface) to catch breakage the instant a method drifts, without waiting for a caller to trip over it.
+
+```go
+package main
+
+import "fmt"
+
+// Notifier is the small contract we want our concrete type to satisfy.
+type Notifier interface {
+	Notify(msg string) error
+}
+
+// EmailNotifier is a concrete type. Notify has a POINTER receiver, so only
+// *EmailNotifier (not a plain EmailNotifier value) implements Notifier.
+type EmailNotifier struct {
+	from string
+}
+
+func (e *EmailNotifier) Notify(msg string) error {
+	fmt.Printf("[email from %s] %s\n", e.from, msg)
+	return nil
+}
+
+// COMPILE-TIME GUARD. This declaration asserts, at BUILD time, that
+// *EmailNotifier satisfies Notifier. (*EmailNotifier)(nil) is a typed nil —
+// it allocates nothing and is never dereferenced; the blank identifier _
+// throws the value away. Its ONLY purpose is to make the compiler verify the
+// interface is implemented RIGHT HERE.
+//
+// If you delete Notify (or change its signature), THIS line fails to compile
+// with: "cannot use (*EmailNotifier)(nil) (value of type *EmailNotifier) as
+// Notifier value in variable declaration: *EmailNotifier does not implement
+// Notifier (missing method Notify)" — so the build error points at the guard,
+// not at some distant call site.
+var _ Notifier = (*EmailNotifier)(nil)
+
+func main() {
+	// Use the concrete type THROUGH the interface it's guaranteed to satisfy.
+	var n Notifier = &EmailNotifier{from: "ops@example.com"}
+	if err := n.Notify("disk 90% full"); err != nil {
+		fmt.Println("error:", err)
+	}
+	fmt.Println("guard holds: *EmailNotifier satisfies Notifier at compile time")
+}
+```
+
+**Output:**
+
+```
+[email from ops@example.com] disk 90% full
+guard holds: *EmailNotifier satisfies Notifier at compile time
 ```
 
 ---
