@@ -6,6 +6,117 @@
 - Use `close`, `range`, and channel directions correctly.
 - Coordinate multiple channels with `select`.
 
+## Mental model: two rooms, a hole in the wall, and boxes
+
+Keep this picture in your head for the whole lesson. A channel is a **hole in the wall between two
+rooms**; goroutines are **workers**; values are **boxes**. Everything else follows from how much
+shelf space sits in the hole.
+
+### Unbuffered — `make(chan int)` — no shelf
+
+```
+      ROOM A                                     ROOM B
+  ┌─────────────┐                           ┌─────────────┐
+  │  sender     │        cap = 0            │  receiver   │
+  │  [box] ─────┼──▶  ( no shelf )  ◀───────┼──── waits   │
+  └─────────────┘      hand to hand         └─────────────┘
+
+  The box is NEVER put down. It passes directly from one
+  worker's hands to the other's -- so both must be at the
+  hole at the same moment.
+```
+
+That is literally what the runtime does: with `cap == 0` there is nowhere to store the value, so it
+is copied **straight from the sender's stack to the receiver's stack**. `ch <- 1` is not a deposit,
+it is a handoff.
+
+Consequences:
+
+- A worker may **stand at the hole and wait**, holding the box, for as long as it takes. Waiting is
+  normal, not an error.
+- It is only broken when **nobody will ever come**.
+- **One worker cannot serve both sides.** He cannot hand a box to himself.
+
+That last point is the classic first deadlock:
+
+```
+  ONE ROOM ONLY
+  ┌──────────────────────────────────────────────┐
+  │  ch := make(chan int)                        │
+  │  ch <- 1     ← worker waits at the hole      │
+  │  <-ch        ← the only receiver is HIM,     │
+  │                one step later -- a step he   │
+  │                can never take while waiting  │
+  └──────────────────────────────────────────────┘
+        fatal error: all goroutines are asleep
+```
+
+### Buffered — `make(chan int, 3)` — a shelf with 3 slots
+
+```
+      ROOM A              SHELF (cap 3)                ROOM B
+  ┌───────────┐      ┌──────┬──────┬──────┐      ┌────────────┐
+  │  sender   │ ──▶  │ box1 │ box2 │      │ ──▶  │  receiver  │
+  └───────────┘      └──────┴──────┴──────┘      └────────────┘
+                       len = 2,  cap = 3
+                        FIFO: box1 leaves first
+```
+
+The sender **drops the box and walks away**. He never learns whether it was picked up — that is the
+guarantee you trade away for the convenience.
+
+### When each worker has to wait
+
+```
+  SHELF FULL                             SHELF EMPTY
+  ┌──────┬──────┬──────┐                 ┌──────┬──────┬──────┐
+  │ box1 │ box2 │ box3 │                 │      │      │      │
+  └──────┴──────┴──────┘                 └──────┴──────┴──────┘
+   ▲                                                          ▲
+   └── sender BLOCKS                       receiver BLOCKS ───┘
+       (nowhere to put it)                     (nothing to take)
+```
+
+| shelf (`cap`) | sender blocks when | receiver blocks when |
+|---|---|---|
+| `0` — unbuffered | always, until a receiver arrives | always, until a sender arrives |
+| `N` — buffered | the shelf is **full** | the shelf is **empty** |
+
+A full shelf is **backpressure**: it is the only thing telling a fast producer to slow down. Over-size
+the shelf and you have removed the brake, not fixed the problem.
+
+### `close(ch)` — a sign on the hole
+
+```
+  ┌──────┬──────┬──────┐   ┌───────────────────┐
+  │ box1 │ box2 │      │   │  NO MORE BOXES    │  ← close(ch)
+  └──────┴──────┴──────┘   └───────────────────┘
+
+  1. Boxes already on the shelf still come out, in order.
+  2. After the last one, every receiver gets an EMPTY box
+     (the zero value) plus ok == false -- immediately, forever.
+  3. Putting a box in after the sign goes up  -> panic
+  4. Hanging a second sign                    -> panic
+```
+
+So closing is **not** cleanup and **not** required. It is how a receiver learns the stream ended —
+which is exactly what `for v := range ch` and `v, ok := <-ch` are asking. A channel nobody needs to
+learn that about can simply be left open and garbage collected.
+
+Only the **sender** may hang the sign: a receiver cannot know whether a worker is mid-delivery. With
+several senders, none of them can — you need one extra worker whose only job is *"wait for all
+senders to finish, then hang the sign"*:
+
+```go
+go func() { wg.Wait(); close(ch) }()
+```
+
+### `var ch chan int` — no hole at all
+
+A nil channel is a wall with **no hole in it**. Sends and receives block forever and can never be
+served. That sounds purely like a bug, and usually is — but it is deliberately useful for switching
+off a `select` case once a stream is finished (example 37).
+
 ## Concepts
 - **A channel is a typed conduit** for sending values between goroutines:
   ```go
