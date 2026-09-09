@@ -21,8 +21,10 @@ go.work.sum
 # Editor / OS
 .DS_Store
 .idea/
-.vscode/*
-!.vscode/extensions.json
 /practice
 /learning-plan/PROGRESS.MD
 /tmp
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
