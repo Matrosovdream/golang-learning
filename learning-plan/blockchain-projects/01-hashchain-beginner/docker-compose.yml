@@ -1,0 +1,15 @@
+services:
+  node:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT:-8080}
+      # consensus params — see README "Configuration"
+      DIFFICULTY: ${DIFFICULTY:-20}
+      MIN_DIFFICULTY: ${MIN_DIFFICULTY:-8}
+      MAX_DIFFICULTY: ${MAX_DIFFICULTY:-32}
+      RETARGET_INTERVAL: ${RETARGET_INTERVAL:-0}
+      TARGET_BLOCK_TIME_MS: ${TARGET_BLOCK_TIME_MS:-2000}
+      MINE_TIMEOUT_S: ${MINE_TIMEOUT_S:-60}
+      MAX_DATA_BYTES: ${MAX_DATA_BYTES:-1024}
+    ports:
+      - "${APP_PORT:-8080}:${APP_PORT:-8080}"
