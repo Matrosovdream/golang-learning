@@ -1,0 +1,93 @@
+# A five-node network: four miners in a mesh, plus one follower that only
+# validates. Peer IDs are derived from NODE_SEED (see cmd/peerid), which is why
+# they can be written here before the nodes have ever started.
+#
+#   docker compose up --build
+#   docker compose exec node1 /app/chainctl status -nodes http://node1:8080,http://node2:8080,http://node3:8080,http://node4:8080,http://node5:8080
+
+x-node: &node
+  build: .
+  environment: &env
+    APP_PORT: "8080"
+    P2P_PORT: "4001"
+    DATA_DIR: /data
+    # consensus — identical on every node, or they reject each other's blocks
+    CHAIN_ID: "${CHAIN_ID:-1337}"
+    DIFFICULTY: "${DIFFICULTY:-25}"
+    BLOCK_REWARD: "${BLOCK_REWARD:-50}"
+    MIN_FEE: "${MIN_FEE:-1}"
+    MAX_BLOCK_TXS: "${MAX_BLOCK_TXS:-100}"
+    DEV_ACCOUNTS: "${DEV_ACCOUNTS:-5}"
+    DEV_BALANCE: "${DEV_BALANCE:-1000000}"
+    # node-local policy
+    MINER_THREADS: "${MINER_THREADS:-1}"
+    PEER_SYNC_S: "${PEER_SYNC_S:-10}"
+
+services:
+  node1:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_SEED: node1
+      MINER_DEV_ACCOUNT: "0"          # each miner earns to its own dev account
+      BOOTSTRAP: "/dns4/node2/tcp/4001/p2p/12D3KooWHay9m7dumiMo8EvFYeqnDuwWGBSjn69NWprGTMSNkYEf,/dns4/node3/tcp/4001/p2p/12D3KooWGFDtNUjcvNm83BmCkFv2KKH8RHghdHBAAo2CSddn3Qyf,/dns4/node4/tcp/4001/p2p/12D3KooWSwsUDTVae5Ps9RmZPRMYycA9rc8sQNCjMBoFxdNMyL8m"
+    ports:
+      - "8081:8080"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_SEED: node2
+      MINER_DEV_ACCOUNT: "1"          # each miner earns to its own dev account
+      BOOTSTRAP: "/dns4/node1/tcp/4001/p2p/12D3KooWNJMvu24iarjknQr7P8miTyi4ZdynE5jjZCnRhyX1ffq8,/dns4/node3/tcp/4001/p2p/12D3KooWGFDtNUjcvNm83BmCkFv2KKH8RHghdHBAAo2CSddn3Qyf,/dns4/node4/tcp/4001/p2p/12D3KooWSwsUDTVae5Ps9RmZPRMYycA9rc8sQNCjMBoFxdNMyL8m"
+    ports:
+      - "8082:8080"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_SEED: node3
+      MINER_DEV_ACCOUNT: "2"          # each miner earns to its own dev account
+      BOOTSTRAP: "/dns4/node1/tcp/4001/p2p/12D3KooWNJMvu24iarjknQr7P8miTyi4ZdynE5jjZCnRhyX1ffq8,/dns4/node2/tcp/4001/p2p/12D3KooWHay9m7dumiMo8EvFYeqnDuwWGBSjn69NWprGTMSNkYEf,/dns4/node4/tcp/4001/p2p/12D3KooWSwsUDTVae5Ps9RmZPRMYycA9rc8sQNCjMBoFxdNMyL8m"
+    ports:
+      - "8083:8080"
+    volumes:
+      - node3-data:/data
+
+  node4:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_SEED: node4
+      MINER_DEV_ACCOUNT: "3"          # each miner earns to its own dev account
+      BOOTSTRAP: "/dns4/node1/tcp/4001/p2p/12D3KooWNJMvu24iarjknQr7P8miTyi4ZdynE5jjZCnRhyX1ffq8,/dns4/node2/tcp/4001/p2p/12D3KooWHay9m7dumiMo8EvFYeqnDuwWGBSjn69NWprGTMSNkYEf,/dns4/node3/tcp/4001/p2p/12D3KooWGFDtNUjcvNm83BmCkFv2KKH8RHghdHBAAo2CSddn3Qyf"
+    ports:
+      - "8084:8080"
+    volumes:
+      - node4-data:/data
+
+  # A follower: no mining, it only validates and serves what it receives.
+  node5:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_SEED: node5
+      MINER_THREADS: "0"
+      BOOTSTRAP: "/dns4/node1/tcp/4001/p2p/12D3KooWNJMvu24iarjknQr7P8miTyi4ZdynE5jjZCnRhyX1ffq8,/dns4/node2/tcp/4001/p2p/12D3KooWHay9m7dumiMo8EvFYeqnDuwWGBSjn69NWprGTMSNkYEf,/dns4/node3/tcp/4001/p2p/12D3KooWGFDtNUjcvNm83BmCkFv2KKH8RHghdHBAAo2CSddn3Qyf,/dns4/node4/tcp/4001/p2p/12D3KooWSwsUDTVae5Ps9RmZPRMYycA9rc8sQNCjMBoFxdNMyL8m"
+    ports:
+      - "8085:8080"
+    volumes:
+      - node5-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
