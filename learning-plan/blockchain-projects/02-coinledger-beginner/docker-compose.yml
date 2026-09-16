@@ -1,0 +1,26 @@
+services:
+  node:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT:-8080}
+      DATA_DIR: /data
+      # consensus params — every node of a network must agree (see README "Configuration")
+      CHAIN_ID: ${CHAIN_ID:-1337}
+      DIFFICULTY: ${DIFFICULTY:-18}
+      BLOCK_REWARD: ${BLOCK_REWARD:-50}
+      MIN_FEE: ${MIN_FEE:-1}
+      MAX_BLOCK_TXS: ${MAX_BLOCK_TXS:-100}
+      GENESIS_ALLOC: ${GENESIS_ALLOC:-}
+      # node policy
+      MINER_ADDRESS: ${MINER_ADDRESS:-}
+      BLOCK_TIME_MS: ${BLOCK_TIME_MS:-0}
+      MEMPOOL_SIZE: ${MEMPOOL_SIZE:-1000}
+      MAX_NONCE_GAP: ${MAX_NONCE_GAP:-16}
+      REBUILD_STATE: ${REBUILD_STATE:-false}
+    ports:
+      - "${APP_PORT:-8080}:${APP_PORT:-8080}"
+    volumes:
+      - chaindata:/data   # the chain survives `docker compose down`; `down -v` deletes it
+
+volumes:
+  chaindata:
