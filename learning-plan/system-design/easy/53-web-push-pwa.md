@@ -1,0 +1,327 @@
+# 53 · Web Push & the Installable App (PWA)
+
+`🟢 easy` · *Topics:* the Web Push protocol at design level (subscription = endpoint + keys, VAPID, encrypted payload, push services in the middle), a per-device subscription table, sending 5M pushes in 10 minutes, stale-subscription cleanup, TTL / urgency / collapse keys, at-least-once without duplicate spam, push vs in-app vs email and the permission ask, service worker and install facts the backend must respect · *Builds on:* [45 Live In-App Notifications](45-live-notifications.md) (the in-app channel and routing; not repeated), [12 Notification Service](12-notification-service.md) (the pipeline push plugs into), [15 Job Scheduler](15-job-scheduler.md) (range tasks)
+
+> ← [Index](../README.md) · [Progress](../PROGRESS.md) · Prev: [52 Configurable Forms](52-configurable-forms.md) · Next: [54 Programmatic Location Pages](54-programmatic-location-pages.md)
+
+---
+
+> 🌱 **Seed (honeydolist-site):** **a backlog plan, not built** (`docs/backlog/mobile-pwa.md`, added 2026-09-23, "planned, not scheduled"): grep finds no `push_subscriptions`, VAPID, manifest or service worker in the code. What *does* exist is the live channel: an SSE stream (`GET /admin/events`, PLAN steps 7p.2d and 7v.3, `platform/live`) fed by a Postgres `NOTIFY` on one channel that each API `LISTEN`s to, carrying only *what changed* (a kind and ids, never names or amounts); and the notification pipeline of ADR 0008 (`Notify` writes a `notifications` row plus an `outbox` message in one transaction, the worker sends), with per-person alert choices (migrations 0039, 0054, 0065). The plan decides: a PWA, push as a third `Notify` channel, **one subscription row per device** (`endpoint` unique, `p256dh`, `auth`), a **host allow-list** so the worker can't be turned into an SSRF tool, a hand-written service worker that **caches nothing**, scope `/dashboard/` only, `404`/`410` deletes the row, VAPID keys held by the worker only, `tag`/`Topic` so five new leads show as one notification. It also records two traps found on paper: the manifest sits behind an auth gate that redirects, so install fails silently; and an installed iPhone app has its own cookie jar, so a fixed 14-day session signs staff out every fortnight.
+> **Here, at scale:** a consumer-facing product with 20M subscribed devices, marketing campaigns to 5M devices in 10 minutes, transactional pushes all day, and 10–20% of subscriptions going stale every year.
+
+## 1. The task
+
+> "Add push notifications to our web app: users install it to their home screen, opt in, and get
+> notified even when the app is closed. Marketing wants to push a campaign to five million devices
+> in ten minutes, and nobody wants a notification that is about a stale order or arrives twice."
+
+You do not talk to a phone. You talk to a **push service** run by the browser vendor, and it talks
+to the device. Most of the design is what that indirection forces on you: opaque endpoints that
+silently die, a payload you can't recall, and a permission prompt you only get to show once.
+
+## 2. Clarifying questions
+
+| Ask | Why it matters | Assumed answer |
+|---|---|---|
+| Web push only, or also native (APNs/FCM tokens)? | Different protocols and tables. | Web Push (browser/PWA) only; native tokens are an extension. |
+| Who is notified: users, staff, customers? | Consent and volume. | Both staff (transactional) and consumers (opt-in marketing). |
+| Transactional vs marketing? | Priorities, TTL, quiet hours. | Both; transactional must not queue behind a campaign. |
+| One device or many per user? | Subscription model. | Many; a device can change hands (shared phone). |
+| Deep link on tap, badge counts? | Payload and service-worker behaviour. | Yes: tap opens a URL; badge on supporting platforms. |
+| What if the device is offline? | TTL and collapse. | Hold briefly (minutes to a day by type), then drop. |
+| Delivery guarantee? | Duplicates. | At-least-once to the push service; show-once via collapse keys. |
+| Scale? | Fleet size. | 20M devices, 40M routine pushes/day, 5M-device campaign in 10 min. |
+
+## 3. Requirements
+
+**Functional**
+- A page can ask permission and register a device; the server stores the subscription against a user.
+- Send a notification to a user (all their devices), a segment, or everyone.
+- Tap opens the right URL; later pushes about the same thing replace the earlier one.
+- Sign-out and deactivation stop pushes to that device at once.
+- Preferences: per category on/off, quiet hours, a frequency cap.
+
+**Non-functional**
+- Campaign of 5M inside 10 minutes without delaying transactional pushes.
+- Dead subscriptions removed automatically; no endless retries.
+- The sending service holds the private key; no device can make it call arbitrary hosts.
+
+**Out of scope**
+- Rich media, native app stores, SMS fallback logic (see [12](12-notification-service.md)), audience building.
+
+## 4. Back-of-the-envelope
+
+| Quantity | Estimate | How |
+|---|---|---|
+| Subscribed devices | 20M | given |
+| Subscription table | ~12 GB | 20M × ~600 B (endpoint ~400–500 B, two keys, label, timestamps, indexes) |
+| Routine pushes | ~40M/day ≈ 460/s | assume 2 per device per day: 40M ÷ 86,400 |
+| Campaign rate | ~8,300/s | 5,000,000 ÷ 600 s |
+| In flight during a campaign | ~830 | 8,333/s × ~0.1 s per POST to a push service (assumed) |
+| Bandwidth | ~12 MB/s ≈ 100 Mbit/s | 8,333 × ~1.5 KB (headers + encrypted payload under 1 KB) |
+| Workers | 8 workers × ~200 goroutines | ~1,600 slots, 2× headroom over 830 |
+| Stale subscriptions | 2–4M a year ≈ 5.5k–11k/day | 20M × 10–20% ÷ 365 |
+| Wasted sends if never pruned | 250k–500k per campaign | 5M × 5–10% (half a year of decay) |
+| Send log | ~4 GB/day | 40M × ~100 B; keep 7 days ≈ 28 GB |
+
+What the numbers tell us: **8k sends/s is a small fleet**, not a hard problem. What is hard is the
+*lifecycle* (a fifth of the fleet's addresses die every year, silently), *fairness* (a campaign
+must not delay "your driver has arrived"), and the *platform rules* (consent, install, a service
+worker that must not serve stale code).
+
+## 5. Plan
+
+1. How Web Push actually flows, and what a subscription is.
+2. The subscription table and its lifecycle (register, move, sign out, die).
+3. Sending: fan-out, rate, retries, TTL, urgency, collapse.
+4. Push vs in-app vs email, and the permission ask.
+5. Service worker and PWA install facts that reach the backend.
+
+## 6. High-level design
+
+```
+ browser (service worker)                          your servers                              push services
+ ───────────────────────                           ────────────                              ─────────────
+ pushManager.subscribe(VAPID public key)
+   └─ subscription {endpoint, p256dh, auth} ─────► POST /push/subscriptions ─► push_subscriptions
+                                                        │
+ event / campaign ─► Notify(audience, template) ─► outbox ─► fan-out job: device ranges
+                                                        │
+                                          send workers (HTTP/2 pools, one per push service)
+                                              POST endpoint   Authorization: vapid t=…,k=…
+                                                              Content-Encoding: aes128gcm
+                                                              TTL / Urgency / Topic
+                                                        │ 201 queued   404/410 gone   429/5xx retry
+                                                        ▼                                          ▼
+ service worker 'push' event ◄──────────────── (device online) ◄─────────────────── push service holds it
+   └─ showNotification(); tap → clients.openWindow(url)
+```
+
+You never see delivery. A `201` means the push service accepted the message, not that a phone
+buzzed. Everything downstream of that is the vendor's.
+
+## 7. API
+
+```
+GET    /push/config                       → 200 { "public_key": "<VAPID public key>" }
+POST   /push/subscriptions                { endpoint, keys: { p256dh, auth }, label? }  → 201 { id }   (upsert on endpoint)
+GET    /push/subscriptions                → 200 [my devices]
+DELETE /push/subscriptions/{id}           → 204                                            (sign-out calls this first)
+POST   /push/subscriptions/{id}/test      → 202                                            (goes through the real pipeline)
+POST   /internal/notifications            { audience, template, data, topic?, ttl, urgency }  → 202 { id }
+```
+
+The app calls `register` on **every open** if the browser's current subscription differs from
+the server's: that self-heals lost subscriptions, `pushsubscriptionchange` on browsers that don't
+fire it, and a rotated key.
+
+## 8. Data model
+
+```sql
+CREATE TABLE push_subscriptions (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id          BIGINT NOT NULL,
+    endpoint         TEXT   NOT NULL,                       -- opaque URL at the push service
+    endpoint_hash    BYTEA  NOT NULL UNIQUE,                -- sha256(endpoint): short, uniform unique key
+    p256dh           TEXT   NOT NULL,                       -- device public key
+    auth             TEXT   NOT NULL,                       -- device auth secret
+    label            TEXT,                                  -- "iPhone · Safari"
+    vapid_key_id     SMALLINT NOT NULL,                     -- which application server key it was made for
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_success_at  TIMESTAMPTZ,
+    failing_since    TIMESTAMPTZ                             -- first consecutive failure; sweep when old
+);
+CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id);
+
+CREATE TABLE push_sends (
+    notification_id  BIGINT NOT NULL,
+    subscription_id  BIGINT NOT NULL,
+    status           TEXT   NOT NULL CHECK (status IN ('queued','accepted','gone','failed','skipped')),
+    attempts         SMALLINT NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (notification_id, subscription_id)          -- the dedupe: one row per (message, device)
+);
+```
+
+The log is partitioned by day and dropped after 7 days (partitioned, its primary key gains the day
+column). On a retried fan-out task the primary key makes `INSERT … ON CONFLICT DO NOTHING` safe:
+devices already `accepted` are skipped, rows still `queued` (the worker died mid-send) are re-sent.
+
+## 9. Deep dives
+
+### 9.1 The protocol shape, and what a subscription is
+
+Design-level facts (the RFCs are 8030 for the protocol, 8291 for payload encryption, 8292 for
+VAPID):
+
+- The browser's `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })` returns a **subscription**: an **endpoint** (a URL at the browser vendor's push service) and two keys, `p256dh` (the device's public key) and `auth` (a shared secret). You store all three.
+- To send, you `POST` an **encrypted** body to the endpoint with a **VAPID** JWT in `Authorization`, signed with *your* private key and naming your public key. The push service checks the signature, stores the message, and delivers when the device is reachable. It cannot read the payload.
+- **The subscription is bound to the VAPID public key it was created with.** Rotating the application server key invalidates *every* existing subscription. Treat the key like a root of trust: one key per environment, `vapid_key_id` on the row, rotate by dual-registering, never casually.
+- A subscription is **per browser profile per device**, not per user. One user, many rows; a shared phone can change user: the register call **upserts on `endpoint_hash` and moves the row** to the signed-in user (honeydolist's plan does exactly this).
+
+| Option for the table | Pros | Cons |
+|---|---|---|
+| **One row per device, unique on `endpoint_hash`** | a `410` kills one row; moves cleanly between users | N rows per user to fan out |
+| One row per user with an array of endpoints | one read per user | a single dead endpoint rewrites the user row; no per-device status; harder to move |
+| Store only a vendor token and re-create the endpoint on send | tiny | not how Web Push works: the endpoint is the address |
+
+**Choice and why.** Per device, hash-keyed (the endpoint is long and vendor-controlled, and a
+unique index on a 450-byte string is wasteful). The worker looks up endpoint and keys **at send
+time**, so logs and the outbox carry a subscription id, never the endpoint or keys.
+
+**The SSRF angle.** The worker POSTs to a URL a client supplied. Without a check, a hostile client
+registers `http://169.254.169.254/…` and your sender fetches cloud metadata. honeydolist's plan
+allow-lists the known push hosts (Apple, Google, Mozilla, Microsoft) and re-checks in the driver.
+The cost of an allow-list is a code change when a new vendor appears; the alternative is the
+resolve-and-validate dialer from [10](10-webhook-delivery.md). Use both: an allow-list of
+*suffixes* plus the dialer that refuses private IPs, `https` only, no redirects.
+
+### 9.2 Sending at scale
+
+A campaign is one logical message and 5M sends. Model it like [15](15-job-scheduler.md)'s range
+tasks and [40](40-media-reprocessing.md)'s backfills:
+
+1. The audience resolves to a **snapshot** (a table of subscription id ranges); the campaign becomes tasks of ~5,000 devices each (≈ 1,000 tasks).
+2. Workers claim tasks with `SKIP LOCKED`, insert `push_sends` rows (`ON CONFLICT DO NOTHING`), and send with bounded concurrency.
+3. **Two lanes**: transactional and campaign, with the campaign lane capped (say 80% of send slots) so a 10-minute blast cannot delay "your table is ready". Same priority-lane idea as [12](12-notification-service.md).
+4. **Per push-service limits.** Each vendor throttles you. Keep an HTTP/2 connection pool and a token bucket **per host** ([03](03-rate-limiter.md)); on `429` honour `Retry-After` and slow *that host's* lane only.
+
+| Response | Meaning | Action |
+|---|---|---|
+| `201` | accepted by the push service | mark `accepted`, set `last_success_at` |
+| `404`, `410` | subscription gone | **delete the subscription**; never retry |
+| `400`, `413` | malformed or payload too large | permanent for this message; log |
+| `401`, `403` | VAPID rejected (key mismatch) | page a human; this is *your* bug, not the device's |
+| `429` | you are sending too fast | back off per `Retry-After` |
+| `5xx`, timeout | vendor trouble | retry with jittered backoff, within the message's TTL |
+
+**Duplicates.** Push has no idempotency key; a retry after a lost response can deliver twice. Two
+defences: the `(notification_id, subscription_id)` primary key stops *your* double sends, and a
+**collapse key** (`Topic` header, plus `tag` in `showNotification`) makes a duplicate *replace* the
+earlier one on the device and at the push service instead of stacking.
+
+**TTL, urgency, payload.** `TTL` is how long the push service may hold the message for an offline
+device: "your driver has arrived" is 60 seconds (afterwards it is false), a promo is 24 hours.
+`Urgency` (very-low to high) lets the vendor save battery for low-priority sends. Keep payloads
+**small** (the practical limit is about 4 KB; aim for under 1 KB) and **send data, not a story**:
+a title, a short body, a URL, and an id the app can re-read, the same "a notification says what
+changed, never how" rule honeydolist's live stream follows.
+
+```go
+// Illustrative, with github.com/SherClockHolmes/webpush-go (the library the backlog plan names).
+resp, err := webpush.SendNotificationWithContext(ctx, payload,
+    &webpush.Subscription{Endpoint: sub.Endpoint, Keys: webpush.Keys{P256dh: sub.P256dh, Auth: sub.Auth}},
+    &webpush.Options{
+        Subscriber:      "mailto:ops@example.com",
+        VAPIDPublicKey:  pub, VAPIDPrivateKey: priv,
+        TTL:             60, Urgency: webpush.UrgencyHigh, Topic: "delivery-"+orderID,
+    })
+// resp.StatusCode → the table above; always resp.Body.Close()
+```
+
+### 9.3 Push, in-app or email, and the permission ask
+
+| Channel | Reaches | Costs | Use for |
+|---|---|---|---|
+| **In-app** ([45](45-live-notifications.md)) | users with the app open | nothing; instant | live updates, unread badges |
+| **Web push** | closed app, opted-in device | a consent step; payload limits; vendor trust | time-sensitive, personal ("leave now") |
+| **Email** ([12](12-notification-service.md)) | everyone with an address | deliverability work; slow to read | receipts, digests, anything that must be kept |
+
+The escalation ladder is the one from [45](45-live-notifications.md) §9.4: in-app first; if unread
+after N minutes and push is on, push; if still unread and it matters, email. What this task adds is
+**consent**, because it is the part that decides your reach:
+
+- The browser's permission prompt can be shown, and if the user taps *Block* you can **never ask again** from the page. So ask with a **soft prompt first** ("Get a message when your order ships?" with *Yes / Not now*); only a *Yes* triggers the real browser prompt, and only after a user gesture, never on page load.
+- Opt-in rates are low and vary a lot; plan reach from measured opt-ins, not from installs. (Any specific percentage you quote is an assumption.)
+- A **preference centre** (per category, quiet hours, frequency cap) is what keeps people subscribed. Count unsubscribes: an annoying push costs you the device for good.
+- Quiet hours and caps are evaluated in the **send worker at send time** against the user's time zone, so a delayed message never lands at 03:00.
+
+### 9.4 Service worker and PWA facts that reach the backend
+
+Push needs a **service worker** (the code that wakes to show the notification). Three things the
+backend team must get right:
+
+- **The manifest and the service worker file must be served without authentication.** honeydolist's plan found its own trap: its dashboard sits behind a gate that redirects signed-out requests to `/login`, and the browser fetches the manifest **without cookies**, so installing would fail silently. Serve `manifest.webmanifest`, `sw.js` and the icons outside the gate; they contain nothing private.
+- **A stale service worker is the classic foot-gun.** One that precaches the app serves yesterday's bundle after a deploy. The plan's answer is a worker that handles `push`, `notificationclick` and `pushsubscriptionchange` and **caches nothing**, served with `Cache-Control: no-cache` so a new version is picked up on the next load, scoped to one path, and *not* installed on the public marketing site where it would cost page speed. If you do cache an offline shell, version it and delete old caches on `activate`.
+- **Platform rules** (as of my knowledge, treat as time-sensitive): on iPhone/iPad, web push works only for a site **added to the Home Screen** (iOS/iPadOS 16.4 and later) and the permission request must come from a tap inside the installed app; Android Chrome and desktop browsers allow it from a normal tab. An installed iOS app keeps **its own cookie jar**, separate from Safari: a fixed 14-day session therefore signs people out every fortnight, which is why the plan proposes **sliding sessions** (renew after half the lifetime).
+
+### 9.5 Lifecycle: no pushes to the wrong phone
+
+| Event | What the server does |
+|---|---|
+| Sign-out on a device | the app unsubscribes (`pushManager.unsubscribe()` and `DELETE`) **before** the logout call |
+| Another user signs in on the same device | upsert on `endpoint_hash` moves the row |
+| Account deactivated / email changed | delete that user's subscriptions in the same transaction as the sessions |
+| `404`/`410` from the push service | delete the row |
+| Silent death (no `410`, device off for months) | `failing_since` plus a sweep: no success for 90 days → delete |
+| App opened | compare browser subscription and key with the server; re-register on mismatch |
+
+Recipients are resolved **at event time** from current permissions and consent: losing a role
+stops the alerts with no cleanup, the property honeydolist's plan wants from "users with the
+event's permission who have a device on".
+
+## 10. Scaling, bottlenecks & failure modes
+
+- **What breaks first at 10×** (50M devices, 80k sends/s): the push services throttle you before your fleet saturates, so per-host buckets and campaign windows matter more than worker count; then the `push_sends` write volume (partition by day, batch inserts) and the audience snapshot step.
+- **A vendor's push service is down:** only that host's lane backs off; TTL expires old messages; transactional pushes to other vendors continue.
+- **VAPID key mishap** (wrong key deployed): every send is `401/403`. Alert on the *ratio*, and make the dual-key registration the default so a key can be rolled back without orphaning devices.
+- **Stale list before a campaign:** run the sweep and prune first; sending to a 10% dead list wastes 500k requests against your per-host rate budget (and a push service may treat a high error rate as abuse; that is theirs to decide).
+- **Notification storm from one bug:** per-user caps in the send worker (e.g. 5 per hour for non-critical categories) and a global kill switch ([51](51-runtime-settings.md)).
+- **Privacy:** the push service cannot read the encrypted payload, but it sees timing and your endpoint; keep sensitive details out of the payload anyway (a lock screen is public).
+- **Single points of failure:** the audience snapshot job, the worker's private key (store it as a secret, [42](42-credentials-vault.md)), the subscription database.
+
+## 11. Trade-offs at a glance
+
+| We chose | Instead of | We gain | We give up |
+|---|---|---|---|
+| Web Push / PWA | Native apps first | no store, one codebase, immediate updates | iOS install friction, weaker badge/background features |
+| One row per device | One row per user | per-device failures and moves | N rows to fan out |
+| `endpoint_hash` as unique key | Unique on the URL | small uniform index | a computed column on write |
+| Two send lanes + per-host buckets | One FIFO | transactional never waits behind a campaign | tuning two queues |
+| Collapse keys + `(message, device)` PK | Trusting retries | duplicates replace rather than stack | one extra row per send |
+| Soft prompt before the browser prompt | Prompt on load | a refusal is not permanent | an extra tap, fewer total prompts |
+| Service worker that caches nothing | Offline-first shell | no stale-bundle bugs | no offline mode |
+
+## 12. Check yourself
+
+1. What exactly is a push subscription, and why do you not talk to the device?
+2. Why one row per device, unique on a hash of the endpoint?
+3. List the response codes from a push service and what you do for `201`, `410`, `429`, `403`.
+4. How do you stop a 5M-device campaign delaying a transactional push, and a retry showing twice?
+5. Why does an authentication gate in front of the manifest break installing, and what does iOS change about push?
+
+<details><summary>Answers</summary>
+
+1. An endpoint URL at the browser vendor's push service plus two keys (`p256dh`, `auth`). You POST an
+   encrypted message to the endpoint, signed with your VAPID key; the push service stores it and
+   forwards when the device is reachable. Delivery to the device is entirely theirs.
+2. A device is the unit that fails (`410`) and moves (shared phone); a user has many. The endpoint is
+   long, so a `sha256` makes a compact unique key and the upsert moves the row to the new user.
+3. `201` accepted: mark it, set `last_success_at`. `410`/`404`: delete the subscription. `429`: back
+   off that host's lane per `Retry-After`. `403`/`401`: VAPID mismatch, page a human (never delete
+   devices for it). `5xx`/timeout: retry with jittered backoff inside the TTL.
+4. Separate lanes with the campaign lane capped (and per-host token buckets), so campaign slots are
+   never all of them. For repeats: `(notification_id, subscription_id)` primary key prevents your own
+   double sends, and a `Topic`/`tag` collapse key makes a duplicate replace the earlier notification.
+5. Browsers fetch the manifest and service worker without cookies; a gate redirecting to a login
+   page returns HTML instead, so install silently fails. Serve them outside the gate. On iOS, push
+   works only for a site added to the Home Screen and the prompt must come from a tap in the
+   installed app, which also has its own cookie jar (hence sliding sessions).
+
+</details>
+
+## 13. In Go
+
+- Related lessons: [44 Background jobs](../../44-background-jobs-queues.md) (range tasks, retries), [36 Resilience](../../36-resilience-patterns.md) (backoff with jitter, per-host bulkheads), [58 Realtime: WebSockets & SSE](../../58-realtime-websockets-sse.md) (the in-app channel), [57 Web security](../../57-web-security.md) (SSRF, secrets), [68 Rate limiting & throttling](../../68-rate-limiting-throttling.md) (per-host buckets), [63 Networking fundamentals](../../63-networking-fundamentals.md) and [66 Serving Go apps](../../66-serving-go-apps.md) (HTTP/2 pools, serving static files with the right headers).
+- One `http.Client` per push host with an `http2`-enabled `Transport` and a bounded `MaxConnsPerHost`; a `golang.org/x/time/rate.Limiter` per host; never share one limiter across vendors.
+- Serve `sw.js` with `Cache-Control: no-cache` and `manifest.webmanifest` as `application/manifest+json`; test both **signed out**.
+- Packages: `github.com/SherClockHolmes/webpush-go` (or ~150 lines on `crypto/ecdh` and `x/crypto/hkdf` for RFC 8291), `pgx/v5`, `golang.org/x/time/rate`, `golang.org/x/sync/errgroup`.
+
+## 14. Extensions
+
+- **Native tokens** (APNs/FCM) as a second driver and a `kind` column on the subscription; one `Notify`, two transports.
+- **Per-user event preferences** as a table (category × channel × quiet hours), the thing honeydolist's plan defers until the second event type.
+- **Badge counts** and silent updates: what the payload must carry, and the platform limits.
+- **Rich campaigns:** A/B variants, send-time optimisation per user time zone ([27](27-deadlines-escalation.md) §9.5, the 09:00 herd and jitter), and measuring tap-through with a `?n=<id>` on the tap URL ([47](47-web-analytics.md)).
+- **Sliding sessions** for the installed app: the security trade-off of renewing a session on use.
+- **Offline-capable PWA:** a versioned shell cache and the update flow that avoids serving a stale app.

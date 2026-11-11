@@ -50,7 +50,7 @@ able to hurt us or each other.
 |---|---|---|
 | Deliveries | ~175/s average, ~1,750/s peak | 115 events/s × 1.5 endpoints, peak 10× |
 | In-flight at peak | ~1,750 × 0.5 s ≈ 900; worst case with 10 s timeouts ≈ 17k | rate × duration |
-| Retries | if 5% fail and retry ~6 times: +50% load | retries are not free |
+| Retries | if 5% fail and retry ~6 times: 0.05 × 6 = +30% load | retries are not free |
 | Delivery rows | 15M/day, ~500 B each (with response snippet) → 7.5 GB/day | keep 30 days ≈ 225 GB |
 | Workers | a few hundred goroutines per node, a few nodes | mostly waiting on the network |
 
@@ -235,7 +235,8 @@ Use all of them. They are cheap and they compose.
 
 **For us** (an attacker registers an endpoint pointing at *our* internals: SSRF):
 - Resolve the hostname and refuse private, loopback, link-local and metadata ranges
-  (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `::1`, `fd00::/8`).
+  (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `0/8`, `100.64/10`, `169.254/16`, `::1`, `fc00::/7`,
+  `fe80::/10`), and unwrap IPv4-mapped IPv6 (`::ffff:10.0.0.1`) so it is checked as IPv4 too.
 - Re-check **after DNS resolution at connect time** (DNS rebinding: the name resolves to a public
   IP during validation and to `169.254.169.254` a second later). Use a custom dialer that validates the IP it is about to connect to.
 - Don't follow redirects (a public URL redirecting to an internal one).

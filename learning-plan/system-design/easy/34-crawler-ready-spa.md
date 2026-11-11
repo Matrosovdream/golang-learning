@@ -1,0 +1,355 @@
+# 34 · Crawler-Ready SPA Serving
+
+`🟢 easy` · *Topics:* what the first response must contain for each kind of client, SSR vs prerender vs dynamic rendering vs head-only injection vs head-plus-body templates, bot classes and verification (UA + reverse DNS), a bot lane that cannot starve humans, tiered HTML caching, honest status codes from an SPA shell, one data model projected to HTML, JSON-LD and Markdown · *Builds on:* [03 Rate Limiter](03-rate-limiter.md) (lanes and limits), [05 Cache with TTL](05-kv-cache-ttl.md) (L1), [11 Image Upload & Hosting](11-image-upload-hosting.md) (CDN, immutable assets), [32 Block-Based CMS](32-block-cms.md) (the content being rendered)
+
+> ← [Index](../README.md) · [Progress](../PROGRESS.md) · Prev: [33 Sitemaps & Crawl Notifications](33-sitemaps-crawl-notify.md) · Next: [35 Redirect Manager & 404 Tracker](35-redirect-manager.md)
+
+---
+
+> 🌱 **Seed (honeydolist-site):** ADR 0001 proposed Nuxt SSR; ADR 0002 rejected it for a **client-rendered Vue SPA whose Go
+> backend serves `index.html` with a per-route `<head>` injected from the database** (title, canonical, Open Graph,
+> JSON-LD via `html/template` and `json.Marshal`, never string concatenation). A missing record is a real `404`, a
+> database error is an uncached `503` with `Retry-After` (never a 404 that would teach crawlers a page is gone), pages
+> are cached in memory by path (5 min, 404s 30 s) and purged on every admin save. Measured (Step 73, with each bot's
+> user-agent string): every bot got the same 7,197-byte shell with `<div id="app"></div>`; AI fetchers are, by their
+> published descriptions, plain fetchers that run no script, so they could quote a title and one sentence.
+> **Step 73** then wrote the page's words as plain HTML inside `#app`, replaced on mount (no layout shift measured), from
+> the same use cases as the API; added `ETag`/`Last-Modified` with `304`s; Step 85 serves a **Markdown copy of every page**
+> built from the same `Body`, plus `llms.txt`/`llms-full.txt`; Steps 92–93 add `ImageObject` JSON-LD and images in
+> `<noscript>`. A *number-parity test* proves every number in the API payload appears in the body and the reverse.
+> **Here, at scale:** 20M pages, 30% of traffic is bots and link-preview scrapers, and the origin must survive crawl
+> spikes of 20k requests/s on mostly-cold URLs.
+
+## 1. The task
+
+> "Our storefront is a single-page app with 20 million product and content pages. Search engines, link-preview
+> scrapers and AI assistants must see real content, correct metadata and correct status codes, without changing what
+> humans see, and without a crawl spike taking the site down."
+
+An SPA's first response is an empty shell. Everything here is about what to put in that response, who gets it, how it
+is cached, and how to keep one source of truth for three outputs.
+
+## 2. Clarifying questions
+
+| Ask | Why it matters | Assumed answer |
+|---|---|---|
+| Who reads the page without running script? | Decides how much goes in the HTML. | Link-preview scrapers (head only), AI/answer fetchers (body), Bing (partial JS), Google (renders, deferred). |
+| Is content DB-backed and editable live? | Rules out build-time prerender for everything. | Yes, edits visible in seconds. |
+| Is Nuxt/Next an option? | The big alternative. | Not now; revisit with explicit triggers (§9.1). |
+| Page kinds? | The cost of a second renderer. | 12 kinds (home, list, detail, category, article…). |
+| Do bots get the same HTML as humans? | Cloaking risk. | Always identical bytes. |
+| Crawl spikes? | Capacity and shedding. | 20k req/s for hours, mostly cold long-tail URLs. |
+| Freshness vs load? | TTLs and purge. | 5 min TTL, purge on publish within seconds. |
+| Scale of humans? | The cache hot set. | ~21k req/s peak of HTML from humans; bots add ~9k/s normally. |
+| Statuses that matter? | Soft-404 cost. | 200, 301/308, 404, 410, 503 all real. |
+
+## 3. Requirements
+
+**Functional**
+- The first response carries: a correct `<head>` (title, description, canonical, Open Graph, robots meta, JSON-LD),
+  the page's content as plain HTML inside `#app` (replaced on mount), and the bootstrap data for the app.
+- Real status codes decided **before** any HTML is built.
+- A Markdown copy of each page and `llms.txt` for agents, from the same data.
+- Conditional requests (`ETag`, `If-None-Match`, `HEAD`) so crawler revisits are cheap.
+
+**Non-functional**
+- Humans' p99 stays flat while bots spike: bots are a lower-priority lane.
+- Cold render ≤ 10 ms server-side; cache hit ≤ 2 ms.
+- No cloaking, no hidden text, no content only bots see.
+- Hostile data (`</script>`, `<img onerror>`) stays inert.
+
+**Out of scope**
+- Hydration strategy inside the SPA, A/B testing, personalisation, the sitemap ([33](33-sitemaps-crawl-notify.md)).
+
+## 4. Back-of-the-envelope
+
+| Quantity | Estimate | How |
+|---|---|---|
+| Pages | 20M | given |
+| Rendered response | ~25 KB raw, ~5 KB gzip | head ~3 KB + crawler body ~10 KB + bootstrap JSON ~12 KB (assumption); honeydolist's *empty* shell is 7.2 KB |
+| Whole corpus | 500 GB raw / 100 GB gz | 20M × 25 KB; 20M × 5 KB |
+| HTML requests, peak | ~30k/s | ~21k humans + ~9k bots (30%) |
+| Crawl spike | +20k/s, cold | given |
+| Cold render | ~3 ms CPU + 3 indexed queries | Go template + use cases (assumption) |
+| Unprotected spike | 60 cores, ~60k qps to the DB | 20k × 3 ms; 20k × 3 queries; one Postgres does ~10k+ indexed reads/s |
+| Hot set for RAM | ~5 GB | top 200k pages × 25 KB (1 GB gzipped) |
+| Snapshot reads in a spike | ≥ 4 S3 prefixes, use 16 | 20k ÷ 5,500 GET/s per prefix ≈ 3.6 |
+| Re-render everything (template change) | ~16.7 CPU-hours ≈ 10 min on 100 cores | 20M × 3 ms = 60,000 CPU-s |
+
+What the numbers tell us: a *cold* spike cannot reach the database (60k qps) or the renderer (60 cores) unprotected. If
+95% is answered from **snapshots** (pre-rendered HTML in object storage) the residue is 1k renders/s ≈ 3 cores and 3k
+qps, comfortable. Capacity work is about *not rendering twice* and *shedding bots first*, not about faster templates.
+
+## 5. Plan
+
+1. Decide what the first response contains for each kind of client; pick the rendering strategy.
+2. One `Page` model built by the use cases the API already uses; three projections (HTML body, JSON-LD, Markdown).
+3. Resolve the route and the status code before rendering.
+4. Cache tiers and keys; snapshots written on publish.
+5. Bot lanes, verification and shedding.
+6. Failure behaviour: deploys, stale-if-error, cold start.
+
+## 6. High-level design
+
+```
+ humans │ Googlebot/Bingbot │ AI fetchers │ link-preview scrapers
+        ▼
+ CDN / WAF ── cache (s-maxage + SWR) ── "verified bot" flag ── per-class rate limits
+        │ miss
+        ▼
+ Shell service (Go) ─ lane: human │ bot  (separate concurrency pools; bots shed first)
+   1. route manifest → resolver ⇒ kind + keys + STATUS (200/301/404/410) — before any HTML
+   2. L1  in-process LRU: hot pages (5 min), one shared 404 body
+   3. L2  snapshot store: pre-rendered html.gz per page, 16 key prefixes, written on publish
+   4. L3  render: use cases → Page model → head + crawler body + bootstrap JSON (html/template)
+        ▼
+ Postgres replicas      publish ─► outbox ─► snapshotter (render, PUT, purge CDN by tag)
+```
+
+A response is `<head>` + `<div id="app">`*crawler body*`</div>` + `<script type="application/json" id="boot">` + the
+bundle `<script>`. The SPA empties `#app` on mount, so humans never see the plain version for more than a moment.
+
+## 7. API
+
+```
+GET  /{path}        → 200 HTML | 301/308 Location | 404 | 410 | 503 + Retry-After + Cache-Control: no-store
+HEAD /{path}        → same status and headers, no body
+GET  /{path}.md     → 200 text/markdown; Link: <https://…/path>; rel="canonical"   (same Page model as the HTML)
+GET  /llms.txt      → 200 text/plain        GET /llms-full.txt → 200 (built once at a time, cached 5 min)
+Response headers:   ETag: "<hash of the bytes sent>"   Last-Modified: <when these bytes were first made>
+                    Cache-Control: public, max-age=0, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400
+                    Vary: Accept-Encoding   X-Robots-Tag: noindex (only where intended)
+If-None-Match / If-Modified-Since → 304
+```
+
+## 8. Data model
+
+```sql
+CREATE TABLE page_snapshots (
+    page_id      BIGINT PRIMARY KEY,
+    tmpl_version INTEGER NOT NULL,                -- bump to re-render everything lazily
+    content_hash BYTEA   NOT NULL,                -- of the Page model that was rendered
+    etag         TEXT    NOT NULL,
+    object_key   TEXT    NOT NULL,                -- 'html/<prefix 0-15>/<tenant>/<page_id>.html.gz'
+    rendered_at  TIMESTAMPTZ NOT NULL,
+    last_modified TIMESTAMPTZ NOT NULL            -- first time THESE bytes existed: survives re-renders that yield identical bytes
+);
+CREATE INDEX page_snapshots_stale_idx ON page_snapshots (tmpl_version, rendered_at);   -- backfill order
+
+CREATE TABLE tombstones (                         -- why a deleted page is a 410/301, not a 404
+    path        TEXT PRIMARY KEY,
+    status      SMALLINT NOT NULL CHECK (status IN (301, 308, 410)),
+    location    TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((status = 410) = (location IS NULL))
+);
+
+CREATE TABLE bot_ip_verdicts (                    -- or Redis with a 24 h TTL
+    ip          INET PRIMARY KEY,
+    bot         TEXT,                             -- 'googlebot' | 'bingbot' | NULL (claimed but unverified)
+    verified_at TIMESTAMPTZ NOT NULL
+);
+```
+
+Snapshot bodies live in object storage; Postgres holds only the index. The *route manifest* is the site's `pages`/slug
+tables plus code patterns, shared by the Go resolver and the Vue router (a test asserts every frontend route resolves
+non-404 on the backend; honeydolist's `pages` table doubles as that manifest).
+
+## 9. Deep dives
+
+### 9.1 What does the first response contain, and who renders it?
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Full SSR** (Nuxt/Next on a Node pool) | one component tree renders for bots and humans; hydration | a Node fleet in the request path; JS render CPU ≫ a Go template; cold crawl spikes hit it hardest; SSR-safety rules (`window`) |
+| **Build-time prerender (SSG)** | static files on a CDN, fastest | 20M pages = hours per build; an edit waits for a build; can't show a DB change live |
+| **Dynamic rendering** (headless Chrome for bots only) | no app change | Chrome in production, hundreds of ms to seconds per page (thousands of cores at 20k/s); two audiences invite cloaking; Google calls it a workaround |
+| **Head-only injection** (honeydolist ADR 0002) | ~80 lines; link previews correct; Google indexes via its render pass | AI fetchers and weaker renderers see no body; Google's render queue adds delay |
+| **Head + crawler body from Go templates, replaced on mount** (Step 73) | no script needed by any bot; same use cases as the API; cheap | a **second renderer** beside Vue: drift you only see with JS off |
+
+**Choice: head + crawler body, with a parity test.** The body is the *same content a person sees*, not different
+content for bots, so it isn't cloaking. The drift risk is managed, not ignored: the number-parity test (every number in
+the API payload appears in the body, and every number in the body comes from the payload) runs in CI for each page kind.
+Be honest about the exit: honeydolist's own design notes say server HTML plus client components *is* SSR, and that
+"if server-rendered body matters later, the honest fix is Nuxt, not a hand-rolled second renderer". Set **triggers**
+that move you: more than ~25–30 block/page kinds, repeated drift incidents, or interactive content bots must see. Until
+then 12 templates are cheaper than a Node fleet.
+
+### 9.2 Bots: classify, verify, shed, never cloak
+
+| Class | Examples | Reads | Policy |
+|---|---|---|---|
+| Search crawlers | Googlebot, bingbot | head + body (Google also renders JS) | verified → good rate, below humans in priority |
+| Link-preview scrapers | Facebook, Slack, WhatsApp, X | `<head>` only; cache for days | always get the full head; absolute 1200×630 JPEG/PNG `og:image` |
+| AI/answer fetchers | `OAI-SearchBot`, `ClaudeBot`, `PerplexityBot`, … | body, **no script** | allow by robots choice; same HTML |
+| Unknown / spoofed | anything claiming to be Googlebot | everything | unverified claim = ordinary client limits |
+
+A User-Agent is a *claim*. Verify the big crawlers with **reverse DNS then forward-confirm** (or the vendor's published
+IP ranges), cache the verdict per IP for ~24 h, and time the DNS lookup out at ~200 ms (timeout = unverified). A CDN's
+"verified bot" flag does the same by network address; honeydolist noticed a UA-string test from an ordinary address
+proves nothing about whether the *real* bot gets in.
+
+```go
+func verifiedBot(ctx context.Context, ip netip.Addr, suffixes []string) bool {
+	names, err := net.DefaultResolver.LookupAddr(ctx, ip.String()) // reverse: PTR
+	if err != nil {
+		return false
+	}
+	for _, name := range names {
+		name = strings.TrimSuffix(name, ".")
+		if !hasSuffixAny(name, suffixes) { // e.g. ".googlebot.com", ".google.com"
+			continue
+		}
+		addrs, err := net.DefaultResolver.LookupHost(ctx, name) // forward-confirm
+		for _, a := range addrs {
+			if p, perr := netip.ParseAddr(a); err == nil && perr == nil && p.Unmap() == ip.Unmap() {
+				return true
+			}
+		}
+	}
+	return false
+}
+```
+
+| Spike strategy | Pros | Cons |
+|---|---|---|
+| Treat everyone equally | simple | a crawl spike degrades humans |
+| `Crawl-delay` in robots.txt | free | Google ignores it |
+| **Separate lane + shed with `503 + Retry-After`** | humans protected; major crawlers back off on 429/503 | bots may crawl slower for a while |
+| Block bots | zero load | disappears from search |
+
+**Choice: two concurrency pools** (a semaphore each; the bot pool is smaller and sheds first with `503` and
+`Retry-After`) plus the snapshot tier, which makes most bot hits cheap. **The lane changes priority, never content.**
+
+### 9.3 Caching rendered HTML
+
+| Option | Pros | Cons |
+|---|---|---|
+| CDN only | zero origin code | the long tail is never warm: 20k/s of cold URLs all reach origin |
+| In-process map only (honeydolist) | trivial; microseconds | 500 GB doesn't fit; every node warms separately; no cross-node purge |
+| **CDN → L1 LRU → L2 snapshots → render** | spike absorbed by snapshots; hot set in RAM | three layers to keep coherent |
+| Pre-render and store *everything* | origin never renders | big backfill after each template change |
+
+**Choice: three tiers.** The **snapshotter** renders on publish (event from the outbox, [10](10-webhook-delivery.md)),
+writes `html.gz` to object storage under one of 16 key prefixes, and purges the CDN by tag ([32](32-block-cms.md)). L1 is a
+bounded LRU of the hot ~200k pages (5 min TTL). A request miss falls to L2 (`GET` ~10–30 ms), and only an L2 miss
+renders. Rules that decide whether it works:
+
+- **Key hygiene.** The key is the normalised path plus an **allow-listed variant** (honeydolist keys a product by
+  `?offer=` only, with a length cap and forbidden characters); every other query parameter is dropped, or `?utm=x`
+  turns 20M pages into 20M × ∞ cache entries.
+- **Never cache failures.** `503` is `no-store`. A `404` gets a short TTL (30 s: it may be published in a moment) and,
+  at scale, **one shared 404 body** in memory rather than a cached entry per junk path. Honeydolist's own `Stats()`
+  comment notes that crawler 404s "pile up between saves" in an unbounded map; cap it.
+- **Validators.** `ETag` = hash of the bytes sent; `Last-Modified` = when those bytes were *first made* and kept across
+  re-renders producing identical bytes, so a crawler's revisit is a `304` even after a cache drop (honeydolist does
+  exactly this). A `304` saves bandwidth but still spends crawl budget; the real fix for budget is fewer, better URLs.
+- **Stampede control.** `singleflight` per key at L3 ([38](../../38-caching-patterns.md)); serve stale while one request
+  refreshes; `stale-if-error` so a dead database means stale pages, not an outage.
+- **Template version bump:** don't re-render 20M at once (16.7 CPU-hours). Serve old snapshots (stale-while-revalidate)
+  and backfill hot-first at a capped rate using the `page_snapshots_stale_idx` order.
+
+### 9.4 Real status codes from an SPA shell
+
+A client-side router cannot change the HTTP status, so a naive SPA answers `200` for every path and shows "not found"
+in the browser: a **soft 404**. Crawlers waste budget on infinite bogus URLs and dilute the real ones. The resolver
+decides the status first, in a fixed order (honeydolist's):
+
+| Situation | Status | Note |
+|---|---|---|
+| Live page | 200 | self-referencing canonical |
+| Draft, unpublished, never written | 404 | also absent from API, sitemap, `llms.txt` |
+| Deleted on purpose | 410, or 301 to its list | via `tombstones`; honeydolist sends removed/archived pages to their list with a 301 |
+| Moved (slug change) | 301/308 | looked up **last**: a live page always wins its address ([35](35-redirect-manager.md)) |
+| Render or database error | **503** + `Retry-After`, `no-store` | never 404 (would teach crawlers the page is gone) and never 200 with a default card |
+| Staging / non-public host | `X-Robots-Tag: noindex` | and `Disallow: /` ([33](33-sitemaps-crawl-notify.md)) |
+
+Two pitfalls: the route table in the backend is now authoritative for "what exists" and must never drift from the
+Vue router (one shared manifest, plus a test); and **paging**: crawlers must be able to *follow* `<a href="?page=n">`
+links, while the head's canonical stays on the list's own address (honeydolist: the shell ignores `?page=n`, so every
+page n has page 1's head and the crawler body shows page 1).
+
+### 9.5 One model, three projections
+
+| Option | Pros | Cons |
+|---|---|---|
+| Hand-write HTML, JSON-LD and Markdown separately | simplest per output | three sources of truth; they disagree within a month |
+| JSON-LD injected by client script | one place | AI fetchers don't run script; Google may read it, others won't |
+| **One `Page` model → `RenderBody`, `JSONLD`, `Markdown`** | structured data and text can't disagree; each output testable | a model rich enough for all three |
+
+**Choice: one model.** The use cases build a `Page` (the same ones the JSON API serves); three pure functions project
+it: an `html/template` body, a single `@graph` of JSON-LD built with `json.Marshal` (a name containing `</script>` stays
+inside its tag; `template.JS` stops the engine mangling it), and a Markdown renderer for `/page.md` and
+`llms-full.txt`. Rules inherited from honeydolist: the markup tells the truth (an `Offer`'s price equals the price
+shown; no rate means no offer); **omit empty values** rather than invent them (no hours until typed); never self-write
+`AggregateRating`/`Review`; list photos as `ImageObject` nodes and, in the body, as `<img>` inside `<noscript>` (JS
+clients don't download them twice); test hostile names in every field. Link-preview scrapers cache hard and you can't
+purge their caches, so get `og:image` right the first time: absolute HTTPS, no redirects, 1200×630, small JPEG/PNG.
+
+## 10. Scaling, bottlenecks & failure modes
+
+- **What breaks first at 10×** (200k req/s crawl spike): S3-style prefix limits (≥ 40 prefixes), then egress and the CDN
+  bill; shedding bots earlier. The database stays safe if snapshots exist for the tail.
+- **Cold start / deploy:** empty L1 plus a stampede. Warm the top-N list from snapshots before taking traffic; roll
+  nodes gradually.
+- **Old shell, deleted bundle:** a cached page references `app.abc123.js` that a deploy removed; Googlebot indexes it
+  blank. Hashed immutable assets, and keep the last several deploys' files ([62](../../62-deployment-operations.md)).
+- **Snapshot store down:** humans fall through to L3; bots get `503`. **Database down:** serve stale (`stale-if-error`),
+  `503` only on true misses.
+- **Wrong status cached:** a 404 cached for a page published a second later: 30 s TTL plus a publish purge bound it.
+- **Bot verification slow:** DNS timeout ⇒ treat as unverified; never block a request on it for long.
+- **Hostile content in a snapshot:** snapshots are rendered by the escaping template; re-render on any escaping fix
+  (bump `tmpl_version`).
+- **Single points of failure:** the snapshotter (events queue), the CDN purge path (TTL is the backstop).
+
+## 11. Trade-offs at a glance
+
+| We chose | Instead of | We gain | We give up |
+|---|---|---|---|
+| Head + crawler body from Go templates | Nuxt/Next SSR | no Node fleet, cheap renders, same use cases as the API | a second renderer and a parity test |
+| Same bytes for every client | bot-specific pages | no cloaking risk, one cache | nothing |
+| Bot lane + `503/Retry-After` shedding | equal treatment | humans protected during spikes | slower crawling during a spike |
+| Pre-rendered snapshots on publish | render on demand only | cold crawl spikes never reach the DB | storage (~100 GB gz) and a snapshotter |
+| Resolver decides status first | SPA decides in the browser | no soft 404s | the route manifest must match the SPA |
+| One `Page` model, three projections | three hand-written outputs | text, JSON-LD and Markdown can't disagree | a richer model |
+
+## 12. Check yourself
+
+1. Which clients read what, and why isn't head-only injection enough in 2026?
+2. Why is serving the same HTML to bots and humans important, and what *can* differ?
+3. A crawl spike of 20k req/s hits cold URLs. Show why unprotected it breaks, and what protects you.
+4. A database error occurs while rendering a page. What status, what caching, and why not 404?
+5. What does the number-parity test check, and what risk does it contain?
+
+<details><summary>Answers</summary>
+
+1. Link-preview scrapers read only `<head>`; Google renders script on a deferred pass; AI fetchers and weaker
+   renderers, as far as their published descriptions say, run no script and see only the HTML. Head-only gives them a title and one sentence, nothing to quote. A
+   plain-HTML body from the same data fixes that.
+2. Different content for bots is cloaking and gets penalised. Only *priority and rate limits* differ (a separate lane,
+   shedding with `503`); the bytes, the status and the cache entry are the same.
+3. 20k × 3 ms is 60 cores and 20k × 3 queries is ~60k qps against a database good for ~10k+ indexed reads/s. With
+   pre-rendered snapshots answering ~95%, only ~1k renders/s (≈ 3 cores, 3k qps) remain; a separate bot lane and
+   `503 + Retry-After` shed the rest, and CDN + L1 absorb repeats.
+4. `503` with `Retry-After`, `Cache-Control: no-store`. A 404 would tell crawlers the page is gone and drop it from
+   the index; a 200 with a default card would create duplicate/soft-404 content.
+5. Every number in the API payload appears in the HTML body and every number in the body comes from the payload (for
+   each page kind), catching drift between the Go template and the Vue component. It contains the second-renderer
+   risk; it can't prove the *wording* matches, only the facts.
+
+</details>
+
+## 13. In Go
+
+- Related lessons: [57 Web security](../../57-web-security.md) (`html/template` contexts, `template.JS`, XSS), [64 HTTP internals](../../64-http-protocol-internals.md) (conditional requests, `HEAD`, gzip, `Vary`), [66 Serving Go apps](../../66-serving-go-apps.md) (the shell as a handler, reverse proxy in front), [38 Caching](../../38-caching-patterns.md) (`singleflight`, stale-while-revalidate), [68 Rate limiting](../../68-rate-limiting-throttling.md) and [36 Resilience](../../36-resilience-patterns.md) (lanes, load shedding, `Retry-After`), [20 HTTP server](../../20-http-server.md), [62 Deployment](../../62-deployment-operations.md) (immutable assets).
+- Packages: `html/template`, `net/http` (`http.ServeContent` answers `If-None-Match`/`If-Modified-Since` with a `304` when you set `ETag` and the modtime), `net` and `net/netip` (PTR and forward lookups), `golang.org/x/sync/singleflight` and `semaphore`, `github.com/hashicorp/golang-lru/v2`, `compress/gzip`, an S3 client.
+- Keep `RenderBody`, `JSONLD` and `Markdown` as pure functions `Page → []byte`; golden-file tests per page kind catch silent changes in a diff.
+
+## 14. Extensions
+
+- **Content negotiation:** `Accept: text/markdown` on the canonical URL, beside `/page.md`.
+- **Edge rendering** of the `<head>` only (a worker reading the snapshot index), keeping HTML at the edge.
+- **Per-bot analytics:** which bots, which URLs, which statuses; feed it back into sitemap priorities ([33](33-sitemaps-crawl-notify.md)).
+- **The migration trigger:** write down the metrics (render CPU, page kinds, drift incidents) at which you move to Nuxt, and what you'd keep (resolvers port as plain functions).
+- **Widget-heavy pages:** prerender with a headless browser for the 1% that can't be templated, cached as snapshots.
+- **Hreflang and canonical clusters** for 20 languages: the head's size and the cache key both grow.

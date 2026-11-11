@@ -108,7 +108,7 @@ Distribution (what SDKs call):
 
 ```
 GET /sdk/snapshot/prod         Authorization: SDK key
-  200  ETag: "418"  Cache-Control: max-age=30   body: { "version": 418, "flags": { … } }
+  200  ETag: "418"  Cache-Control: max-age=5    body: { "version": 418, "flags": { … } }
   304  Not Modified
 GET /sdk/stream/prod           text/event-stream → "event: version\ndata: 419\n\n"   (then the SDK fetches)
 ```
@@ -208,7 +208,7 @@ in     = bucket < percentage × 100                     // 10% → bucket < 1000
 | **Polling with ETag** every 30 s | ≤ 30 s | ~70 req/s, nearly all `304` | dumb, robust; works through any proxy |
 | **SSE / long-poll push** of "new version" events | ~1 s | 2,000 idle connections | the SDK then fetches the snapshot; reconnect with backoff; falls back to polling |
 | **Streaming the full ruleset** over WebSocket | ~1 s | more complex state sync | what hosted vendors do; not needed here |
-| CDN in front of the snapshot endpoint | same as polling | offloads the origin | snapshots are immutable per version, so `max-age=30` with ETag revalidation is safe |
+| CDN in front of the snapshot endpoint | poll interval + CDN TTL (worst case) | offloads the origin | each version's body is immutable, but `/snapshot/prod` is a moving pointer: with `max-age=30` and a 30 s poll the worst case is ~60 s. Use a short CDN TTL (~5 s) or purge on publish; the origin is cheap |
 
 **Choice: poll + push.** Polling is the baseline that always works; the SSE channel makes the
 kill switch fast. The SDK treats a push as "poll now". Snapshots are compiled once per publish,

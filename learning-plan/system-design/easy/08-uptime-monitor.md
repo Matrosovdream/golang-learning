@@ -51,8 +51,10 @@ making a million timers fire on time and not crying wolf.
 | Concurrent in-flight checks per region | ~17k × ~0.5 s avg = ~8k; worst case with 10 s timeouts: 170k | rate × duration |
 | Result records per day | 4.3B | 50k × 86,400 |
 | Raw result size | ~100 B → **~430 GB/day** | timestamp, monitor, region, status, latency, error code |
-| 90 days raw | ~39 TB | too much; store raw 7 days, 1-min aggregates 90 days |
-| 1-min aggregates | 1M monitors × 1,440/day × ~50 B = 72 GB/day | still large; roll to 1-hour after 7 days |
+| 90 days raw | ~39 TB | too much; store raw 7 days (~3 TB) and roll up |
+| 1-min rollups | one row per (monitor, region, minute) = 4.3B rows/day at a 60 s interval, ~50 B → ~216 GB/day | no real reduction: at a 60 s interval a 1-minute bucket holds exactly one check. Use coarser buckets |
+| 5-min rollups | 1M × 3 regions × 288/day = 864M rows/day × ~50 B ≈ 43 GB/day → ~3.9 TB for 90 days | fits; a columnar store compresses it 10–20× |
+| 1-hour rollups | 1M × 3 × 24 = 72M rows/day × ~50 B ≈ 3.6 GB/day → ~1.3 TB/year | long-term history (uptime %, trend charts) |
 
 What the numbers tell us: this is a **throughput** problem in two places: firing 50k timers a
 second on schedule, and ingesting 50k result rows a second. Storage must be time-series shaped
@@ -82,7 +84,7 @@ with downsampling or it is 40 TB of rows nobody reads.
  results stream ──► aggregator: per monitor, latest result per region ──► state machine
                        │  UP→DOWN when ≥2 regions fail 2× in a row; DOWN→UP when ≥2 pass
                        ├──► alerts → notification service (task 12)
-                       └──► time-series store (raw 7 d, 1-min rollups 90 d)
+                       └──► time-series store (raw 7 d, 5-min rollups 90 d)
  status page / dashboards ──► API ──► rollups (cached, CDN for public pages)
 ```
 
@@ -143,7 +145,7 @@ CREATE TABLE check_results (
     err         SMALLINT                             -- enum code, not text
 );  -- partition by day; drop partitions older than 7 days
 
-CREATE TABLE check_rollups_1m (
+CREATE TABLE check_rollups_5m (          -- one row per (monitor, region, 5 minutes)
     bucket      TIMESTAMPTZ NOT NULL,
     monitor_id  BIGINT NOT NULL,
     region      TEXT NOT NULL,
@@ -226,15 +228,15 @@ still down) is a scheduled job (task 15) keyed on the open incident.
 | Layer | Resolution | Retention | Size |
 |---|---|---|---|
 | raw results | every check | 7 days | ~3 TB |
-| 1-minute rollups | per monitor, region, minute | 90 days | ~6 TB (compressed far less) |
-| 1-hour rollups | per monitor, hour | 2 years | small |
+| 5-minute rollups | per monitor, region, 5 minutes | 90 days | ~3.9 TB (~0.2–0.4 TB compressed) |
+| 1-hour rollups | per monitor, region, hour | 2 years | ~2.6 TB (~0.1–0.3 TB compressed) |
 
 - Insert raw results in **batches** (1,000 rows per `COPY`/multi-row insert) from the aggregator;
   single-row inserts at 50k/s would be the bottleneck.
 - A columnar or time-series store (ClickHouse, TimescaleDB) compresses these rows 10–20× and makes
   "p95 latency over 30 days" a cheap aggregate. Plain Postgres partitioned by day works to start;
   drop old partitions instead of `DELETE`.
-- Rollups are computed continuously (a minute behind) so the dashboards and status pages read only
+- Rollups are computed continuously (a few minutes behind) so the dashboards and status pages read only
   rollups. Uptime % for 30 days is a sum of two integers per bucket.
 - Public status pages: rendered JSON cached for 30–60 s, served through the CDN.
 
@@ -267,7 +269,7 @@ different region from the one being checked.
 | Redis sorted-set due-queue | DB polling | 17k pops/s cheaply, multi-scheduler safe | the schedule must be rebuilt from Postgres after loss |
 | quorum + 2 consecutive failures | alert on first failure | few false alerts | 1–2 minutes of detection latency |
 | alerts on transitions | alert per failed check | one alert per incident | must maintain state per monitor |
-| raw 7 d + rollups 90 d | raw everything | 10× less storage, fast dashboards | raw detail older than a week is gone |
+| raw 7 d + rollups | raw everything | ~5× less storage before compression (~7 TB vs ~39 TB for 90 days), fast dashboards | raw detail older than a week is gone |
 | batched inserts, columnar store | row inserts in Postgres | 50k rows/s ingest | another database to run |
 
 ## 12. Check yourself

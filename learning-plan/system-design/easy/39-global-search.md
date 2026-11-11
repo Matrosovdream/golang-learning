@@ -1,0 +1,291 @@
+# 39 · Global Search with Permission Filtering
+
+`🟢 easy` · *Topics:* one search over many kinds of records, Postgres FTS + trigram vs a dedicated engine, a derived index fed by events (idempotent, versioned upserts), reindex by alias swap, permission filtering before ranking, identifier / number queries, typo tolerance · *Builds on:* [10 Webhook Delivery](10-webhook-delivery.md) (outbox, at-least-once), [15 Job Scheduler](15-job-scheduler.md) (workers, `SKIP LOCKED`), [05 In-Memory Cache with TTL](05-kv-cache-ttl.md) (what you can afford to keep stale), [06 View & Like Counter](06-view-like-counter.md) (hot keys)
+
+> ← [Index](../README.md) · [Progress](../PROGRESS.md) · Prev: [38 AI Draft Queue](38-ai-draft-queue.md) · Next: [40 Media Reprocessing at Scale](40-media-reprocessing.md)
+
+---
+
+> 🌱 **Seed (honeydolist-site):** PLAN step 7u.1 puts one search box over clients, requests, orders, equipment, projects and pages. It starts as `ILIKE` over `pg_trgm` indexes (migration 0038); Elasticsearch was floated and *deliberately not chosen*: "the endpoint stays and Elasticsearch can sit behind it" if search outgrows Postgres. Step 29.2 (migration 0057) builds `search_docs`: **one row per record**, typed columns for what is filtered (`kind`, `perm`, `public`, `archived`, `status`, `town`, `rank`…), a weighted `tsvector` (name and "Also called" words = A, body = B) with a GIN index, and a GiST trigram index on name + words only (ordered nearest-first: 0.3 ms a word at 10,000 rows; matching the body by trigram took 130 ms a word, so it never does). A trigger on each source table appends the record's key to `search_dirty` *in the writer's transaction* (plain `INSERT`, so writers never wait on each other; statement-level transition tables for bulk writes; row-level only when an indexed column really changed); a worker rebuilds ≤ 500 keys every 2 s with one `INSERT … SELECT … ON CONFLICT` per kind, plus a nightly full rebuild (each row records the builder's version). A change shows in ~3 s. The match has three arms: words through `tsv`; *identifiers* (`#1235`, `DEV-0083`, an email, a public id, phone digits); and trigram per longer word for typos. An exact identifier hit ranks first, the archived last, and only kinds whose `perm` the viewer holds are returned. Step 25.5 made order/request numbers searchable ("2051" or "#2051"); step 47 added file tags; step 31 added uploaded documents' extracted text (read out on the server by a worker, searched, but never put on a card or sent to the model). Measured at 10,000 rows: p95 5–8 ms, 20 of 20 invoices found first by number.
+> **Here, at scale:** 5B documents across 100k tenants, 3,000 queries/s at peak, results strictly limited to what the asker may see, index fresh within seconds.
+
+## 1. The task
+
+> "One search box for the whole product. Type a name, a number, an email or a few words and get matching customers, orders, invoices, files and pages, ranked, instantly, and never anything I'm not allowed to open."
+
+Search is a *derived copy* of your data. The design is about how the copy is fed, who may see which rows of it, and when to leave Postgres.
+
+## 2. Clarifying questions
+
+| Ask | Why it matters | Assumed answer |
+|---|---|---|
+| Is a search ever across tenants? | If never, tenant is a routing key and everything gets cheap. | Never: always one tenant. |
+| How many kinds, what fields? | Document shape. | ~10 kinds (client, order, invoice, file, page…); title, aliases, body text, number, status, dates. |
+| Permissions? | Where ACL lives. | Kind-level (a permission) plus some record-level (owner, team). |
+| Freshness? | Indexing design. | New or changed record searchable in ≤ 5 s p99; ACL changes as fast. |
+| Scale? | Engine choice. | 5B docs, 100k tenants (avg 50k, a few huge), 3k queries/s peak. |
+| Languages? | Analyzers. | Mostly one; keep multi-language possible. |
+| Typo tolerance, typeahead? | Extra query paths. | Typos yes; typeahead separate, prefix only. |
+| IDs and numbers? | Users paste them. | Must find `#2051`, emails, phone numbers, public ids exactly and first. |
+| Total hit counts, deep pages? | Cost and leaks. | No exact total; top 100 per query. |
+| Deletes and erasure? | Stale hits. | Deleted records gone in seconds; erasure verified. |
+
+## 3. Requirements
+
+**Functional**
+- `GET /search?q=` over all kinds the viewer may see; filter by kind; highlight; open the record.
+- Exact identifier lookup (number, public id, email, phone), ranked first.
+- Typo tolerance on names; synonyms/aliases ("also called" words).
+- Index updates from every write path, including bulk imports and merges.
+- Reindex everything (new analyzer, new field) with no downtime.
+
+**Non-functional**
+- p95 < 100 ms (seed: 5–8 ms at 10k rows); freshness ≤ 5 s.
+- No cross-tenant or cross-permission leaks, including counts, highlights and suggestions.
+- Search down must not take the product down.
+
+**Out of scope**
+- Semantic/vector search, personalised ranking, cross-tenant public search.
+
+## 4. Back-of-the-envelope
+
+| Quantity | Estimate | How |
+|---|---|---|
+| Documents | 5B; ~50k per tenant on average | 5B ÷ 100k (a few tenants hold 10M–50M: heavy tail) |
+| Raw text | ~5 TB | 5B × ~1 KB (title, aliases, body excerpt, card) |
+| Index on disk | ~5–7.5 TB; ~10–15 TB with 1 replica | assume index ≈ 1–1.5× text |
+| Dedicated engine shards | ~160 primaries | ~6.25 TB ÷ ~40 GB (a common shard-size rule of thumb) |
+| Sharded Postgres instead | 64 shards × ~78M docs | 5B ÷ 64; × ~2 KB ≈ 156 GB of rows per shard, 300+ GB with indexes |
+| Queries | 3k/s peak; ~47/s per Postgres shard | one tenant → one shard; 3,000 ÷ 64 |
+| Churn | 2 %/day ≈ 100M updates ≈ 1,160/s avg, ~3,500/s peak | assumed 2 % of docs change daily |
+| Freshness budget | ≈ 3.5 s | 2 s poll + 0.5 s batch + 1 s index refresh |
+| Full reindex | ≈ 28 h at 50k docs/s | 5 × 10⁹ ÷ 5 × 10⁴ = 10⁵ s |
+| Seed, for scale | 10k docs ≈ 20 MB, p95 5–8 ms | measured |
+
+What the numbers tell us: the read load is trivial *because every query is one tenant's*; the storage (5B docs) and the write stream (1–3.5k docs/s, forever) are what decide the architecture. A full reindex takes more than a day, so reindexing must be an online operation, and the queue that feeds the index must be a log, not a table you insert into and delete from 100M times a day.
+
+## 5. Plan
+
+1. Choose the store (stay on Postgres or add an engine) by the numbers that flip it.
+2. Document shape: typed filters, weighted text, ACL tokens, version.
+3. Get data in: events, idempotent versioned upserts, deletes, fan-out of renames.
+4. Reindex without downtime.
+5. Permission filtering before ranking.
+6. Query understanding: classify, identifiers, typos, ranking.
+7. Failure: the index is a copy; the primary decides.
+
+## 6. High-level design
+
+```
+ writers ── tx: row + outbox event ──► relay ──► stream (partition = hash(tenant, doc))
+                                                     │
+                                       indexer workers (batch 500–1,000)
+                                       upsert with external version = source version; deletes = tombstones
+                                                     ▼
+ browser ─► Search API ─► classify query ─► index (routed by tenant: 1 shard)       alias docs → docs_v7
+              │   tenant_id + ACL tokens injected from the session (never from the request)
+              │   top-K ids ──► verify against primary (batch PK lookup) ──► hits with cards
+              └─ on index failure: 503 for search only; per-list filters still work
+ reindex: snapshot primary by keyset ranges → docs_v8, catch up from stream offset, compare counts, flip alias
+```
+
+One query: the API takes tenant and permissions from the session, classifies the text (an identifier or words), asks one shard for the top ~40 by rank with the ACL filter *inside* the query, verifies those ids against the primary, and returns 20 hits. One write: the row and an outbox event commit together; the relay publishes; an indexer upserts the document if its version is newer than what is indexed.
+
+## 7. API
+
+```
+GET /v1/search?q=&kinds=client,order&limit=20&cursor=
+  → 200 { hits: [{ kind, id, public_id, title, card, highlights?, score }], next_cursor?, more: true }
+          (no exact total; at most ~100 results reachable: search is not a list)
+GET /v1/search/suggest?q=&limit=8       → prefix matches on titles and aliases, same ACL filter
+POST /v1/admin/search/reindex           { tenant_id?, kind?, mapping_version }  → 202 { job_id }
+GET  /v1/admin/search/lag               → { p50_ms, p99_ms, oldest_unindexed_age_s, drift_by_kind }
+```
+
+Event on the stream: `{ tenant_id, kind, id, op: "upsert"|"delete", version }`. The indexer re-reads the source row at `version` (or later), so a dropped or duplicated event only costs a redundant read.
+
+## 8. Data model
+
+One document per record. The DDL is one Postgres shard; the same fields map one-to-one onto an OpenSearch/Elasticsearch mapping (`keyword` for ids/numbers/ACL, `text` for title/aliases/body).
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;  CREATE EXTENSION IF NOT EXISTS btree_gin;  CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE search_docs (
+  tenant_id   bigint   NOT NULL,
+  kind        text     NOT NULL,
+  id          bigint   NOT NULL,                  -- the row's id in its own table
+  public_id   text     NOT NULL,                  -- c_…, o_…: what links use
+  number      bigint,                             -- the human number: Order #2051
+  acl         text[]   NOT NULL,                  -- any-of tokens that grant access: {'perm:leads.read','team:12','user:77'} or {'*'}
+  archived    boolean  NOT NULL DEFAULT false,    -- searched, but ranked last
+  title       text     NOT NULL,
+  words       text     NOT NULL DEFAULT '',       -- aliases / "also called" / suggested words
+  body        text     NOT NULL DEFAULT '',       -- searched, never returned: notes, message text, extracted file text
+  rank        real     NOT NULL DEFAULT 0,        -- 0–1 tie-breaker, recomputed nightly
+  card        jsonb    NOT NULL,                  -- the few fields shown; never notes, streets, phones, emails
+  src_version bigint   NOT NULL,                  -- older events are ignored
+  builder     smallint NOT NULL,                  -- a newer builder rebuilds every row
+  tsv         tsvector GENERATED ALWAYS AS (      -- 'simple': one config cannot stem several languages (the seed used 'english')
+                setweight(to_tsvector('simple', title || ' ' || words), 'A') ||
+                setweight(to_tsvector('simple', body), 'B')) STORED,
+  PRIMARY KEY (tenant_id, kind, id)
+) PARTITION BY HASH (tenant_id);                  -- e.g. 16 partitions per shard server
+CREATE INDEX search_docs_tsv  ON search_docs USING gin  (tenant_id, tsv);                                 -- tenant first
+CREATE INDEX search_docs_trgm ON search_docs USING gist (tenant_id, (title || ' ' || words) gist_trgm_ops); -- names only, never body
+CREATE INDEX search_docs_acl  ON search_docs USING gin  (tenant_id, acl);
+CREATE UNIQUE INDEX search_docs_number ON search_docs (tenant_id, kind, number) WHERE number IS NOT NULL;
+
+CREATE TABLE tenant_search_route (                -- which shard a tenant lives on; whales get their own
+  tenant_id bigint PRIMARY KEY, shard smallint NOT NULL, dedicated boolean NOT NULL DEFAULT false
+);
+```
+
+## 9. Deep dives
+
+### 9.1 Postgres FTS or a dedicated engine?
+
+| Option | Pros | Cons |
+|---|---|---|
+| **One Postgres** (the seed) | no second store; transactional triggers; trivial ops | ~100M docs is a ceiling for one node; one huge tenant slows everyone |
+| **Postgres sharded by tenant** (64 × ~78M) | same tech, queries never fan out | you build the shard map, rebalancing, reindex tooling and replicas yourself |
+| **OpenSearch/Elasticsearch, routed by tenant** | sharding, replicas, analyzers, facets, synonyms, relevance tuning built in | a second store to feed, monitor and upgrade; eventual consistency |
+| Hosted search service | least ops | cost at 5B docs, data-residency, limits |
+
+The numbers that flip it: **documents per node** (≈ 100M is where one Postgres stops being relaxed), **one whale tenant** (tens of millions of docs, which GIN posting lists make slow), **languages and analyzers**, **facets/aggregations**, **relevance work** (synonyms, boosts, A/B), and **who runs it**. The seed stays on Postgres at ~10⁴ docs and keeps the escape hatch: the endpoint is the contract, the engine sits behind it.
+
+**Choice and why.** At 5B docs, a dedicated engine with **routing by tenant** (`routing = tenant_id`, so a query hits one shard and never scatter-gathers 160), whales on dedicated shards, and Postgres remaining the source of truth. Sharded Postgres is a respectable alternative, but at this size we would be rebuilding what the engine ships. Keep the seed's discipline: the index is a derived, rebuildable copy.
+
+### 9.2 Getting data in
+
+| Option | Pros | Cons |
+|---|---|---|
+| Dual-write from app code | simple | one write fails, the index drifts; every write path must remember |
+| **Dirty-key queue fed by triggers, polled by a worker** (the seed) | no write path is missed (imports, merges, a hand-run SQL fix); same transaction | at 1,160 docs/s that is ~100M inserts and ~100M deletes a day on a queue table: bloat, vacuum pressure |
+| **Outbox event → log/stream → indexers** | durable, replayable, partitioned for per-doc order | needs the relay and a stream |
+| CDC from the WAL | catches *every* write, even without app cooperation | extra infrastructure; row-shaped events need re-reading to build a document |
+
+**Choice and why.** Keep the seed's key insight (*no write path may be missed*, so mark in the writer's transaction) but move the transport to a log: the trigger or app code writes an outbox event, a relay publishes it, and indexers consume partitions keyed by `(tenant, doc)` so one doc's events stay ordered. Details:
+
+- **Idempotent, versioned upserts.** Index with an *external version* equal to the source row's version: an older or duplicate event is a no-op. At-least-once delivery becomes exactly-once in effect (see [10](10-webhook-delivery.md)). Deletes are tombstones with a version, so a late "upsert" cannot resurrect a deleted record.
+- **Events carry keys, not documents.** The indexer reads the current row(s) and builds the document, so an event is "a reason to look" (the seed's builder works the same way: it re-reads the live rows for each marked key).
+- **Batch.** 500–1,000 docs per bulk request: 3,500 docs/s is ~4 bulk calls/s.
+- **Fan-out of renames.** The seed marks a client's orders and invoices when the client is renamed, because their documents contain the name. A client with 1M orders means 1M reindexes. Either don't denormalise names into other kinds (store the client id and resolve at query time), or send fan-out events to a **low-priority lane with a rate cap**; never let it sit in front of ordinary updates.
+- **Drift repair.** Triggers miss `TRUNCATE`; consumers have bugs. Run a nightly reconcile: per-(tenant, kind) counts and sampled version comparisons against the primary; enqueue repairs. This is the seed's nightly `search.rebuild`, made incremental.
+- **Freshness and read-your-writes.** ~3.5 s end to end is fine for "found it", annoying for "I just created it": for the writer's own session, merge their last few writes from the primary into the first page, or return the new record's link directly from the create call.
+
+### 9.3 Reindex without downtime
+
+A new analyzer, a new field or a mapping bug means rebuilding 5B docs, which is ~28 h at 50k docs/s, so it must be online:
+
+1. Create `docs_v8` with the new mapping. Point the **alias** `docs` at `docs_v7` (reads and writes go through the alias).
+2. Record the stream offset; **dual-write** new events to v7 and v8 from that offset.
+3. Bulk-load v8 from the primary by **keyset ranges per tenant** (resumable, parallel, rate-limited so production isn't starved), with the same external versions, so a loaded row never overwrites a newer event.
+4. Compare counts per tenant/kind and sample documents; watch lag.
+5. **Flip the alias** atomically to v8; keep v7 a day for rollback; drop it.
+
+The seed's cheaper variant works at small scale: every row records the builder's `version`, a deploy that changes a row's shape makes the worker rebuild *every* row in place, and a nightly rebuild repairs drift.
+
+### 9.4 Permission filtering: before ranking, not after
+
+| Option | Pros | Cons |
+|---|---|---|
+| Post-filter: search, then check each hit against the source | trivial to reason about | a page of 20 may show 3; **counts and facets leak** existence; N checks per query; deep pages break |
+| **Pre-filter inside the query: tenant + ACL tokens** | correct pagination and counts; one round trip | ACL must be indexed; changes need reindex |
+| One index per user or per role | simple queries | combinatorial; ACL changes rebuild indexes |
+| Pre-filter coarsely, then verify top-K against the primary | catches complex rules; defence in depth | one extra batch lookup (~1–5 ms for 20 PK reads) |
+
+**Choice and why.** Pre-filter coarsely, verify the top-K. Mechanics:
+
+- **Tenant** comes from the session and is injected by the Search API (never from request parameters); it is also the routing key.
+- **ACL tokens, any-of.** Each doc lists the tokens that grant access (`perm:leads.read`, `team:12`, `user:77`, `*`); the viewer's token set is built from their session (their permissions, teams, own id) and the filter is `acl && viewer_tokens`. The seed's single `perm` column is the one-token version of exactly this ("only kinds whose perm the viewer holds").
+- **Expand groups at query time, not into documents.** Adding someone to a team must not reindex every doc the team can see.
+- **ACL changes are index writes** on a priority lane with an SLA of seconds; revoking a person's account is handled at the API (immediate), not through the index.
+- **No exact totals, ever.** `more: true` and a capped `next_cursor`; counts and facets are computed inside the same ACL filter.
+- **Cards, highlights and suggestions obey the same rule.** The card never holds restricted fields (the seed: "never notes, a street, a phone or an email"; uploaded text is searched but never returned, and a test plants a phrase to prove it); highlight only fields the viewer can read; suggestions are filtered like results.
+- **Open-by-id re-authorizes against the primary.** The copy finds the record; the live row decides.
+- Rules that are *not* any-of (AND conditions, time-boxed shares) don't fit tokens: pre-filter by the coarse token, then verify the top-K with the real check.
+
+### 9.5 Understanding the query: identifiers, typos, ranking
+
+```go
+var (
+    reNumber = regexp.MustCompile(`^#?(\d{3,12})$`)             // "2051", "#2051"
+    rePublic = regexp.MustCompile(`^[a-z]{1,2}_[0-9A-Za-z]{12}$`) // "o_8fK2…": prefix + 12 base62
+)
+func classify(q string) Plan {
+    q = norm.NFKC.String(strings.TrimSpace(q))
+    switch {
+    case reNumber.MatchString(q):  return Plan{Exact: ByNumber(digits(q))}   // unique (tenant, kind, number)
+    case rePublic.MatchString(q):  return Plan{Exact: ByPublicID(q)}
+    case strings.Contains(q, "@"): return Plan{Exact: ByEmail(strings.ToLower(q))}
+    case len(digits(q)) >= 7 && mostlyDigits(q): return Plan{Exact: ByPhone(digits(q))}
+    }
+    return Plan{Text: q, Fuzzy: true}
+}
+```
+
+- **Identifiers are lookups, not searches.** The seed made numbers searchable on purpose ("it is read out on the phone"): `2051` or `#2051` finds Order 2051. A btree lookup on `(tenant, kind, number)` beats any text query and is ranked first (a client first among identifier hits, since an email or phone names a person). Never let a text arm outrank an exact id.
+- **Words.** AND the terms first; if too few hits, fall back to OR (the seed ORs, because its input is a whole question; humans typing a search box expect AND). Weight title and aliases (A) above body (B); break ties with the nightly `rank` (popularity/recency), put archived last, and boost the kind a question names ("owed" → invoices).
+- **Aliases/synonyms** live in `words`: hand-typed plus model-suggested (step 29: "yellow digger", "mini ex" find the excavator). Suggested words are derived data with a drop (✕) list: the seed never re-suggests a dropped word.
+- **Typos on short fields only.** Trigram/fuzzy matching runs on *names and aliases*, never on long bodies (130 ms a word at 10k rows in the seed), and only for terms the exact arm found nothing for. GiST trigram returns nearest-first, so a word stops at its best few instead of reading every row that shares a trigram.
+- **Typeahead is a different path:** prefix on titles and aliases, tiny result cap, own rate limit; don't run the full three-arm query per keystroke.
+- **Depth.** Keyset cursor on `(score, id)`, capped around 100 results. Users refine; exports are a different feature.
+
+## 10. Scaling, bottlenecks & failure modes
+
+- **What breaks first at 10× (50B docs, 30k queries/s):** the write path first (indexing throughput, 35k docs/s at peak, queue lag); then whale tenants (dedicated shards); then reindex time (10× longer, so incremental mapping changes only); the read load stays easy because it is tenant-routed.
+- **Single points of failure:** the stream/relay (events buffer in the outbox table, nothing is lost), the index cluster (search 503s; the rest of the product runs, and per-list filters keep working as in the seed), the primary.
+- **Lag:** alert on *oldest unindexed event age*, not on throughput; page at 30 s.
+- **A stale hit:** a deleted record still in the index is dropped by the top-K verify; the user sees nothing wrong.
+- **Poison event:** a record whose builder throws goes to a dead-letter table with its key; the batch continues.
+- **Erasure requests:** a delete event on the priority lane, then a verify query by id and a reconcile pass.
+- **Abuse:** per-user rate limit and a cap on query length and term count (a 500-term query is a DoS); `limit` capped at 20, depth at ~100.
+- **Cost:** shard sizing and replica count are the bill; use one replica, tier cold tenants to cheaper nodes.
+
+## 11. Trade-offs at a glance
+
+| We chose | Instead of | We gain | We give up |
+|---|---|---|---|
+| dedicated engine routed by tenant | one big Postgres | scale, analyzers, tuning; one-shard queries | a second system to feed and run |
+| outbox → log → indexers | polling a dirty table | durable, replayable, per-doc order | relay and stream to operate |
+| external versions on every upsert | trusting event order | duplicates and reordering are harmless | every doc needs a monotonic source version |
+| ACL tokens, pre-filter | post-filtering | correct pages and counts, no leaks | ACL changes are index writes |
+| verify top-K on the primary | trusting the copy | stale or orphan hits never shown | one batch of PK reads per query |
+| identifiers as exact lookups | text matching numbers | exact, first, cheap | a classifier to maintain |
+| no exact total, depth ≤ 100 | "1,203 results" and page 40 | cheap queries, no count leaks | users must refine |
+
+## 12. Check yourself
+
+1. Why does tenant scoping make 3,000 queries/s across 5B documents easy?
+2. Why is post-filtering by permission wrong, and what do you do instead?
+3. An event arrives twice, and a delete arrives before an older upsert. What stops a wrong index state?
+4. How do you change the mapping of a 5B-document index without downtime?
+5. How does the search treat `#2051` differently from `kubota excavator`, and why are typos handled on a separate path?
+
+<details><summary>Answers</summary>
+
+1. Every query touches one tenant, so with routing it hits one shard; 3,000/s spread over 64 (or ~160) shards is ~47/s each, and no query scatter-gathers. Size and write rate are the hard parts, not read load. Whale tenants are moved to dedicated shards.
+2. Post-filtering returns pages with holes (20 fetched, 3 visible), leaks existence through totals and facets, and costs N source checks per query. Pre-filter inside the query by tenant and ACL tokens, so counts and pages are right, then verify the top-K against the primary as defence in depth.
+3. Upserts carry an external version (the source row's version), so a duplicate or older event is ignored; a delete is a versioned tombstone, so an older upsert cannot bring the record back. Reconcile jobs repair anything missed.
+4. Build the new index beside the old one behind an alias: dual-write new events, bulk-load from the primary by keyset ranges with the same external versions, compare counts and samples, flip the alias atomically, keep the old index briefly for rollback.
+5. `#2051` is classified as an identifier and answered by a btree lookup on `(tenant, kind, number)`, ranked first. The words go through the weighted full-text arm (AND, then OR). Typo matching (trigram/fuzzy) runs only on short name fields and only for terms with no exact hit, because fuzzy matching long bodies is slow and noisy.
+
+</details>
+
+## 13. In Go
+
+- Related lessons: [22 database/sql](../../22-database.md) (bulk upserts, `ON CONFLICT`), [34 Event-driven & outbox](../../34-event-driven-outbox.md) (the outbox relay), [44 Background jobs & queues](../../44-background-jobs-queues.md) (indexer workers, dead letters), [43 Authorization, RBAC & multi-tenancy](../../43-authorization-rbac-multitenancy.md) (building the viewer's token set), [59 Production DB patterns](../../59-production-database-patterns.md) (`SKIP LOCKED`, keyset pagination, versioned writes), [52 Heaps & priority queues](../../52-heaps-priority-queues.md) (merging top-K lists), [55 Data pipelines](../../55-data-pipelines.md) (batching and backpressure), [36 Resilience](../../36-resilience-patterns.md), [38 Caching](../../38-caching-patterns.md) (cache the viewer's token set briefly).
+- The indexer's inner loop: read a batch of events, collapse by `(tenant, kind, id)` keeping the highest version, load those rows, build documents with a pure `build(row) Doc`, send one bulk request, ack the offsets only after the bulk call succeeds; failed items go to the dead-letter table with their key.
+- Packages: `pgx`, a Kafka/NATS client (`franz-go`, `nats.go`), the official Elasticsearch or OpenSearch Go client, `golang.org/x/text/unicode/norm`, `golang.org/x/sync/errgroup`, `regexp`.
+- Test builders as pure functions with golden documents; test "the card never holds the text" by planting a phrase in `body` and asserting it appears in no response (the seed's trick).
+
+## 14. Extensions
+
+- **Typeahead service:** prefix index, per-tenant popularity, results within 50 ms.
+- **Semantic/vector search** with ACL-aware retrieval (filter first, then rank) and a hybrid score with keyword search; feeds the assistant ([37](37-records-assistant.md)).
+- **Facets and saved searches** per tenant; why facets make counts a leak surface.
+- **Learning to rank / click feedback:** log clicks, tune boosts, A/B test rankers.
+- **Multi-language analyzers** with a language field per document and per-tenant defaults.
+- **Cross-tenant "public" search:** a second index with only public docs, and none of the ACL machinery.
+- **Index tiering:** hot tenants on SSD, cold tenants on cheaper nodes, searched lazily.

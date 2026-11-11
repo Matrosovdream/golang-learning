@@ -50,7 +50,7 @@ exact and one per user. The task is to notice that and design each accordingly.
 | Naive database updates | 100k row updates/s | one `UPDATE … +1` per view: far beyond one Postgres |
 | After batching per server (100 servers, flush every 1 s) | ≤ 100 updates/s **per distinct item** viewed in that second; total ~ (distinct items/s) | a hot item becomes 100 updates/s instead of 10k |
 | Redis ops | 100k `INCR`/s | one node handles it; shard if needed |
-| Like rows | 5k inserts/s; 1B rows/yr at ~50 B | fine for a partitioned table |
+| Like rows | 5k inserts/s peak; assume average ≈ ¼ of peak (~1.25k/s) → ~40B rows/yr ≈ 2 TB at ~50 B | fine for a partitioned table (partition from day one); 5k/s sustained would be ~158B rows/yr |
 | Unique viewers with HyperLogLog | 12 KB per video regardless of audience | vs a set of 8 B user IDs: 80 MB for 10M viewers |
 
 What the numbers tell us: counting is a **write** problem, the opposite of tasks 01 and 02.
@@ -218,7 +218,7 @@ Display formatting ("1.2M") belongs in the client. Send the integer.
 | We chose | Instead of | We gain | We give up |
 |---|---|---|---|
 | local aggregation + Redis + delayed flush | `UPDATE +1` per view | 1,000× fewer DB writes, no hot-row lock queue | up to ~1 s + flush interval of view loss on crash |
-| row per (post, user) + conditional increment | counter only | exact likes, idempotent retries, "liked by me" | 1B rows/yr to store and partition |
+| row per (post, user) + conditional increment | counter only | exact likes, idempotent retries, "liked by me" | tens of billions of rows/yr (~2 TB) to store and partition |
 | deltas on flush | absolute values | safe with multiple flushers | slightly more complex flush |
 | HyperLogLog for uniques | a set per video | 12 KB fixed vs tens of MB | ~0.8% error |
 | counts also in a DB column | Redis only | sorting, durability | a reconciliation job |

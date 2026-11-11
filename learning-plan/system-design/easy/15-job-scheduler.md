@@ -2,7 +2,7 @@
 
 `🟢 easy` · *Topics:* `FOR UPDATE SKIP LOCKED` dispatch, leases and crash recovery, at-least-once + idempotent handlers, cron with time zones and DST, catch-up policies, why exactly-once is a myth · *Builds on:* [08 Uptime Monitor](08-uptime-monitor.md) (due-queues), [10 Webhook Delivery](10-webhook-delivery.md) (retries), used by 02, 09, 12, 13, 14
 
-> ← [Index](../README.md) · [Progress](../PROGRESS.md) · Prev: [14 Polls & Voting](14-polls-voting.md) · Next: *(end of the easy set; medium backlog in [../medium/README.md](../medium/README.md))*
+> ← [Index](../README.md) · [Progress](../PROGRESS.md) · Prev: [14 Polls & Voting](14-polls-voting.md) · Next: [16 Public Form Intake](16-public-form-intake.md)
 
 ---
 

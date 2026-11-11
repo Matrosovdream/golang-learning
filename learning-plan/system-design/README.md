@@ -208,6 +208,120 @@ introduces a building block or pattern that later tasks reuse.
 | 14 | [Polls & Voting](easy/14-polls-voting.md) | one vote per user atomically, counters vs rows, result caching |
 | 15 | [Job Scheduler](easy/15-job-scheduler.md) | `SKIP LOCKED` dispatch, leases, at-least-once, cron & DST |
 
+#### 16–60 · Seeded from honeydolist-site, designed for scale
+
+Tasks 16–60 were mined from the `honeydolist-site` project (a small handyman-business site: Vue + Go + Postgres + NATS). Each file opens with a 🌱 **Seed** line saying what that project really does (with its PLAN step / migration / ADR) and a **Here, at scale** line saying what the same idea becomes at millions of users. Where the project is simpler than the lesson, or differs from it, the Seed line says so.
+
+**Intake & abuse** — How a public endpoint stays correct and safe when the internet is hostile and mobile networks are bad.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 16 | [Public Form Intake](easy/16-public-form-intake.md) | client-made idempotency keys, replay semantics, jittered retries & load shedding, outbox vs broker, drafts |
+| 17 | [Abuse & Spam Protection](easy/17-abuse-protection.md) | who counts as a person, trusted-proxy client IP, layered defence, fake 201 for bots, spam as a flag, live-tunable limits |
+| 18 | [Inbound Webhook Receiver](easy/18-inbound-webhook-receiver.md) | durable accept then ack, inbox dedupe, reconcile-by-pull, signature + replay window, ordering |
+| 19 | [Moderated Submissions](easy/19-moderated-submissions.md) | quarantine bucket, re-encode & decode budget, moderator queue & risk lanes, anonymous rate limiting, takedown |
+
+**Records & integrity** — The plumbing under every admin app: numbers, presence, history, lists.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 20 | [Per-Tenant Document Numbering](easy/20-document-numbering.md) | key vs public id vs number, counter rows & allocation blocks, hot-row ceiling, gap-free invoices |
+| 21 | [Presence & Soft Edit Locks](easy/21-presence-soft-locks.md) | Redis TTL presence, heartbeat cost math, advisory lock + version check, takeover & idle expiry |
+| 22 | [Audit Log & Revision History](easy/22-audit-log-revisions.md) | diff vs snapshot, partitioned append-only log, same-transaction capture, restore, redaction, hash chain |
+| 23 | [Paginated Lists at a Billion Rows](easy/23-paginated-lists.md) | keyset vs offset, capped & maintained counts, partial indexes for filter + sort, export limits |
+
+**Lifecycle & workflow** — What happens to a record over its life: kept, merged, moved, due, deleted.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 24 | [Data Lifecycle: Archive, Delete, Erase](easy/24-data-lifecycle.md) | archive vs remove vs purge vs anonymise, batched purge & autovacuum, erasure ledger across stores |
+| 25 | [Contact Deduplication & Merge](easy/25-contact-dedupe-merge.md) | unique email vs hint keys, E.164 phones, race-safe find-or-create, blocking vs O(n²), tombstone merge & undo |
+| 26 | [Configurable Status Workflow](easy/26-status-workflow.md) | stages in code vs tenant statuses as rows, strict transitions & guards, conditional UPDATE + history + outbox |
+| 27 | [Deadlines & Escalation](easy/27-deadlines-escalation.md) | rolling `next_fire_at`, `due_version` idempotency, escalation ladder × preferences, time zones & DST, 09:00 jitter |
+
+**Booking & commerce** — Money-adjacent designs where correctness beats speed.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 28 | [Booking Calendar for Rentable Units](easy/28-booking-calendar.md) | range exclusion constraint, pooled units & fragmentation, holds with TTL, blocks, month-view reads |
+| 29 | [Price & Availability Engine](easy/29-price-availability-engine.md) | dated prices, staged campaigns with a one-row switch, derived availability, stock ledger, hidden cost |
+| 30 | [Invoicing: Money, Tax & PDF](easy/30-invoicing.md) | integer money & rounding, dated tax, freeze at issue, idempotent payments, lazy PDFs, billing runs |
+| 31 | [Service Area & Geocoding](easy/31-service-area-geocoding.md) | geocoding cache & cost, postal lists vs polygons vs cells, haversine vs road, autocomplete, provider interface |
+
+**Content & SEO** — Serving pages to people and to crawlers at 50M-URL scale.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 32 | [Block-Based CMS](easy/32-block-cms.md) | typed JSON blocks, versioned registry, sanitised rich text, publish as pointer flip, tag purge, category trees |
+| 33 | [Sitemaps & Crawl Notifications](easy/33-sitemaps-crawl-notify.md) | sitemap index limits, shard rebuild math, `lastmod` from content hash, IndexNow coalescing, robots hygiene |
+| 34 | [Crawler-Ready SPA Serving](easy/34-crawler-ready-spa.md) | head + crawler body vs SSR/prerender, bot verification, 3-tier HTML cache, honest status codes, one model → HTML/JSON-LD/Markdown |
+| 35 | [Redirect Manager & 404 Tracker](easy/35-redirect-manager.md) | Bloom → packed table → atomic snapshot, loop & chain handling, 301 vs 302 caching, Space-Saving 404 tracking |
+
+**AI & search** — Putting a model or an index behind a product without losing control of cost, safety or permissions.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 36 | [LLM Gateway](easy/36-llm-gateway.md) | one chokepoint, layered kill switches, reserve-then-settle token budgets, call log, caching & routing, failover |
+| 37 | [In-App Records Assistant](easy/37-records-assistant.md) | tool-calling vs text-to-SQL, permissions in the tool, prompt injection from stored data, golden-question evals |
+| 38 | [AI Draft Queue](easy/38-ai-draft-queue.md) | backfill as a job queue, drafts that never overwrite human text, approve with a version check, review capacity |
+| 39 | [Global Search with Permission Filtering](easy/39-global-search.md) | Postgres FTS vs a dedicated engine, versioned idempotent indexing, alias-swap reindex, ACL pre-filter, id & typo queries |
+
+**Platform & operations** — Keeping a running system safe: media, backups, secrets, deploys.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 40 | [Media Reprocessing at Scale](easy/40-media-reprocessing.md) | originals as truth, key = f(original, recipe), range-task backfills, priority lanes, video leases, pointer rollback |
+| 41 | [Backup & Restore](easy/41-backup-restore.md) | RPO/RTO per failure class, logical vs physical + WAL (PITR), key custody, immutable off-site copies, restore drills |
+| 42 | [Integration Credentials Vault](easy/42-credentials-vault.md) | root key → per-tenant KEK, AES-GCM with AAD, rotation without downtime, write-only API, secrets broker |
+| 43 | [Zero-Downtime Deploys & Schema Migrations](easy/43-zero-downtime-deploys.md) | expand/contract, what locks what in Postgres, `lock_timeout` retry, canary + rolling, graceful drain, compat windows |
+
+**Comms, access & analytics** — Telling people things, deciding who may do things, counting what happened.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 44 | [Bulk Email Campaign Sender](easy/44-email-campaign-sender.md) | daily caps & hourly pace, per-zone cursors, at-most-once + reconcile, suppression, warm-up, fairness |
+| 45 | [Live In-App Notifications](easy/45-live-notifications.md) | SSE + web push, doorbell-not-data, per-user bus subjects, inbox replay & resync, routing & escalation |
+| 46 | [Roles & Permissions (RBAC)](easy/46-rbac.md) | permissions not roles, escalation guards, versioned permission cache, bitsets, deny-by-default |
+| 47 | [Privacy-Friendly Web Analytics](easy/47-web-analytics.md) | beacon ingest, salted daily-hash visitors, HLL, replay-safe counters, rollups, business-day DST |
+
+**Tooling & settings** — The internal platform: moving data in, testing load, watching, configuring.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 48 | [Bulk Import with Preview & Undo](easy/48-bulk-import.md) | stage → preview → chunked commit, idempotent upsert, hash-guarded undo, fair scheduling, hostile files |
+| 49 | [Load Testing Harness](easy/49-load-testing-harness.md) | open vs closed load, coordinated omission, mergeable histograms, generator fleet, regression gate |
+| 50 | [Alerting Engine](easy/50-alerting-engine.md) | rule evaluation at scale, alert state machine, flapping, grouping & inhibition, outbox delivery, watchdog |
+| 51 | [Runtime Settings & Timed Kill Switches](easy/51-runtime-settings.md) | settings registry, in-process snapshots (NOTIFY + feed poll), `off_until` switches, env > tenant > plan > default, audit |
+
+**Forms, push & landing pages** — Product surfaces that tenants configure, devices that get pinged, pages that must earn their place.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 52 | [Configurable Forms](easy/52-configurable-forms.md) | tenant-owned fields, stable ids, one validator per side with golden vectors, JSONB + version, immutable versions, CDN schema |
+| 53 | [Web Push & the Installable App (PWA)](easy/53-web-push-pwa.md) | push subscription per device, VAPID, 5M-in-10-min fan-out, `404/410` cleanup, collapse keys, consent, service-worker traps |
+| 54 | [Programmatic Location Pages](easy/54-programmatic-location-pages.md) | candidate matrix, versioned quality gates + `live` CHECK, variable-part simhash, tiers, waves & stop-loss |
+
+**Timelines, links & events** — Entity-level features that look small and hide a real decision each.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 55 | [Order Timeline with Photo Steps](easy/55-order-timeline.md) | timeline vs audit log, text-first photo capture, device-minted ids, revocable tracking link, system milestones |
+| 56 | [Related Content & Interlinking](easy/56-related-content-interlinking.md) | curated > text > computed edges, materialised top-N, link rot, in-memory graph health, baked-in blocks |
+| 57 | [Event Registration with Capacity & Waitlist](easy/57-event-registration-waitlist.md) | counter row + CHECK, holds & state machine, first-that-fits waitlist, waiting room + gate, refunds & drift |
+
+**Tracking, adapters & time** — Cross-cutting plumbing: counting clicks you can bill for, third parties you can test, days that have 23 hours.
+
+| # | Task | What it teaches |
+|---|---|---|
+| 58 | [Outbound Link Click Tracking](easy/58-outbound-click-tracking.md) | 302 via a first-party endpoint, signed click ids, ledger vs hot counter, versioned fraud verdicts, postbacks |
+| 59 | [Provider Adapters with Fake Drivers & Chaos Testing](easy/59-provider-adapters-fakes.md) | narrow interface, four error kinds, fake/stub/sandbox ladder, fate-by-input chaos, fail-closed guard |
+| 60 | [Business-Day Time Zones & DST in Reports](easy/60-business-day-time-zones.md) | five kinds of time, half-open day windows (23/25 h), 15-minute UTC grid, zone changes, DST golden tests |
+
+
+#### Easy backlog
+
+Empty: every idea found in honeydolist-site is now a task (16–60). Other parts of that project (or other projects) can be mined the same way: name one and it becomes `easy/NN-slug.md` with a 🌱 Seed line.
+
 ### 🟡 Medium — [medium/](medium/)
 
 Backlog in [medium/README.md](medium/README.md). Not written yet.

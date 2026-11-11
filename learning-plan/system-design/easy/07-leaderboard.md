@@ -206,13 +206,25 @@ Redis orders equal scores lexicographically by member, which is deterministic bu
 the score itself: scores are integers, so use a composite
 
 ```
-zscore = points × 2^20 + (2^20 − 1 − seconds_since_epoch_bucket)
+zscore = points × 2^20 + (2^20 − 1 − minutes_since_board_start)
 ```
 
 Higher points dominate; among equal points, an earlier timestamp yields a larger remainder and
 ranks higher. Keep the total under 2⁵³ so the float64 score stays exact (points up to ~2³³ with
 a 20-bit time component). Decode `points = zscore >> 20` on read. The alternative, a secondary
 sort in the application, works for a top-10 page but not for computing a rank.
+
+Two details the formula hides:
+
+- **The time part must fit in 20 bits.** Seconds since the board's start overflow it after 12 days
+  (2²⁰ s), so use **minutes since the board's start**: 2²⁰ minutes ≈ 2 years, plenty for a monthly
+  board. An all-time board needs more time bits (and so fewer points bits) or a coarser bucket.
+  Players who reach the same score in the same minute still tie and fall back to member order.
+- **Plain `ZINCRBY` no longer works.** Adding `points × 2²⁰` would keep the *old* time part, so the
+  tiebreak would record when the player first scored, not when they reached this score (a player
+  who went 10 → 100 at t=9 would beat one who hit 100 at t=5). Update with an atomic Lua script
+  instead, the same pattern as task 03: `ZSCORE` → decode points → add → `ZADD` with the new
+  composite. Sections 6 and 8 show plain `ZINCRBY` for the no-tiebreak case.
 
 ### 9.6 Reads and caching
 
