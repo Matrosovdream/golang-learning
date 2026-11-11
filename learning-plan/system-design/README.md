@@ -20,6 +20,7 @@ model, deep dives), the trade-offs, check questions, and ideas for extending the
 - [Estimation cheat sheet](#estimation-cheat-sheet)
 - [AWS sizing cheat sheet](#aws-sizing-cheat-sheet)
 - [Database choice cheat sheet](#database-choice-cheat-sheet)
+- [Scaling ladder cheat sheet](#scaling-ladder-cheat-sheet)
 - [Task index](#task-index)
 - [Adding a task](#adding-a-task)
 
@@ -59,9 +60,9 @@ learning-plan/system-design/
 └── hard/              # 🔴  distributed-systems problems (backlog in hard/README.md)
 ```
 
-Every task file has the **same 16 sections** (see [_template.md](_template.md)), so you always
+Every task file has the **same 17 sections** (see [_template.md](_template.md)), so you always
 know where to look, and so a task can grow for years: a new deep dive is a new `9.x` heading,
-a new idea goes under `14. Extensions`. Sections 15 (AWS hardware sizing) and 16 (database choice) apply the two cheat sheets below to the task's own numbers.
+a new idea goes under `14. Extensions`. Sections 15 (AWS hardware sizing), 16 (database choice) and 17 (what breaks at 100×, 1,000× and 10,000×) apply the three cheat sheets below to the task's own numbers.
 
 ---
 
@@ -318,6 +319,54 @@ primary. Choose Aurora for many replicas, fast failover or a very large, fast-gr
 6. **Redis is an accelerator**, not the record, unless it is durable (MemoryDB, or AOF plus replication) and the loss window is accepted.
 7. **Shard only when one primary cannot take the writes or the data**, by the key you query by; say what it costs (no cross-shard joins or transactions, hot shards, resharding).
 
+## Scaling ladder cheat sheet
+
+> "What breaks first at 100×? At 1,000×? At 10,000×?" is a standard interview follow-up. Answer it as a **ladder**:
+> at each step name the *first* resource to run out (with the number), the change you make, and what you give up. Every
+> task's **section 17** applies this sheet to that task's own numbers. The baseline is the peak in section 4; section 10
+> and section 15 already cover ~10×.
+
+### 1. The kind of change at each step
+
+| Step | What has stopped working | Kind of change | Typical moves | What you give up |
+|---|---|---|---|---|
+| ~10× | one component saturates | **tune and add** | bigger node, replicas, cache, index, batching, a pooler | little |
+| **100×** | one machine or one primary cannot hold it | **scale the same design out** | shard or partition by the access key, cluster the cache, more stateless nodes, read replicas, CDN, queues, cold data to cheap storage | cross-shard joins and transactions, resharding work, hot shards |
+| **1,000×** | one cluster, region or team cannot run it; *coordination* breaks | **change the shape** | independent **cells** (a full copy of the stack per slice of users behind a thin router), multi-region, a different store type (key-value, log, columnar), precompute instead of compute, per-key fan-out strategy, back-pressure, load shedding, per-tenant quotas | global queries, strong cross-cell consistency, simplicity; you gain blast-radius limits and near-linear scaling |
+| **10,000×** | physics, money and the real world | **change the problem** | approximation (sketches, sampling, probabilistic filters), edge or client-side compute, eventual or asynchronous guarantees, rationed features, tiered quality, custom storage engines or hardware; and ask whether the product still makes sense | exactness, features, uniformity |
+
+### 2. What usually breaks first, and where
+
+| Component | First limit | Rule of thumb (re-measure) | The next move |
+|---|---|---|---|
+| One PostgreSQL / MySQL primary | durable writes, then disk | a few thousand to ~10k writes/s; a few TB comfortable | shard by the access key, or a key-value store; partitioning helps retention, **not** write capacity on one node |
+| A Redis node | one core's ops/s, then memory | ~100k ops/s per shard; data ≲ 70 % of RAM | cluster by key; for a hot key: a local cache, replica reads, or split the key |
+| A hot key or partition (the celebrity) | one key above one shard's rate | DynamoDB ≈ 1,000 writes/s and ≈ 3,000 reads/s per partition; Redis ≈ 100k ops/s | split the key (suffix shards), cache, batch, or fan out on read |
+| Connections | process-per-connection databases, load balancers, sockets | a few hundred direct Postgres connections; ~10 KiB per idle Go connection | pooler, fewer long-lived connections, multiplexing |
+| Network and egress | bandwidth, cross-zone and internet bytes | 1 Gbit/s sustained ≈ 324 TB a month ≈ up to $29k (AWS sheet) | CDN, compression, keep traffic inside a cell, move compute to the data |
+| Fan-out | one event becomes N deliveries | cost = rate × N | fan out on write for most and on read for the biggest, batching, queues per partition |
+| Control plane | lease tables, schedulers, config, discovery, metadata stores: the "boring" service nobody sized | grows with the number of *things*, not requests | partition it, cache it, keep the data plane running without it ("static stability") |
+| Third-party limits and bills | provider rate limits, KMS and API quotas, per-call fees | provider-specific | batch, cache, spread across accounts or regions, or bring it in-house |
+| Backfills and maintenance | jobs sized for yesterday's data | job time grows with data | incremental, chunked, resumable, per cell |
+| People | moderation queues, support, on-call, risky deploys | people do not scale linearly | automation, sampling, risk lanes, progressive rollout per cell |
+| Failure rate | with N nodes something is always failing | at 5,000 nodes a node dies about every hour | assume constant failure: automatic replacement, spread over zones and cells |
+
+Cost grows roughly **linearly** with load, except egress, cross-zone traffic and coordination, which can grow faster.
+
+### 3. Sanity anchors (approximate)
+
+World population ≈ 8 billion; internet users ≈ 5 billion or more; one hyperscale service peaks at millions of requests per second;
+the biggest event pipelines in the world move trillions of messages a day (tens of millions per second). If 10,000× your baseline
+exceeds what the real world contains (people, devices, events), say so in one clause and treat the row as a thought experiment about
+limits (network, power, latency across the planet, money), not as a deployment plan.
+
+### 4. How to answer in an interview
+
+1. **Multiply** the baseline out loud ("5k writes/s becomes 500k").
+2. **Name the first thing that breaks, with its number**, against the rules above ("one primary does ~10k; that is 50 primaries' worth").
+3. **Give the change and its price** ("shard by user id; I lose cross-user transactions"), then climb to the next step.
+4. When a multiple is absurd, say it, name the first *physical or economic* limit, and show the change in **kind** (cells, edge, approximation, a product change).
+
 ---
 
 ## Task index
@@ -475,7 +524,7 @@ Backlog in [hard/README.md](hard/README.md). Not written yet.
 ## Adding a task
 
 1. Copy [_template.md](_template.md) to `easy/NN-slug.md` (or medium/hard), next free number.
-2. Fill all 16 sections. Keep the task statement short and vague, the way interviewers do.
+2. Fill all 17 sections. Keep the task statement short and vague, the way interviewers do.
 3. Add a row to the index above and a tick line to [PROGRESS.md](PROGRESS.md).
 4. Link it from the previous task's `Next:` line.
 

@@ -63,6 +63,7 @@ as written. `[ ]` open · `[x]` fixed.
 **53** · §10 "10× (50M devices)" does not match 10× of §4's 20M (200M): only fits as a 50M-device campaign audience. §15: the per-send `last_success_at` update (~8.3k random-key updates/s in a campaign) is not in the IOPS/CPU math: batch per task or write only when older than a day.
 **54** · **SQL** §8/§9.4: wave rollback and cohort stats filter on `wave_id`, but `location_pages` has no index on it (each scans 12M rows).
 **56** · §15 ANN row: sizes int8 vectors (38 GB) "self-run HNSW or pgvector", but pgvector's compact types are `halfvec` (2 B per dimension, ≈ 77 GB for 50M × 768) and `bit`; with `halfvec` the two-copy rebuild flip (~90 GB) no longer fits one 128 GiB node.
+**57** · §10 says "~100k attempts/s" at 10×, but §4 × 10 gives ~42k/s in the first minute (section 17 uses §4 × N).
 **58** · §4 gives no storage for `click_verdicts` (≈ 100 B per click ≈ 6.7 GB/day ≈ 600 GB/90 days, added in §15); "~40 B of one index" per ledger row but §8 defines two indexes (≈ +30 B per row).
 **60** · §9.3 says zone conversion belongs in Go and SQL should only compare instants, but the re-bucket query still does `bucket_start AT TIME ZONE $1`, which reintroduces the two-tzdata dependency.
 

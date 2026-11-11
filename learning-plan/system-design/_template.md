@@ -10,7 +10,8 @@
 <!-- Section map (keep all 14, in this order):
      1 task · 2 questions · 3 requirements · 4 estimation · 5 plan · 6 high-level design · 7 API
      8 data model · 9 deep dives · 10 scaling & failures · 11 trade-offs · 12 check yourself · 13 in Go · 14 extensions
-     15 hardware sizing on AWS (see the README's AWS sizing cheat sheet) · 16 database choice and why (see the README's database choice cheat sheet) -->
+     15 hardware sizing on AWS (see the README's AWS sizing cheat sheet) · 16 database choice and why (see the README's database choice cheat sheet)
+     · 17 what breaks at 100×, 1,000× and 10,000× (see the README's scaling ladder cheat sheet) -->
 
 
 
@@ -153,3 +154,17 @@ The problem. The options:
 **If it were MySQL instead:** what would change (a Postgres-only feature replaced by a workaround), or "nothing material".
 
 **What would flip the choice:** the number or requirement at which you would move to something else.
+
+## 17. What breaks at 100×, 1,000× and 10,000×
+
+> A favourite interview follow-up. The baseline is the peak in section 4; every row names the *first* thing to run out, the number that proves it, and the change. Method and typical breakpoints: [Scaling ladder cheat sheet](../README.md#scaling-ladder-cheat-sheet).
+
+| Scale | Load (baseline × N) | What breaks first, and the number | Recommendation (and what you give up) | ≈ bill |
+|---|---|---|---|---|
+| **100×** | | | | |
+| **1,000×** | | | | |
+| **10,000×** | | | | |
+
+**What stays the same at every scale:**
+
+**Say it in an interview:**
