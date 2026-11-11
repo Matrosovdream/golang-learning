@@ -352,3 +352,58 @@ legal series, pause that tenant's issuing for the backfill window.
 - **Importing history** from another system: collisions with the counter, and the "raise only" rule.
 - **Strict order without gaps at high rate:** a single-writer allocator per hot tenant (medium: distributed task queue).
 - **Audit the series:** a nightly job proving invoice numbers have no holes, feeding [task 22](22-audit-log-revisions.md).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Orders / Invoices API (Go, stateless) | 10k creates/s at peak, 3k/s average | CPU | 10,000 × 0.5 ms = 5 vCPU (JSON, random `public_id`, block allocation in memory, one insert). N = ceil(5 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.3) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | CPU work only; the allocator's blocks and the tenant-to-shard map (1M × ~50 B = 50 MB) live in memory, so `c`, not `m`; 42 % busy at peak, 63 % with a zone down. The numbering itself is a rounding error here; order reads (not in section 4) would be the next load |
+| Postgres shards (`orders`, `invoices`, `number_counters`) | 32 shards, ≈ 310 creates/s each at peak (10,000 ÷ 32); the whale's shard ≈ 1,300/s (1,000 + ≈ 280); ≈ 95B rows/year | memory, then disk size | per shard: IOPS ≈ 310 × 2 = 620 + ~1,000 miss reads ≈ 1,600, under gp3's 3,000 included (whale's shard: 1,300 × 2 + 1,000 ≈ 3,600 ⇒ 6,000); CPU 310 × 0.5 ms = 0.16 vCPU of 4 (whale 0.65); counters 3M rows ≈ 300 MB in all (≈ 9 MB per shard); this lesson's slice of a document ≈ 200 B (72 B row + three indexes ≈ 100 B + page overhead, assumed) ⇒ 95B × 200 B = 19 TB/year ≈ 600 GB per shard | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 32 shards × (primary + standby) | memory-bound: the `(tenant, public_id)` and `(tenant, number)` indexes are hit at random, so the recent part must stay cached (`r`: 8 GiB per vCPU); CPU is nearly idle. 10k writes/s is only ~3–4 nodes' worth of durable writes, so the 32 shards come from data size and tenant isolation, not from throughput |
+
+Counter rows need no tuning: with blocks of ~100 the whale updates its row 10 times a second (section 4), far under the row-lock ceiling of ~330/s. The invoice path (in-transaction counter) is the same hardware; its limit is a lock, not a node.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| ALB: $16 + ~20 LCU × $0.008 × 730 | $130 |
+| Postgres: 32 × `db.r7g.xlarge` (≈ $310 each, Multi-AZ doubles to $620) | $19,800 |
+| gp3 at the end of year one: 19 TB ($1,520) + 3,000 extra IOPS on the whale's shard ($15), ×2 for the standbys | $3,070 |
+| **Total** | **≈ $23,300** (≈ $16,300 with 1-year commitments on the $20,120 of compute) |
+
+- **Biggest line and why:** the database tier is 98 % of the bill (nodes 85 %, disks 13 %); the API that does the numbering is 1.4 %. Price is linear in size, so fewer, bigger shards would save operations, not money; the lever is bytes per document. A real order row (~1 KB, not this lesson's 200 B slice) would make the disk line ≈ 5× ($15k).
+- **What changes at 10×:** 100k creates/s ⇒ 50 vCPU ⇒ N = ceil(50 ÷ 8.53) = 6 × `c7g.4xlarge`; per shard 3,100 writes/s ⇒ ≈ 6,200 IOPS (still inside gp3's 16k) but ≈ 1.6 of 4 vCPU before any reads, so shards move to `db.r7g.2xlarge` (or 64 shards); disks reach 190 TB a year (≈ $30k a month at year-end); and the whale hits 10k/s on one counter row, the first real architecture change (bigger blocks, per-instance sub-ranges).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- ≈ 260M new documents a day (3k/s average, 10k/s peak), ≈ 95B rows a year, on 32 shards by `tenant_id`: ≈ 310 creates/s per shard at peak, the whale's shard ≈ 1,300/s (sections 4, 15).
+- Every access is by key inside one tenant: take a number, fetch by `(tenant_id, public_id)` or `(tenant_id, number)`, list a tenant's documents. Nothing reads across tenants.
+- Three rules the store must enforce itself: unique `(tenant_id, number)` for orders, unique `(tenant_id, series, number)` for issued invoices, and a gap-free counter bumped in the issuing transaction so a rollback un-increments it (9.3). One counter row tops out at ≈ 330 updates/s while its lock is held (9.2).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora), sharded by hand | ✅ chosen | `INSERT … ON CONFLICT DO UPDATE … RETURNING last_value` takes a number in one statement; the row lock held to commit is what makes invoice numbers gap-free; unique keys plus the partial unique index and the `CHECK` make "no duplicate, ever" a database fact; `fillfactor = 50` gives HOT updates on the counter row; `CREATE UNIQUE INDEX CONCURRENTLY` and `NOT VALID` constraints make the live backfill safe (9.5) |
+| MySQL (RDS / Aurora), sharded by hand or with Vitess | ✔ works, small edits | `ON DUPLICATE KEY UPDATE … LAST_INSERT_ID(…)` replaces `RETURNING`; unique keys and row locks behave the same (below) |
+| DynamoDB | ✔ works for orders, ✖ for gap-free invoices | an `UpdateItem` with `ADD` is an atomic counter that returns the new value, and 10k writes/s needs no shard fleet; blocks still apply (one item ≈ 1,000 writes/s). But only the primary key is unique, so `(tenant, number)` and `(tenant, public_id)` need an item each in a `TransactWriteItems` (2× the write cost), and a transaction on a hot counter fails with a conflict instead of queueing behind a lock, so gap-free issuing becomes retry logic |
+| Cassandra / Keyspaces | ✖ poor fit | counter columns can double-count when a write is retried; the safe alternative, a lightweight transaction (`IF last_value = x`, Paxos), costs several round trips per attempt and queues badly on one hot key |
+| Redis | ✖ as the record | `INCR` sits outside the order's transaction: a crash leaves gaps and a Redis loss can repeat numbers (9.1) |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, 32 shards of `db.r7g.xlarge` behind a tenant-to-shard map (section 15). It wins on three things: constraints and row locks inside the shard, so numbering, uniqueness and the rollback rule are database guarantees (8, 9.3); `RETURNING` for one-statement allocation; and tenant locality, since a tenant's counter, orders and invoices share a shard and no transaction ever spans two.
+
+**Sharded Postgres, or a key-addressed store?** Throughput alone does not need shards: 10k writes/s is about 3–4 nodes of durable writes (section 15). The 32 shards come from size (≈ 19 TB a year at the assumed 200 B per document, ≈ 600 GB a shard) and tenant isolation. This is a key-addressed workload, so DynamoDB would take the volume with no shards to run and is a credible choice for the order path; what it gives up is the database enforcing the invoice series. Sharding by tenant keeps that path on one node. Ways to shard: by hand as here, Citus (self-managed; not an RDS or Aurora feature) or Aurora Limitless (check availability), or MySQL under Vitess (a `tenant_id` vindex, online resharding, and sequence tables that hand out id blocks, the same idea as 9.2; you run it or buy it, RDS MySQL does not shard).
+
+**If it were MySQL instead:** the same design, with these differences.
+- Allocation: `INSERT … ON DUPLICATE KEY UPDATE last_value = LAST_INSERT_ID(last_value + 1)`, then read `LAST_INSERT_ID()` on the same connection. Create counter rows at tenant signup: two sessions inserting the same missing key is a classic InnoDB deadlock under `REPEATABLE READ`.
+- The partial unique index on invoices is not needed: unique indexes in both engines allow many NULLs, so a plain `UNIQUE (tenant_id, series, number)` already ignores drafts (it only costs index space). `CHECK` is enforced from 8.0.16.
+- Gap-free works under the default `REPEATABLE READ`: `UPDATE` reads the latest committed row and the second issuer just waits for the lock, so there is no serialization error to handle (Postgres needs `READ COMMITTED`, 9.3); an update by full key takes a record lock, not a gap lock. The counter row needs no `fillfactor` or vacuum tuning: InnoDB updates in place and old versions go to the undo log (a long-running transaction delays their purge).
+- Clustered key: `orders.id` is append-only, which is what InnoDB wants; the unique keys are secondary indexes that carry the 8-byte `id`. Clustering by `(tenant_id, number)` would keep a tenant's orders together but moves every insert to its tenant's tail instead of the table's.
+
+**What would flip the choice:** the first real change is not an engine: at 100k creates/s the whale hits ≈ 10k/s on one counter row (section 15), which calls for bigger blocks and per-instance sub-ranges (task 04). DynamoDB becomes the better fit if the gap-free series goes away (or is delegated to an invoicing provider) and documents become pure key-value at a rate where 64 shards are a burden. Multi-region writes would not flip it: global tables resolve conflicts by last writer wins, so two regions could issue the same number; a counter needs one home region per tenant.

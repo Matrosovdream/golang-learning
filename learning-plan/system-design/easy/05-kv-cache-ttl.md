@@ -271,3 +271,51 @@ why it's safe to build locks and counters on it.
 - **GC-friendly storage:** byte arena + offsets instead of `map[string]*entry`; compare pause times with `GODEBUG=gctrace=1`.
 - **Pipelining** in the protocol: many commands per round trip; measure throughput at 1 vs 100 per batch.
 - **Hot-key detection:** sample access counts, log the top-10 keys per minute.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Cache node (Go server, 256 shards) | 100k ops/s, 10k connections, 8 GB of entries (~6M × ~1.3 KB) | memory, then network, then CPU | memory: 8 GB accounted ÷ 0.75 (section 8's slack rule) = 10.7 GB real; + 40 % GC headroom (sheet: 30–50 %) ≈ 15 GB; + 10k connections × (10 KiB + 8 KiB stack) ≈ 0.2 GB ⇒ ~15 GiB. Network: 100k × ~1.2 KB (1 KB value + framing) = 120 MB/s ≈ 1 Gbit/s sustained. CPU: 100k × 10 µs = 1 vCPU, ~2 with GC scanning 6M pointers (assumption) | `r7g.xlarge` (4 vCPU / 32 GiB) on EC2 (managed Redis: `cache.r7g.xlarge`, ≈ $310) | 1, as designed (no replication, section 3) | RAM is what this lesson is about, so `r`: ~15 GiB of 32 used (47 %). `m7g.xlarge` (16 GiB) would sit at ~95 % and the first fragmentation spike kills the process; `c` would pay 16 vCPUs for 32 GiB. CPU ≈ 50 %; ~1 Gbit/s is the next limit (an `xlarge`'s sustained network is a fraction of its "up to 12.5 Gbps" burst, check the instance page) |
+
+First availability step (section 10): shard by key on the client across 2 × `r7g.large` in two zones. Half the keys each ≈ 4 GB of entries ≈ 7.5 GiB real per node, 1 vCPU of 2 busy, ≈ $155 in total, the same as one `xlarge`; losing a node then costs half the hit rate, not all of it.
+
+The cache protects the database behind it: an empty node (a restart) sends all 100k reads/s there (section 12, question 5), so that database, not this node, is what must be sized for a cold start, or the node must be warmed gradually.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Cache node: 1 × `r7g.xlarge` | $160 |
+| Cross-zone client traffic: 100k ops/s × ⅔ × 1.2 KB ≈ 210 TB × $0.02 (out + in) | $4,200 |
+| **Total** | **≈ $4,360** (≈ $4,300 with a 1-year commitment on the $155 node; transfer is not discounted) |
+
+- **Biggest line and why:** cross-zone traffic (~96 %): the node costs $155 and moving data to it from the two thirds of clients in other zones costs 27× that. This assumes the node really runs at its 100k ops/s design point around the clock; at 10 % average load the line is ≈ $420. Levers: a replica per zone read locally (3 × `r7g.xlarge` ≈ $465) or an in-process cache in the clients (section 10).
+- **What changes at 10×:** 1M ops/s ⇒ at least 10 × `r7g.xlarge` (each 100k ops/s, ~50 % CPU, ~1 Gbit/s) with consistent hashing, 80 GB of entries, ≈ $1,550. The cross-zone line becomes ≈ $42,000 a month, so zone-local replicas or a client-side L1 cache stop being an optimisation and become the main cost lever; ~1 Gbit/s per node is also where an `n` family or more nodes comes in.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Opaque values by key, never queried any other way: `GET`, `SET` (with TTL and `NX`), `DEL`, `INCR`, `TTL`. ~6M entries, 8 GB of accounted values (~15 GiB real with headroom), 100k ops/s, p99 under 1 ms, about 10 µs of CPU per operation (sections 3, 4, 15).
+- No durability and no relations: the node may lose everything on restart (section 2) and must never be the only copy of anything (section 10).
+- What it needs from its store is memory-bound eviction (LRU), expiry by clock, and atomic single-key commands, none of which a relational engine is built for.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✔ as the record behind the cache, ✖ as the cache | 100k mixed ops/s is about an order of magnitude over what one primary does (~10k+ reads/s, a few thousand durable writes/s). A `SET … EX` would be a row version, an expiry a `DELETE` plus a sweeper, and there is no memory-bound eviction; `UNLOGGED` tables drop the WAL but none of that. It is exactly the database whose load the cache absorbs, and it must survive a cold start (section 12, question 5) |
+| MySQL (RDS / Aurora) | ✔ as the record behind the cache, ✖ as the cache | the same. Its `MEMORY` engine keeps a table in RAM, but it locks the whole table per write (the single global mutex of 9.4), has no `BLOB`/`TEXT` columns for 100 B-100 KB values, no TTL and no LRU: it errors when full instead of evicting |
+| Go in-process store (this lesson) | ✅ chosen | 256 shards of mutex + map + linked list (9.4), lazy plus sampled expiry (9.3), accounted memory; one `r7g.xlarge` with ~15 of 32 GiB used (section 15). It is the point of the exercise |
+| Redis / Valkey (ElastiCache) | ✔ works, the production default | it is what this lesson builds: single-threaded commands make `INCR` and `SET NX EX` atomic (9.4), `maxmemory` with an LRU policy evicts, active plus lazy expiry (9.3). Managed `cache.r7g.xlarge` ≈ $310 against ≈ $155 self-run (section 15) buys patching and failover |
+| Memcached (ElastiCache) | ✔ works for plain get/set/TTL | multithreaded, LRU, TTL, `incr`, and `add` (set if absent) cover this API; no data structures, no persistence, a 1 MB default value cap (section 10) |
+
+**Pick:** the store is the process itself: a Go server on an `r7g.xlarge` (section 15). In a product you would run managed Redis or Valkey on `cache.r7g.xlarge` instead, unless owning the cache is the point. PostgreSQL or MySQL is whatever record sits behind it; the cache is entirely derived, and the real sizing risk is that database on a cold start, where all 100k reads/s land on it (section 15).
+
+**If it were MySQL instead:** nothing material: the cache holds no relational feature, and cache-aside (task 01) reads the same whichever engine sits behind it. Only "use a MySQL `MEMORY` table as the cache" is worse than the answer above.
+
+**What would flip the choice:** beyond one node (1M ops/s, ≥ 10 nodes, section 15) use client-side consistent hashing or ElastiCache cluster mode. If entries must survive restarts and cannot be rebuilt (sessions, locks), it is no longer a cache: MemoryDB, or a database. Cross-zone client traffic is ~96 % of the bill (section 15), so the next lever is an in-process L1 cache in the clients or per-zone replicas, not another engine.

@@ -314,3 +314,61 @@ different region from the one being checked.
 - **Anomaly detection** on latency (a site that is "up" but 5× slower than its baseline).
 - **SLA reports** per month as a scheduled job; what counts as downtime for billing?
 - **Status page incidents** with manual updates, and subscriber notifications via task 12.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption; priced as us-east-1 in all three regions, though other regions cost somewhat more)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Checkers (Go, one pool per region) | 16.7k checks/s per region (50k/s total); ~8k in flight, worst case 170k with 10 s timeouts | CPU (TLS handshakes) | every check is a new connection to a new host: TLS + HTTP ≈ 1.5 ms CPU (assumption) ⇒ 16.7k × 1.5 ms = 25 vCPU. N = ceil(25 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(5.9) = 6. Memory: ~40 KB per in-flight check ⇒ 8k = 0.3 GB, worst case 170k = 6.8 GB ÷ 6 nodes = 1.1 GB each. Inbound ≈ 10 KB per check ⇒ ~28 MB/s (0.22 Gbit/s) per node, and inbound is free | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS, public subnets with Elastic IPs (customers allow-list them) | 6 per region (2 per zone), 18 in total | CPU-bound on crypto, so `c`; even the timeout storm needs ~1 GiB of 16, and waiting is not CPU. 52 % busy normally, 78 % with one zone down. Public subnets, not a NAT Gateway, which would add $0.045/GB × 131 TB ≈ $5.9k |
+| Scheduler + Redis (`due:{region}`, work queue) | 1M members × ~100 B = 100 MB; ~17 pops/s (1,000 each), 16.7k reschedules/s in Lua, 16.7k queued ids/s | single-core CPU (barely) | 100 MB × 2 for the snapshot fork = 0.2 GB; ops ≈ 0.3 core of 1. The scheduler (×2) is ~0.2 vCPU: run it as extra pods on the checker nodes | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache | 1 primary + 1 replica per region (other zone) | tiny hardware: 2 vCPU is the smallest non-burstable node, and buying `r` memory for 0.1 GB buys nothing; the schedule can also be rebuilt from Postgres (section 10) |
+| Results stream (Kafka) | 50k results/s × 100 B = 5 MB/s (432 GB/day), about 33k/s of it crossing regions | none at this size (disk and network in theory) | RF 3 ⇒ 15 MB/s of disk writes across the cluster, ~5 MB/s per broker; 24 h retention = 432 GB × 3 = 1.3 TB; recent data in page cache ≈ 1.5 GB | MSK `kafka.m7g.large` (2 vCPU / 8 GiB) (self-managed: EC2 `m7g.large`, half the instance price) | 3 brokers, one per zone | one partition carries tens of MB/s, so 12+ partitions only give the aggregator parallelism; 3 brokers are for RF 3 across zones, not for load |
+| Aggregator (state machine, batch writer) | 50k results/s | CPU | ~50 µs per result (decode, last-2-per-region, verdict) ⇒ 2.5 vCPU; state 1M × 3 × 2 × ~50 B = 300 MB. N = ceil(2.5 ÷ (0.8 × 4 × ⅔ = 2.13)) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) | 3 | CPU-light and memory-light, so `c`; consumers share partitions by `monitor_id`; one batch insert of 1,000 rows 50×/s |
+| Time-series store (ClickHouse) | raw 7 d 3 TB + 5-min rollups 90 d 3.9 TB + hourly 2 y 2.6 TB = 9.5 TB uncompressed; 50k rows/s in batches | storage capacity, then CPU (merges); not IOPS | ~15× compression (10–20× in 9.5) ⇒ ≈ 0.65 TB per replica ⇒ 1 TB `gp3`. CPU ≈ 3–4 vCPU of 8 (ingest, merges, rollup views; assumption). Disk writes ≈ 5 MB/s raw, far under gp3's 125 MiB/s | self-managed ClickHouse on `m7g.2xlarge` (8 vCPU / 32 GiB) + 1 TB `gp3` (alternative: Postgres by day on RDS: ≈ 9.5 TB of gp3 ≈ $760 per copy, ×2 Multi-AZ) | 3 replicas, one per zone | columnar compression is the whole case for it: 15× less disk than rows; queries read rollups, so no `r`-size cache is needed |
+| Control plane: API + Postgres | no figure in section 4: assume 1k req/s ⇒ 2 vCPU at 2 ms; 1M monitors × ~300 B ≈ 0.3 GB, a few writes/s | none (availability only) | N = ceil(2 ÷ (0.8 × 2 × ⅔ = 1.07)) = 2 → 3 | `c7g.large` ×3; `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ | 3 + primary and standby | a few small instances for availability, not load; monitor config rides in the queue message, so checkers never query Postgres (assumption, else 50k lookups/s) |
+
+Network is the real item: each check sends ≈ 1 KB out (ClientHello, request, ACKs; assumption) ⇒ 50 MB/s ≈ 0.4 Gbit/s ≈ 131 TB a month, all billed as data out. Inbound responses (~4 Gbit/s in total) are free.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Checkers: 18 × `c7g.2xlarge` (18 × $212) | $3,820 |
+| Redis: 6 × `cache.m7g.large` (6 × ≈ $120) | $720 |
+| Data out: 131 TB × $0.09 (first-tier price; volume tiers lower it) | $11,800 |
+| Cross-region results: ~8.8 TB × ≈ $0.02 | $180 |
+| MSK: 3 × `kafka.m7g.large` (3 × ≈ $120) + 1.3 TB storage ($104) | $460 |
+| Aggregators: 3 × `c7g.xlarge` | $320 |
+| ClickHouse: 3 × `m7g.2xlarge` ($720) + 3 TB `gp3` ($240) | $960 |
+| Postgres `db.m7g.large` ≈ $120, Multi-AZ doubles | $240 |
+| API 3 × `c7g.large` + ALB (≈ $30) | $190 |
+| **Total** | **≈ $18,700** (≈ $16,500 with 1-year commitments, ≈ 35 % off the $6,340 of servers) |
+
+- **Biggest line and why:** data out, 63 %. Every check opens a fresh connection to a different host (nothing to reuse), and a clock-driven system never has an off-peak, so average equals peak. All the servers together are 34 %. The lever is bytes per check (smaller handshakes, shorter reads, longer intervals on cheap plans) or running checkers on bandwidth-cheap hosts, not instance size.
+- **What changes at 10×:** 500k checks/s ⇒ 250 vCPU per region ⇒ N = ceil(250 ÷ 4.27) = 59 → 60 × `c7g.2xlarge` per region (180 in all, ≈ $38k). Each Redis needs ~3 cores, so shard the due-queue ~4 ways per region (section 10). Kafka gets real: 50 MB/s × RF 3, ~13 TB at 24 h, ~6 larger brokers. ClickHouse takes 500k rows/s: ~5 shards × 3 replicas of `m7g.4xlarge`. Aggregators: ceil(25 ÷ 2.13) = 12 × `c7g.xlarge`. Data out ≈ 1.3 PB, over $100k at first-tier price: the real cost problem.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two workloads. The control plane is 1M monitors × ~300 B ≈ 0.3 GB plus incidents, a few writes/s, read by key (section 15). The results are 50k rows/s (4.3B a day, ~430 GB/day raw): raw 7 days ≈ 3 TB, 5-minute rollups 90 days ≈ 3.9 TB, hourly rollups 2 years ≈ 2.6 TB, about 9.5 TB uncompressed (sections 4, 9.5).
+- Results are append-only and never updated. They are read as range scans by `(monitor_id, region, time)` over rollups and as aggregates ("uptime % for 30 days", p95).
+- "Which monitors are due now" is a sorted-set pop at 16.7k/s per region (section 9.1), not a SQL query.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for `monitors` and `incidents`, ✖ for `check_results` at this size | config is relational and tiny (`regions TEXT[]`, a foreign key from `incidents`). For results it could take 50k rows/s as ~50 batched `COPY`s a second and drop day partitions; what fails is the footprint: ~9.5 TB of uncompressed rows ≈ $760 a month of `gp3` per copy, ×2 for Multi-AZ (section 15), where ClickHouse needs ~0.65 TB per replica |
+| MySQL (RDS / Aurora) | ✔ for config (one workaround), ✖ for results for the same reason | no array type, so `regions` becomes a JSON array or a `monitor_regions` table. For rollups InnoDB's clustered key `(monitor_id, region, bucket)` makes a monitor's 30-day range one tree walk, a real plus; it is still a row store holding ~9.5 TB |
+| ClickHouse (self-managed on EC2) | ✅ chosen for `check_results` and the rollups | batched inserts of 1,000 rows, ~15× compression (section 15), and a 30-day p95 is a cheap column aggregate. The cheat sheet's warning (slow single-row updates, not OLTP) does not bite because no result row is updated. Cost: another database to operate (section 11) |
+| Timestream | ✔ managed alternative | removes the cluster to run; check the cardinality (1M monitors × 3 regions = 3M series), retention tiers and the price at 50k writes/s first. Not sized in section 15 |
+| Redis (ElastiCache) | ✅ for the `due:{region}` queue, ✖ as the record | 1M members × ~100 B = 0.1 GB and an atomic Lua pop-and-reschedule (section 9.1); derived, rebuilt from Postgres in seconds (section 10) |
+
+**Pick:** by workload, as in section 15. PostgreSQL on RDS Multi-AZ (`db.m7g.large`) is the system of record for monitors, incidents and alert config. ClickHouse (3 × `m7g.2xlarge`, one replica per zone) holds results and rollups, because columnar compression turns 9.5 TB into ~0.65 TB per replica; raw rows are the record for 7 days, the rollups are derived from them and are what lasts. Redis holds the due-queue, derived from Postgres. Kafka (MSK) only buffers results for 24 h: a transport, not a store.
+
+**If it were MySQL instead:** the control plane changes in one place: `regions TEXT[]` becomes a JSON array or a join table. Nothing else in sections 8-9 needs a Postgres-only feature (`SKIP LOCKED` exists in MySQL 8.0 if you ever poll the database instead of Redis), and the results store is ClickHouse either way.
+
+**What would flip the choice:** down: at ~100k monitors (5k rows/s, ~0.3 TB of 7-day raw plus ~0.4 TB of 5-minute rollups: section 4 divided by ten) plain Postgres day partitions are enough and ClickHouse is not worth operating (section 9.5 says so too). Up: at 10× (500k rows/s) ClickHouse shards (~5 shards × 3 replicas, section 15). If nobody wants to run ClickHouse, the two-year hourly tier can live in S3 as Parquet and be queried with Athena.

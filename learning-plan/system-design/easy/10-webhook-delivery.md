@@ -324,3 +324,56 @@ receiver can refetch when it needs the latest state. Document that the snapshot 
 - **mTLS** or OAuth client credentials instead of HMAC for enterprise customers.
 - **Inbound webhooks** (the mirror image): verify, dedupe, respond fast, process async.
 - **Delivery SLOs**: p95 time-to-first-attempt, success rate per endpoint, dashboards for customers.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption; payload ≈ 2 KB is assumed too, section 4 only gives the 500 B delivery row)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Delivery workers (Go) | 1,750 deliveries/s + 30 % retries = 2,275 attempts/s; ~900 in flight, worst case 17k | CPU (TLS + HMAC + DB result) | most endpoints are hit once per ~10 min (175/s ÷ 100k), so no connection is reused: new TLS each time ≈ 2 ms CPU ⇒ 2,275 × 2 ms = 4.55 vCPU. N = ceil(4.55 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.1) = 3. Memory: 17k × ~40 KB = 0.7 GB ÷ 3 nodes = 0.23 GB each | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS, private subnets of a dedicated egress VPC (section 9.5) | 3, one per zone | section 4 says "mostly waiting on the network", but waiting costs memory, not CPU, and even the 17k worst case is ~1 GiB of 24: so `c`, not `m`. 38 % busy normally, 57 % with a zone down. Per-endpoint caps and breakers live in memory because the queue is partitioned by endpoint |
+| Relay + fan-out + retry dispatcher + dashboard API | 1,150 events/s at peak (10× of 115) | CPU, small | relay 1,150 × 0.15 ms + fan-out 1,150 × 0.5 ms (endpoints cached, 100k × 300 B = 30 MB) + dispatcher ≈ 0.9 vCPU. N = ceil(0.9 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3 | tiny hardware: the zone rule sets the count. Kept apart from the workers so the segment that talks to the internet has no more access than it needs |
+| Events topic + delivery queue (Kafka) | events 1,150/s + deliveries 2,275/s at ~2 KB ≈ 7 MB/s peak; 24 h retention ≈ 60 GB × RF 3 = 180 GB | none at this size (disk and network in theory) | RF 3 ⇒ ~21 MB/s of disk writes across 3 brokers = 7 MB/s each, far below one `gp3` volume | MSK `kafka.m7g.large` (2 vCPU / 8 GiB) (alternative: SQS FIFO with `MessageGroupId` = endpoint id) | 3 brokers, one per zone | partitioned by `endpoint_id` for isolation, not for throughput: 7 MB/s is a fraction of one partition's tens of MB/s |
+| Postgres (`deliveries`, `endpoints`) | ≈ 3,400 commits/s at peak (1,150 fan-out + 2,275 attempt results); 7.5 GB/day ⇒ 225 GB rows + ~65 GB indexes in 30 days | write IOPS, then CPU | ≈ 2 IOPS per commit (assumption) ⇒ 6.8k + ~1k reads ⇒ `gp3` at 8,000 IOPS, 400 GB (bloat and WAL headroom). CPU 3,400 × 0.5 ms = 1.7 vCPU of 8. Hot set = last day's rows + indexes ≈ 10 GB ≪ 32 GiB | `db.m7g.2xlarge` (8 vCPU / 32 GiB), RDS Multi-AZ | 1 primary + synchronous standby | the hot set is small and old rows are read only by the dashboard, so `m` not `r`; IOPS decide the node, which is why the table is partitioned by day and old days are dropped (section 10). gp3 caps at 16k IOPS: batch result writes before buying `io2` |
+
+Network: each attempt sends ≈ 4 KB out (2 KB payload and headers, TLS, ACKs; assumption) ⇒ 2,275 × 4 KB = 9 MB/s ≈ 73 Mbit/s at peak, no limit near. On average 175 × 1.3 = 228 attempts/s ⇒ ≈ 2.4 TB a month out. Customers allow-list our IPs, so the egress VPC uses a NAT Gateway per zone (fixed addresses, no route inward). No Redis is needed.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Workers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Relay, fan-out, dispatcher: 3 × `c7g.large` (3 × $53) | $160 |
+| MSK: 3 × `kafka.m7g.large` (3 × ≈ $120) + 180 GB storage ($14) | $370 |
+| Postgres: `db.m7g.2xlarge` ≈ $480, Multi-AZ doubles | $960 |
+| gp3 400 GB + 5k extra IOPS: $32 + $25 = $57, ×2 for the standby | $110 |
+| NAT: 3 × $33 + 2.4 TB × $0.045 | $210 |
+| Data out: 2.4 TB × $0.09 | $220 |
+| **Total** | **≈ $2,350** (≈ $1,720 with 1-year commitments, ≈ 35 % off the $1,800 of servers) |
+
+- **Biggest line and why:** Postgres (41 %, 46 % with its disks): the delivery log is a write-heavy table, ~3,400 commits/s at peak for a service whose workers are only ~20 % of the bill. The lever is fewer commits (batch ~20 attempt results per transaction), which would let a `db.m7g.xlarge` carry it.
+- **What changes at 10×:** 22.75k attempts/s ⇒ 45.5 vCPU ⇒ N = ceil(45.5 ÷ 2.13) = 22 → 24 × `c7g.xlarge`. Postgres at ~34k commits/s and ~68k IOPS is past one primary and one `gp3`: batch result writes first, then shard by `endpoint_id` or move to `io2` / NVMe (`i4i`); 150M rows/day (75 GB) is why daily partitions get dropped. Kafka reaches ~70 MB/s × RF 3, so bigger brokers (`m7g.xlarge`, disk and network now matter). NAT plus data out reaches ≈ $3.2k a month (24 TB × $0.135).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 15M `deliveries` rows a day (~500 B, 7.5 GB/day; ~225 GB of rows plus ~65 GB of indexes at 30 days) and ~3,400 commits/s at peak (1,150 fan-out commits + 2,275 attempt results); every row is updated at least once (sections 4, 15).
+- Queries are by key and small ranges: retries that are due (`next_attempt_at`, `pending` rows only), an endpoint's recent deliveries (`endpoint_id, created_at DESC`), and idempotent fan-out (`UNIQUE (event_id, endpoint_id)`).
+- The `outbox` row must commit in the same transaction as the business change (section 9.1), so it lives in the producing service's database, whichever engine that is. The 100k endpoints (~30 MB) are cached in memory.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the partial index `deliveries_due_idx ... WHERE status = 'pending'` holds only the few rows waiting for a retry while 15M new rows land daily; `ON CONFLICT DO NOTHING` plus the unique key makes fan-out idempotent; `jsonb` payloads and `TEXT[]` event types. Cost: every attempt updates a row, so dead rows and autovacuum on a 225 GB table; daily partitions that are dropped (section 10) keep that bounded |
+| MySQL (RDS / Aurora) | ✔ works, with a workaround | no partial index: either a full `(status, next_attempt_at)` index with an entry for every row, or a small `pending_deliveries` table the dispatcher scans and deletes from. `event_types TEXT[]` becomes a join table or a JSON array. InnoDB updates in place, so no vacuum |
+| DynamoDB | ✖ poor fit today, a candidate at 10× | the delivery log is key-value shaped and a TTL could expire 30-day-old rows, but the dashboard needs "failed deliveries of endpoint X, newest first" (an index), and a giant customer (50 % of events, section 10) puts ~875 deliveries/s, each written at least twice, on one endpoint key: past ~1,000 writes/s per partition |
+| Kafka / SQS FIFO | ✔ as the queue, ✖ as the delivery record | section 15 puts events and in-flight deliveries on MSK partitioned by `endpoint_id` for isolation (SQS FIFO with `MessageGroupId` is the managed alternative); a log cannot answer "find delivery `dlv_...`" or "replay last week's failures" |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.2xlarge`, 400 GB `gp3` at 8,000 IOPS, section 15) as the system of record for endpoints and deliveries. Three things decide it: the outbox needs a same-database transaction with the business write, the partial index keeps the retry scan small, and `UNIQUE (event_id, endpoint_id)` with `ON CONFLICT DO NOTHING` makes fan-out replay-safe. Kafka is the in-flight transport; the endpoint cache in the workers is derived.
+
+**If it were MySQL instead:** three changes. The partial index becomes a full index or a pending table (more index to maintain on every status change); `TEXT[]` becomes a join table or JSON array; `ON CONFLICT DO NOTHING` becomes `INSERT IGNORE`, `JSONB` becomes `JSON`, and `TEXT` keys become `VARCHAR(n)`. The outbox pattern is unchanged: the relay polls, or CDC reads the binlog instead of the WAL.
+
+**What would flip the choice:** at 10× (~34k commits/s, ~68k IOPS, section 15) batch ~20 attempt results per transaction first; then shard by `endpoint_id`, or move only the delivery log to DynamoDB (access by key, TTL expiry) with a shard suffix on the key so a giant endpoint spreads over partitions. The outbox stays in the producer's relational database either way.

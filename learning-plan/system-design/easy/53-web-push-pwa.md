@@ -325,3 +325,55 @@ event's permission who have a device on".
 - **Rich campaigns:** A/B variants, send-time optimisation per user time zone ([27](27-deadlines-escalation.md) §9.5, the 09:00 herd and jitter), and measuring tap-through with a `?n=<id>` on the tap URL ([47](47-web-analytics.md)).
 - **Sliding sessions** for the installed app: the security trade-off of renewing a session on use.
 - **Offline-capable PWA:** a versioned shell cache and the update flow that avoids serving a stale app.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). Small hardware: 8k sends/s is a modest fleet, and the push services themselves (Google, Apple, Mozilla, Microsoft) do not bill per message, to my knowledge; what we pay for is a few instances, one database and the bytes out.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Send workers (Go: RFC 8291 encryption, VAPID signature, HTTP/2 POST per push host) | campaign 8,333 sends/s + routine 460/s ≈ 8,800/s; ~830 in flight; ~100 Mbit/s | CPU (the crypto) | ~1 ms CPU per send (assumption: ECDH + HKDF + AES-GCM + a fresh ES256 signature + TLS write) ⇒ 8.8 vCPU. N = ceil(8.8 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(8.2) = 9. Memory: ~92 in-flight goroutines per node × 8 KiB, a few HTTP/2 pools: under 0.5 GiB. Network: 100 Mbit/s ÷ 9 ≈ 11 Mbit/s each | `c7g.large` (2 vCPU / 4 GiB) on ECS | 9, 3 per zone (49 % busy at the campaign peak, 73 % with a zone down) | per-send work is CPU, not waiting and not bandwidth, so `c`. Many small nodes keep the blast radius at 1/9 and match the lesson's "8 workers". Tasks are retriable (`SKIP LOCKED`, the `(message, device)` key dedupes), so 6 of the 9 can be Spot nodes scaled in for the campaign lane; 3 stay on-demand for transactional pushes |
+| Subscription API (Go: register, delete, test, internal notify) | assume ~10 req/s: the app registers on open only when its subscription differs | none (idle); availability | ~0.01 vCPU ⇒ N = ceil(0.01 ÷ 1.07) = 1 → 3 | `c7g.large` on ECS | 3, one per zone | a few small instances, for availability not load; stateless; the sign-out path (`DELETE` before logout) must always answer |
+| Postgres (`push_subscriptions` 12 GB, `push_sends` 28 GB over 7 days) | campaign: 8,333 × 2 row-writes (insert `queued`, update `accepted`) ≈ 16.7k row-writes/s ≈ 2.5 MB/s; routine ≈ 920/s | memory (hot set), then CPU | hot set = subscriptions 12 GB + indexes ~1.5 GB + recent log ~4 GB ≈ 18 GB: fits 32 GiB (`shared_buffers` 8 GiB + cache). CPU: 16.7k × ~0.1 ms (batched, 5,000 rows per statement) = 1.7 of 4 vCPU. IOPS: 2.5 MB/s of new pages, near-sequential because the key is (message, device) ≈ 300 page writes/s, far under gp3's 3,000 | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ, gp3 100 GB | 1 primary + synchronous standby | the whole hot set must sit in RAM and `m7g.xlarge` has 16 GiB, so `r`; CPU only peaks for 10 minutes. Multi-AZ because every send reads it and a lost subscription table means every user must be asked for permission again |
+
+Push services are outside the VPC, so the workers' traffic leaves through NAT gateways (workers in public subnets with public IPs would skip the NAT lines, at the price of exposed instances).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Send workers: 9 × `c7g.large` (9 × $53) | $480 |
+| Subscription API: 3 × `c7g.large` | $160 |
+| Postgres: `db.r7g.xlarge` ≈ $310, Multi-AZ doubles | $620 |
+| gp3 100 GB × 2 (standby) × $0.08 | $20 |
+| Data out to push services: (40M routine + one 5M campaign a day) × 1.5 KB = 67.5 GB/day × 30.4 = 2.05 TB × $0.09 | $190 |
+| NAT gateways: 3 × $33 + 2.05 TB × $0.045 | $190 |
+| ALB | $20 |
+| **Total** | **≈ $1,680** (≈ $1,240 with a 1-year plan on the $1,260 of instances and RDS; Spot on the campaign nodes lowers it further) |
+
+- **Biggest line and why:** the database, ~38 % ($640 of $1,680), and its load is small: it is the Multi-AZ premium for a 40 GB data set that every send touches. The honest lever is not a smaller node (`m` does not hold the hot set) but accepting that the whole system is about $1.7k a month. The workers could be 3 steady nodes plus 6 nodes started only for the campaign (6 × 0.5 h a day × $0.073/h ≈ $7 even on-demand): ≈ $170 instead of $480.
+- **What changes at 10×:** section 10's 80k sends/s: 83k × 1 ms = 83 vCPU ⇒ N = ceil(83 ÷ 4.27) = ceil(19.5) = 20 → 21 × `c7g.2xlarge` (21 × $212 ≈ $4,450), 1 Gbit/s total, ~48 Mbit/s per node, so still CPU. But the push services throttle first, so per-host token buckets and campaign windows decide the real send time, not the node count. Postgres runs out first at the `push_sends` log: ~167k row-writes/s ≈ 25 MB/s ≈ 3,000 page writes/s (the gp3 limit) and ~17 vCPU: go to `db.r7g.4xlarge` with gp3 at ~10k IOPS, or write one row per 5,000-device task plus rows only for failures. Data out grows ~10× to 20 TB a month (≈ $1,850 of egress + ≈ $920 of NAT processing): then public-subnet workers become worth the exposure.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Device subscriptions: 20M rows × ~600 B ≈ 12 GB, unique on `endpoint_hash` (sha256), indexed by `user_id`. Access is by id at send time (~8.8k/s during a campaign), an upsert on every register, a delete on `404/410` (5.5k-11k a day), and "all devices of a user" (sections 4, 8).
+- The send log `push_sends`: one row per (notification, device), day partitions kept 7 days ≈ 28 GB. A 5M-device campaign makes 8,333 `queued` inserts and 8,333 `accepted` updates a second, batched 5,000 rows per statement, so ~3 statements a second (section 15).
+- Fan-out is range tasks over device ids claimed with `SKIP LOCKED` (9.2): no joins, no aggregates, no search.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `ON CONFLICT (endpoint_hash) DO UPDATE` moves a shared phone's device to the user who signs in, `ON CONFLICT DO NOTHING` on `(notification_id, subscription_id)` makes a retried fan-out safe, `SKIP LOCKED` claims tasks, and day partitions drop in 7 days; the ~18 GB hot set fits 32 GiB. Cost: every `queued → accepted` update leaves a dead row version, so autovacuum has to keep up with today's partition |
+| MySQL (RDS / Aurora) | ✔ works, small changes | `ON DUPLICATE KEY UPDATE` for the move, `INSERT IGNORE` (or a no-op `ON DUPLICATE KEY UPDATE`) for the dedupe, `SKIP LOCKED` since 8.0, `BINARY(32)` for the hash. InnoDB updates in place, so no vacuum on the hot log, and the clustered key `(notification_id, subscription_id)` keeps a task's rows adjacent |
+| DynamoDB | ✔ works, with key design | 12 GB + 28 GB is tiny and 16.7k writes/s is within reach, but a campaign keyed by `notification_id` puts 8,333 writes/s on one partition key against ~1,000/s: key it by `(notification_id, subscription_id % 64)`. "All devices of a user" needs a GSI on `user_id`, and the range tasks need an ordered key you design |
+| Redis (ElastiCache) | ✖ as the record, ✔ for small rebuildable counters | a lost subscription table means asking 20M people for permission again (section 15), so it cannot be a cache; per-host token buckets and per-user caps shared by 9 workers are exactly the counters Redis is for |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.xlarge`, gp3 100 GB, section 15). The subscriptions are the system of record (they carry consent); `push_sends` is a 7-day working log that is dropped by partition, and the audience snapshot is derived. The 16.7k row-writes/s sounds beyond one primary's few thousand durable writes/s, but it is ~3 batched statements a second, ~1.7 of 4 vCPU and ~300 page writes/s (section 15). The two conflict clauses that decide the design exist in both engines, so this is nearly a coin flip.
+
+**If it were MySQL instead:** nothing material. The register upsert returns its id by a `SELECT` on `endpoint_hash` instead of `RETURNING`, the day partitions still need the day in the primary key (the same rule as in Postgres), and the hot log needs no vacuum, a small advantage for a table that takes ~8k updates a second during a campaign.
+
+**What would flip the choice:** not the 10× case: at 80k sends/s the push services throttle first, and writing one log row per 5,000-device task plus rows for failures (section 15) keeps the same engine, a bigger `db.r7g.4xlarge` at most. The subscription table changes store when it outgrows one primary, roughly 100M devices (~60 GB plus indexes against 128 GiB of RAM, a rule of thumb): then shard by `user_id` or move it to DynamoDB keyed by `endpoint_hash`.

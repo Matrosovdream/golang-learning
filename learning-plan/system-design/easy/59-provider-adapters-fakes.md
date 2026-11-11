@@ -326,3 +326,53 @@ The seed's `Registry` is built from configuration, can be **live** (asked for th
 - **Tenant-level chaos switch** as a runtime setting ([51](51-runtime-settings.md)): staging tenants with a fault profile, flipped without a deploy.
 - **Production canaries:** a daily internal message and read-only call per provider, feeding the same alert path as customer traffic ([50](50-alerting-engine.md)).
 - **Webhook signature rotation:** two valid secrets during a window, tested with the `forged` and `stale` variants.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every per-case and per-call figure is an assumption). Tiny in hardware terms, and plainly so: the adapter layer is a library that runs inside other services' pods, and its tests fit on one 8-vCPU runner for about a minute. The cost that belongs to this lesson is the test machinery, mostly an always-on staging copy, and the network bytes of real provider calls.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Contract + chaos suite in CI (every adapter PR; fake and stub only, no network) | 8,000 fake + 8,000 stub cases + 1,920 chaos scenarios per full matrix (§4); ~100 adapter PRs a day (assumed) | CPU | fake 8,000 × ~1 ms = 8 s; stub 8,000 × ~10 ms (in-process `httptest`) = 80 s; chaos 1,920 × 0.2 s (fake clock, §4) = 384 s; total ≈ 470 CPU-s ≈ 8 CPU-min ⇒ ~1 min on 8 vCPU, ~2 min with a cached build. 100 PRs × 2 min = 200 runner-min ≈ 3.3 h/day ≈ 100 h/month | `c7g.2xlarge` (8 vCPU / 16 GiB), ephemeral runners (CodeBuild or self-hosted) on Spot | 0 idle, 1–3 at a time | pure CPU, under 2 GiB of memory, no network (that is the point), so `c`. A Spot reclaim just restarts a 2-minute run |
+| Nightly sandbox contract run | 8,000 calls in 2 h = 1.1 calls/s (§4) | the providers' latency and rate limits, not hardware | 1.1 calls/s × ~5 ms of CPU = 0.01 vCPU; the 2 h is waiting | `c7g.large` job, 2 h a night | 1 | the smallest size is already too big; the real budget is each provider's sandbox limit, so pace it to 1–2 calls/s per provider |
+| Staging stack with continuous 1 % chaos (app + 40 stubs + Postgres) | ~50 synthetic calls/s (assumed), 1 % faulted (§9.3) | nothing: it exists to keep production's shape (and its alerts) exercised | 40 stubs × ~10 MB in one process = 0.4 GB; the app tier idles below 0.1 vCPU; data is disposable | 3 × `c7g.large` + `db.m7g.large` single-AZ, 50 GB `gp3` | 3 + 1 | three nodes so a zone-spread bug shows up in staging; `m` for a small database; no Multi-AZ because nothing in it is real. Always on, because the chaos must keep tripping dashboards |
+
+Production runs nothing of its own. The registry, the LRU (20k drivers × ~1 KB = 20 MB per pod; 15 MB working set, 300 MB if every driver were resident, §4) and the shared HTTP clients live inside the workers of [12](12-notification-service.md) and [44](../../44-background-jobs-queues.md); the 300k account rows (≈ 100 MB at ~300 B) and `contract_runs` fit in the platform's existing Postgres.
+
+The production cost per provider call is network, not CPU. CPU: ~0.3 ms per call (keep-alive, JSON) ≈ $0.003 per million calls. Bytes: ~5 KB through the NAT Gateway (request + response, assumed) = $0.23 per million at $0.045/GB, plus ~2 KB out = $0.18 at $0.09/GB, so ≈ $0.40 per million calls, 100× the CPU. The +30 % retry amplification of a degraded provider (§4) adds ≈ $0.12 per million. Call volume belongs to the host services, so this is not in the total.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| CI: ~100 h of `c7g.2xlarge` ($0.29/h) + nightly sandbox 60 h of `c7g.large` ($0.073/h) | $30 |
+| Staging app: 3 × `c7g.large` (3 × $53) | $160 |
+| Staging database: `db.m7g.large` ≈ $120 managed + 50 GB `gp3` ($4) | $120 |
+| Production adapter layer (in-process; < 1 GB of rows in an existing database) | ≈ $0 |
+| **Total** | **≈ $310** (≈ $210 with 1-year commitments on the $280 of always-on staging) |
+
+- **Biggest line and why:** the staging stack (≈ 90 %), an always-on copy of production's shape so that 1 % chaos keeps proving the alerts work. Levers: two nodes instead of three, or off at night (but then the chaos stops tripping dashboards). The honest comparison is the bytes: one billion real provider calls cost ≈ $400 of NAT and egress, so the dollars are in the calls and the engineers, not in this layer's hardware.
+- **What changes at 10×:** 400 integrations. The full matrix is 240,000 cases + 19,200 chaos scenarios ≈ 4,700 CPU-s ≈ 79 CPU-min ≈ 10 min on 8 vCPU: too slow for every PR. Run only the changed adapter's slice on a PR (≈ 12 CPU-s) and the full matrix nightly across 8 × `c7g.2xlarge` on Spot (≈ 75 s). The nightly sandbox run is 80,000 calls, 11 calls/s in total, so per-provider pacing matters more than hardware. 400 stubs ≈ 4 GB still fit one process. Production is unchanged.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:** barely any data, and this is a lesson about code, not storage.
+- ~300k `integration_accounts` rows (≈ 100 MB), a few dozen `drivers`, a small `contract_runs`, and a sampled `provider_calls` kept ~14 days (section 15; its row count is not sized in section 4).
+- Reads are by key, `(tenant_id, category)`, and a ~20k-driver LRU in each pod absorbs them (15 MB working set), so the database sees saves, cache misses and the `version` check.
+- What it needs: `UNIQUE (tenant_id, category, priority)`, a foreign key from account to driver, a few `CHECK`s and a JSON column for non-secret config. Secrets are not here: `secret_ref` points into the vault (42).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen, because the platform already runs it | section 15 puts the account rows in the platform's existing Postgres and gives staging a `db.m7g.large`; the unique key, the foreign key, the `CHECK`s and `jsonb` for `config` all fit, and nothing here strains it |
+| MySQL (RDS / Aurora) | ✔ works, nothing material | every feature used exists in MySQL 8 (`UNIQUE`, foreign keys, `CHECK` since 8.0.16, a `JSON` column, day partitions for `provider_calls`) |
+| DynamoDB | ✔ works, not worth a second store | `(tenant_id, category)` is a natural key and 300k items is nothing, but the unique `priority` rule would need a conditional write per item and the `drivers` foreign key becomes application code, for no load benefit |
+
+**Pick:** the relational database the platform already runs, PostgreSQL, so this lesson adds no new store. Make staging run the same engine and major version as production (the stack in section 15 does): a chaos environment on a different engine tests a different system. Tie-breakers, if there were no existing database: team skill, tooling, and features you may want later (`jsonb` with a GIN index would answer "which tenants use region X" without a scan).
+
+**If it were MySQL instead:** nothing material. The same tables, a `JSON` column instead of `jsonb`, `AUTO_INCREMENT` instead of an identity column.
+
+**What would flip the choice:** nothing here; at 10× (400 integrations) the account rows are ~3M and still fit one small instance. Only `provider_calls` could change the picture: if it stopped being a sample and became a full call log it would be an append-heavy ledger like [58](58-outbound-click-tracking.md) and belong in a log or analytics store, not with the accounts.

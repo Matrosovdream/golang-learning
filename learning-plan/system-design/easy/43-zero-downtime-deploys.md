@@ -326,3 +326,60 @@ Order of operations, always: **additive schema → code that works with both →
 - **Deploy-time load shedding:** pause low-priority work (batch, email campaigns) during the rollout window.
 - **Multi-region:** roll one region at a time with a bake period between; global traffic shifting.
 - **Preview environments** and **shadow traffic**: replay a slice of production against the new version before the canary.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| App fleet (Go API, stateless) | 20k req/s (1.73B a day, so also the average); 200 pods, 250 mid-rollout (§4) | CPU for the traffic, pod requests for the node count | 20k × 2 ms = 40 vCPU; N = ceil(40 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(9.4) = 10 → 12. But pods are placed by *requests*: 200 × 0.3 vCPU = 60 vCPU must still fit after a zone is lost: 60 ÷ (⅔ × ~7 allocatable) = 12.9 → 15. Surge: 250 × 0.3 = 75 ≤ 15 × 7 = 105, so the rollout needs no extra nodes | `c7g.2xlarge` (8 vCPU / 16 GiB) on EKS or ECS | 15, five per zone | CPU-bound (JSON, auth, 1–3 SQL calls); a pod is 0.3 vCPU / 0.6 GiB, exactly the `c` ratio of 2 GiB per vCPU, so `c`, not `m`. 33 % busy normally, 50 % with a zone down; the zone-loss headroom doubles as the rollout surge |
+| Connection pooler (PgBouncer) | 5,000 client connections mid-rollout (250 pods × 20, §4); ~11k queries/s | CPU (one core per process), memory | direct: 5,000 × 5–10 MiB = 25–50 GiB of the database's RAM; pooled: ~150 server connections; 11k ÷ 3 = 3.7k queries/s per node ≈ 0.1 vCPU | `c7g.large` (2 vCPU / 4 GiB); RDS Proxy | 3, one per zone | the pooler is what lets 25 % more pods connect during a rollout without a 50 GiB memory bill on Postgres; trivial CPU, so the smallest `c` for availability |
+| Postgres (the 4×10⁹-row, 2 TB table and its neighbours) | 2 TB table (§4), ~3 TB with indexes; assume 3k durable writes/s + 8k indexed reads/s (15 % writes, 40 % of requests reach the DB); backfill 10k rows per ~100 ms (§4) | memory, then IOPS | hot set ≈ 3 % of 3 TB ≈ 90 GB < 128 GiB. IOPS: 3k × 2 + ~1k misses = 7k, plus backfill 10 batches/s × ~640 pages (10k × 500 B ÷ 8 KiB) = 6.4k ⇒ ≈ 13.4k ⇒ `gp3` at its 16,000 cap. CPU ≈ 3–4 vCPU of 16 | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ | 1 primary + synchronous standby | RAM keeps reads off disk, so `r`; the backfill, not the traffic, is the IOPS peak and `pause_ms` is its throttle; past 16k IOPS go to `io2` or NVMe (`i4i`) |
+
+CI builds (one image per commit, 50 a day) are bursty CPU: ~5 min on a `c7g.4xlarge` (assumption) = 4.2 h a day, a Spot job. A full-table backfill writes ~7 MB of WAL per batch ≈ 70 MB/s, ≈ 2.8 TB over its 11 h: watch standby lag and the WAL archive, not CPU. The image registry (ECR) needs nothing sized.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| App: 15 × `c7g.2xlarge` (15 × $212) | $3,180 |
+| PgBouncer: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.4xlarge` ($620 × 2 managed), Multi-AZ doubles | $2,480 |
+| gp3 3,000 GB + 13k extra IOPS (= $305, ×2 for the standby) | $610 |
+| ALB: 20k req/s × ~3 KB = 216 GB/h = 216 LCU × $0.008 × 730, + $16 | $1,280 |
+| NAT: 3 × $33 + image pulls (15 nodes × 100 MB × 50 deploys × 30 d = 2.25 TB × $0.045) | $200 |
+| WAL archive for restore points: ~260 GB/day × 7 d ≈ 1.8 TB on S3 | $40 |
+| CI builders: 4.2 h a day of a `c7g.4xlarge` ($420) | $70 |
+| **Total** | **≈ $8,000** (lines sum to $8,020; ≈ $6,000 with a 1-year Savings Plan on the app, pooler and database) |
+
+- **Biggest line and why:** the app fleet (≈ 40 %), then Postgres (≈ 38 %) and the ALB (≈ 16 %, billed by bytes). At 33 % CPU the nodes are bought so that 200 pods still fit when a zone is lost, not for traffic; the lever is the pod request: 0.2 instead of 0.3 vCPU gives 40 ÷ (⅔ × 7) = 8.6 → 9 nodes, ≈ $1,270 a month less.
+- **What changes at 10×:** 200k req/s, 2,000 pods: 600 vCPU requested ÷ (⅔ × 7) = 129 → 129 × `c7g.2xlarge` (≈ $27k), with a rollout always in progress; the pooler must carry 50,000 client connections (~10 nodes); Postgres runs out first: 30k writes/s ≈ 60k IOPS and 80k reads/s are past one primary and past gp3's 16k, so NVMe (`i4i`) with read replicas, then sharding the big table; the ALB bill is ≈ $12.6k.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The thing being changed is one huge transactional table: ~4×10⁹ rows, 2 TB (~3 TB with indexes), ~3k durable writes/s and ~8k indexed reads/s, plus a backfill that updates 10k rows every ~100 ms for ~11 h (sections 4, 15). The control plane (`deploys`, `backfills`) is a few rows a day.
+- So the question is not query speed but what each DDL statement locks and for how long: 9.2 prices a careless `ALTER` at 67 minutes to 2.8 hours, with two app versions live the whole time.
+- 5,000 client connections during a rollout (250 pods × 20), and one thing that cannot be rolled back, a contract migration, which needs a restore point (9.4).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | every step of 9.2 has a form that holds a lock for milliseconds or lets writes continue: metadata-only `ADD COLUMN` with a constant default, `CREATE INDEX CONCURRENTLY`, `NOT VALID` then `VALIDATE CONSTRAINT`, and `SET NOT NULL` that reuses a validated CHECK (PG 12+, no scan). DDL is transactional, so a migration that fails halfway leaves nothing behind, and `lock_timeout` plus a retry on `55P03` defuses the lock-queue trap |
+| MySQL (RDS / Aurora) | ✔ works, with a workaround | `INSTANT` add-column and online index builds (`ALGORITHM=INPLACE, LOCK=NONE`) cover the first two rows of 9.2. There is no `NOT VALID`/`VALIDATE` pair, so `NOT NULL` on 4×10⁹ rows is an online but full rebuild of the 2 TB table (hours: the lesson's 2.8 h rewrite is the right order of magnitude, and it needs room for a second copy), and anything that cannot be online goes through gh-ost or pt-online-schema-change. Every `ALTER` commits implicitly, so a migration file is not all-or-nothing. The lock-queue trap exists here too (metadata locks), bounded with `lock_wait_timeout` |
+| DynamoDB | ✖ poor fit | no DDL, so no `ALTER` outage, but the work moves into code (tolerant readers, an item version, a scan-based backfill) and the table loses joins and ad-hoc queries; expand/contract (9.1) is still needed, as a discipline instead of a lock problem |
+| MongoDB / DocumentDB | ✖ poor fit | the cheat sheet reaches for documents when the schema churns, but this is a fixed-shape table with constraints (`CHECK`, foreign keys), and a mixed fleet still needs dual writes and compatible readers (9.5): only the DDL step disappears |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.4xlarge`, section 15) behind a pooler (PgBouncer on 3 × `c7g.large`, or RDS Proxy). Three things decide it: the safe DDL forms above (each is a row of 9.2, and a CI linter can reject the unsafe ones); `lock_timeout` with an advisory lock, so the one-shot migration job can be retried without ever queueing the fleet behind it; and WAL archiving for point-in-time recovery, which is what makes a contract migration recoverable (9.4). The pooler is the price of a process per connection: 5,000 direct connections × 5–10 MiB would take 25–50 GiB of the database's RAM (section 15). `deploys` and `backfills` are tiny tables in the same database.
+
+**If it were MySQL instead:** the design survives, and most rows of 9.2 get a MySQL form:
+- add-column and index builds use `INSTANT` and `INPLACE, LOCK=NONE` (no `INVALID` index to clean up, but an online-DDL log that must be large enough to hold ~3k writes/s for hours);
+- `NOT VALID` / `VALIDATE` has no counterpart: `NOT NULL`, a type change or any rewrite becomes an online rebuild or a gh-ost copy of 2 TB (hours, throttled on replica lag, extra disk);
+- `lock_timeout` becomes `lock_wait_timeout` with the same retry; the advisory lock becomes `GET_LOCK`; migrations stop being all-or-nothing, so each step must be safe to re-run by hand;
+- the backfill is the same PK-range batches and cheaper: InnoDB updates in place, so the ~2 TB dead-tuple risk of section 10 becomes watching undo length; a restore point becomes a recorded binlog position or timestamp; thousands of connections are cheaper, but still pool.
+
+**What would flip the choice:** a change no safe form covers (repartitioning, a primary-key or type change on the 2 TB table) calls for a shadow table (9.1: logical replication on PostgreSQL, gh-ost on MySQL), which is a tool and not an engine switch. The table outgrowing one primary is the real trigger: at 10× (30k writes/s ≈ 60k IOPS, section 15) you shard it by key, and if you must shard anyway, MySQL with Vitess is the more proven path (cheat sheet). If you already run MySQL, do not switch for this reason: the same expand/contract rules plus gh-ost are enough.

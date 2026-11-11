@@ -321,3 +321,61 @@ idea as the [hash chain project](../../blockchain-projects/01-hashchain-beginner
 - **Read auditing:** log who opened sensitive records, sampled, with its own volume math.
 - **Anchoring** the hash chain's head to a public ledger and verifying it independently.
 - **Alerts on actions** ("a Superadmin changed rate limits"), driven by the same outbox rows ([task 50](50-alerting-engine.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Audit shards (Postgres: `audit_log`, `content_revisions`, `outbox`; the business shards) | 20k inserts/s at peak = ≈ 625 per shard (≈ 190 average); history reads 500/s ≈ 16 per shard; 162 TB online ≈ 5 TB per shard | disk size, then memory | CPU 625 × 0.5 ms = 0.3 of 8 vCPU; IOPS ≈ 625 × 3 (two random index pages + the heap tail, assumed) = 1,900 + history reads 16/s × 24 partitions ≈ 400 ⇒ 2,300, so gp3 at 6,000 (shared with the business writes); insert-hot set = the current month's two indexes ≈ 39 GB at month end (172 GB heap + 23 % per shard-month), fits in 64 GiB | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ | 32 shards × (primary + standby) | `r`, not `m`: 32 GiB cannot cache a 20–40 GB insert-hot index; CPU is idle; below 16k IOPS gp3 is enough (`i4i` NVMe not needed). Monthly partitions keep the insert-hot set to one month of indexes instead of 24. By write rate alone ~7 nodes would do (20k ÷ ~3k/s); 32 is the lesson's tenant sharding |
+| Shipper, hash sealer, archiver (Go) | ≈ 20k rows/s at peak read from 32 outboxes (≈ 7 MB/s) | CPU | assume 0.1 ms per row (batch read, canonical JSON, sha256, Parquet encode): 20k × 0.1 ms = 2 vCPU. N = ceil(2 ÷ (0.8 × 4 × ⅔ = 2.13)) = 1 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | CPU plus a few hundred MB for Parquet row groups, so `c`; sha256 over ≈ 400 B × 20k = 8 MB/s is trivial; seconds of lag are acceptable, so Spot would also do |
+| History / actor API (Go, read-only) | ≈ 500 reads/s (section 4), a handful of exports | CPU, barely | 500 × 1 ms = 0.5 vCPU. N = ceil(0.5 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3, one per zone | availability, not load; a read is 24 index seeks on one shard (≈ 2 ms cached, ≈ 25 ms if cold at ~1 ms each, assumed), inside the 50 ms p99, so the wait is disk latency, not CPU |
+
+Cold archive: Parquet + zstd on S3 with Object Lock, ≈ 55 TB once years 3–7 are filled; nothing to size. Hash-chain heads are a few KB. The optional search index is not sized here.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Shards: 32 × `db.r7g.2xlarge`, Multi-AZ (32 × $1,240) | $39,700 |
+| gp3: 162 TB × $0.08 = $12,960, + 3,000 extra IOPS × 32 volumes × $0.005 = $480, all ×2 for the standbys | $26,900 |
+| Shipper / sealer / archiver: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| History API: 3 × `c7g.large` (3 × $53) | $160 |
+| ALB | $30 |
+| S3 archive: 55 TB × $0.023 (once full) | $1,270 |
+| **Total** | **≈ $68,400** (≈ $54,300 with 1-year commitments on the $40,180 of compute) |
+
+- **Biggest line and why:** the Multi-AZ shards, 97 % (nodes 58 %, disks 39 %). What forces it is "history at any age online in 50 ms": 162 TB on gp3 with a standby costs $0.16 per GB-month against $0.023 on S3 (7×). Diffs are what keep it at $27k of disk: before + after (11× the bytes) would be ≈ $300k. Keeping 90 days in Postgres and serving older history from Parquet is a requirement change, not a sizing one.
+- **What changes at 10×:** 200k inserts/s ⇒ 6,250 per shard ≈ 19k IOPS, past gp3's 16k cap (`io2`, NVMe `i4i`, or ~3× the shards; moving the actor index to a columnar store halves the index IOPS); 1.6 PB online ≈ $260k a month on gp3 with standbys, so only ~90 days stay on Postgres; workers need 20 vCPU ⇒ N = ceil(20 ÷ 2.13) = 10 → 12 × `c7g.xlarge`.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Append-only and large: 6k rows/s average, 20k/s peak, ≈ 518M rows a day of ≈ 350 B diffs ≈ 181 GB a day ≈ 66 TB a year; 2 years online ≈ 162 TB with indexes, ≈ 5 TB on each of 32 shards (section 4).
+- No updates and no row deletes: retention drops whole months. The read side is tiny (≈ 500/s): one entity's history newest first, one actor's rows in a time range, and exports.
+- The audit row must commit in the same transaction as the business change, which lives in the same tenant shard (9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora), sharded by tenant | ✅ chosen | monthly `PARTITION BY RANGE (created_at)` makes retention a `DETACH` + `DROP` with no vacuum; `(tenant_id, entity_type, entity_id, created_at DESC)` serves the history tab as one range scan per partition; the partial index `WHERE actor_id IS NOT NULL` skips system rows; `jsonb` holds the diff; and the insert rides in the business transaction (≈ 0.2 ms) |
+| MySQL (RDS / Aurora), sharded by hand or with Vitess | ✔ works, with care | `RANGE` partitioning with `DROP PARTITION` (or `EXCHANGE PARTITION` to hand a month to the exporter) gives the same retention, and the rule that every unique key includes the partition column is the same. The differences are the clustered key, no partial index and no BRIN (below) |
+| DynamoDB | ✔ as a history store fed by the outbox, ✖ for same-transaction capture | the shape fits: partition key `(tenant, entity_type, entity_id)`, sort key `created_at#id`, so the history tab is one `Query` (newest first, `LastEvaluatedKey` as the cursor) and the actor view a GSI on `(tenant, actor, day)`; ≈ 350 B rounds up to one 1 KB write unit, doubled by the GSI. It cannot commit with a business row that sits in Postgres, so capture becomes outbox + async, which 9.3 rejected for compliance; TTL expiry is free but lazy (days); a per-tenant hash chain needs an order a partition per entity does not give |
+| Cassandra / Keyspaces | ✔ as a history store, same catch | the same model (partition `(tenant, entity_type, entity_id)`, clustering `created_at DESC`); time-window compaction with a TTL drops whole files by age, like a partition drop; a self-run cluster typically keeps 3 replicas (162 TB online ≈ 486 TB raw) against the 2 copies of an RDS Multi-AZ pair; Keyspaces has no compaction to tune |
+| OpenSearch | ✔ as a derived index only | free-text and faceted search over entries (section 14), fed by the shipper and rebuildable from the log; never the record |
+| S3 (Parquet + zstd, Object Lock) | ✅ chosen for years 3–7 | ≈ 55 TB of archive, queried offline (Athena), write-once anchors for the hash-chain heads |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, 32 shards of `db.r7g.2xlarge` (section 15), the same shards as the business data; S3 for the archive; OpenSearch optional and derived. Three things decide it: the audit row commits atomically with the change in the same shard (9.3), native monthly partitions with drop-based retention (9.2), and the tenant-to-shard layout and its operations already exist for the business data.
+
+**Sharded Postgres, or a key-addressed store?** This is the append-only, key-addressed shape DynamoDB and Cassandra were built for, and 20k writes/s is routine for either, so the case for Postgres is not throughput: by write rate ≈ 7 nodes would do (section 15). It is atomic capture with a change that lives in a Postgres shard, plus shards, a map and on-call that already exist. The price is real: the Multi-AZ shards are 97 % of the ≈ $68k bill (nodes 58 %, disks 39 %, section 15), and the sheet has no DynamoDB or Cassandra prices, so price both before you commit. Under Vitess a MySQL fleet would sit in the same place: a `tenant_id` vindex and online resharding replace the hand-made map, at the cost of running Vitess yourself or buying it.
+
+**If it were MySQL instead:**
+- The layout ports, the primary key does not. `(tenant_id, created_at, id)` as InnoDB's clustered key puts every row mid-tree, a random page touch per insert across the shard's tenants. Use the append-only `(created_at, id)` as the key (it still contains the partition column) and keep `tenant_id` in the entity index: the table's tail is then sequential, and the two secondary indexes are the only random inserts (in Postgres the same key is a third random B-tree beside a sequential heap).
+- No partial index: `audit_actor_idx` also indexes the system rows (NULL `actor_id`). No BRIN: exports range-scan the clustered key. `jsonb` becomes `JSON`, which is fine because `changes` is never indexed.
+- Appends do not block each other (insert-intention locks are compatible), but keep the sealer's reads non-locking: a `FOR UPDATE` range scan under `REPEATABLE READ` takes next-key locks.
+
+**What would flip the choice:** 10× (200k inserts/s, ≈ 19k IOPS a shard) passes gp3's 16k cap: `io2`, NVMe or more shards (section 15). Beyond that the move is by age, not by engine: about 90 days in Postgres, older history in Parquet or in a DynamoDB or Cassandra history store fed by the outbox row (capture stays atomic, only the reads move), and the actor index in a columnar or search store. A need for seconds-old analytics across tenants would point to ClickHouse.

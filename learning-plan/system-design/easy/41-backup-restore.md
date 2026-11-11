@@ -301,3 +301,58 @@ policy (`keep_newer` or `overwrite`), a dry run first showing now → after coun
 - **Per-tenant PITR from a change log:** logical decoding into an immutable log so one tenant can be replayed to any second without a full clone.
 - **Game day:** lose the primary account on purpose; time the rebuild; update the runbook (what must live in a password manager, in what order to rebuild: the repo's *Total loss* runbook).
 - **Cost:** tiering old base sets to cold storage, dedup between incrementals, egress-aware restore planning.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). The production primary is outside section 4's numbers; assume `r7g.8xlarge` (32 vCPU / 256 GiB) with 20 TB of gp3, and price only what backup and restore *add*.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Hot standby (other zone), also the base-backup source | replay 20 MB/s of WAL; weekly full read at 500 MB/s ≈ 11 h (§4's rate) | memory + IOPS like the primary; during a backup, EBS throughput and network | 20 TB is over one gp3 volume (16 TiB max), so 2 × 10 TB striped, 16,000 IOPS. 500 MB/s = 4 Gbit/s sustained upload (the sheet: sustained multi-Gbps needs an `8xlarge`+). Compress + encrypt at ~150 MB/s a vCPU (assumed) ≈ 4 of 32 vCPU | `r7g.8xlarge` EC2 with pgBackRest or WAL-G; managed: RDS/Aurora Multi-AZ with automated backups (PITR to 5 min) + AWS Backup cross-account copy, ≈ 2× on the instances | +1 (primary exists) | `r`, same as the primary: a smaller standby cannot take over its load; the agent runs here so the primary pays nothing and no agent fleet exists |
+| Delayed replica for tenant restores | ~10 restores a day, each ~200 MB (≈ 4 s) | disk (a full 20 TB copy) and WAL replay | replay 20 MB/s is well under one core's ~100 MB/s (assumed); extracts are trivial. Kept ~24 h behind (older points need a PITR clone: hours). An on-demand clone ≈ 4.4 h × ($1.70 + $2.19) ≈ $17 a restore (copy only), the replica costs $2,235 ⇒ it pays off above ≈ 130 restores a month; §2's ~10 a day is ≈ 300 | `r7g.4xlarge` (16 vCPU / 128 GiB) + 20 TB gp3 at 6,000 IOPS | 1 | RAM only for the tenants being read; "minutes" for the common case is bought with a second full copy |
+| Weekly drill cluster | copy 4.4 h, replay ≤ 1 day of WAL, then verify | network/EBS copy, then single-process replay | 4.4 h + ~4.7 h (1.7 TB at an assumed 100 MB/s) + verification ≈ 24 h a week ≈ 104 h a month | `r7g.8xlarge` + 20 TB gp3, on-demand, only while it runs | 1, ephemeral | a drill the budget skips is not a backup; a Spot reclaim would waste a 24 h run |
+| Catalogue DB (control plane) | a few rows a day | nothing; availability | tiny | `db.m7g.large`, RDS Multi-AZ | 1 + standby | separate from the 20 TB cluster so it survives losing it |
+| Backup storage (S3, two regions, object lock) | WAL ≈ 1.2 PUT/s (20 MB/s ÷ 16 MiB segments), far under 3,500/s | nothing to size; bytes cost | 52 TB (§4) + 12 monthly sets × 10 TB = 172 TB a region × 2 = 344 TB | S3 + a gateway endpoint (no NAT) | none | not an instance question: storage and the copy are the bill |
+
+Not tiny hardware: two more 20 TB copies run all month because no cold restore of 20 TB meets an hour (§4: 4.4 h copy at 10 Gbit/s, ≈ 44 Gbit/s sustained for 1 h, more than one instance's EBS bandwidth is likely to sustain: check its limit).
+
+**Rough monthly bill (≈, on-demand); the primary (≈ $2,900) is not counted**
+
+| Line | ≈ $/month |
+|---|---|
+| Hot standby: `r7g.8xlarge` ($1,240) | $1,240 |
+| Standby disk: 20 TB × $0.08 = $1,600 + 13,000 IOPS above 3,000 × $0.005 = $65 | $1,665 |
+| Delayed replica: `r7g.4xlarge` ($620) + 20 TB gp3 ($1,600) + 3,000 IOPS ($15) | $2,235 |
+| Weekly drill: 104 h of `r7g.8xlarge` ($177) + 20 TB gp3 for those hours ($228) | $405 |
+| Catalogue DB: `db.m7g.large` $120, Multi-AZ doubles | $240 |
+| S3 backups: 344 TB × 1,000 × $0.023 | $7,912 |
+| Cross-region copy: ~66 TB a month (4 × 10 TB fulls + 26 TB WAL) × $0.02 | $1,320 |
+| **Total** | **≈ $15,000** (sum $15,017; ≈ $14,300 with a 1-year commitment on the $2.1k of steady compute) |
+
+- **Biggest line and why:** S3 backup storage, 53 %, because the backups are 17× the database: two regions, a year of monthly full sets (120 TB a region) and 4 weekly fulls. Levers: monthly sets are write-once and rarely read, so an archive storage class costs a fraction (the sheet lists no price; check it), and incrementals instead of 10 TB monthly fulls. The two standing 20 TB replicas (standby and delayed) are the next 34 %.
+- **What changes at 10×:** 200 TB and 200 MB/s of WAL, which is above the assumed ~100 MB/s of replay, so the standby and delayed replica fall behind; a full backup takes 110 h. One cluster is no longer recoverable: shard into ~10 databases of 20 TB, each with its own lineage, drill and replicas (≈ $5.5k each ≈ $55k), plus S3 ≈ $79k and cross-region ≈ $13k, roughly $150k a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:** here the data is the database itself, so the choice is which engine's backup tools meet the targets of 9.1, plus where the small catalogue lives.
+- A 20 TB cluster holding 100k tenants in a shared schema, ~20 MB/s of WAL (~1.7 TB/day); a logical dump takes ~11 h and a logical restore 1–2 days, while a physical copy back is ~4.4 h at 10 Gbit/s plus WAL replay (section 4).
+- Targets per failure class: RPO ~0 and minutes for node loss, 5 min and hours for a logical disaster, minutes for one tenant.
+- Two small stores beside it: the backup catalogue (a few rows a day, kept apart from the 20 TB cluster) and the backup bytes (~52 TB a region of base sets and WAL, immutable).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (EC2 as in section 15, or RDS / Aurora) | ✅ chosen: the engine under backup and the catalogue's engine | a physical base backup (`pg_basebackup`, pgBackRest or WAL-G) plus continuous WAL archiving gives restore to any second (`recovery_target_time`) at network speed with no index rebuild; `archive_timeout = 60 s` bounds the RPO; `pg_create_restore_point`, `pg_verifybackup` and `pg_amcheck` are the drill's checks; DDL is transactional, so a migration that fails halfway leaves nothing behind, which shrinks the "bad migration" row of 9.1 |
+| MySQL (self-run or RDS / Aurora) | ✔ works, same shape with different tools | a physical backup (Percona XtraBackup, or an RDS/Aurora snapshot) plus archived binary logs replayed with `mysqlbinlog` to a time or GTID; logical dumps with `mysqldump --single-transaction` or MySQL Shell (the analogue of the lesson's single `REPEATABLE READ` snapshot). DDL commits implicitly, so a bad migration cannot be rolled back and leans on PITR more; the catalogue's `pg_lsn` columns become a binlog file and position or a GTID set |
+| RDS / Aurora automated backups (either engine) | ✔ the managed alternative | snapshots and PITR (to 5 min, section 15) with a cross-account copy through AWS Backup, and no agent or WAL archive to run. You give up the 60 s archive timeout, the KMS-plus-offline-escrow envelope of 9.3 and control over where each object lands. A restore always creates a new instance or cluster, so a tenant restore is still extract-and-merge. Aurora MySQL alone also offers Backtrack, an in-place rewind |
+| S3 with Object Lock (second account, two regions) | ✅ chosen for the backup bytes | write-once retention equal to the PITR window, a write-only agent role and cross-region replication are what ransomware and a compromised admin demand (9.4); no database offers that |
+| DynamoDB | ✔ for the catalogue only, ✖ for the 20 TB | a few rows a day by id with built-in PITR, but the manifests beside the objects already rebuild the catalogue and it would be a third technology to run; as the 20 TB store it changes nothing, since its PITR also restores into a new table |
+
+**Pick:** PostgreSQL as the lesson states it: the 20 TB primary and its hot standby on EC2 `r7g.8xlarge` (section 15), pgBackRest or WAL-G running on the standby so the primary pays nothing, WAL archived at most every 60 s, base sets written to S3 Object Lock in a second account and region; the catalogue in a separate RDS PostgreSQL Multi-AZ `db.m7g.large`. What decides it: WAL archiving with point-in-time recovery, the verification tools of 9.5, and owning the archive, the keys and the destination account. The cluster is the system of record; the archives are copies; the catalogue is metadata the manifests beside the objects can rebuild.
+
+**If it were MySQL instead:** the same architecture: XtraBackup base sets taken from a replica, binlogs archived continuously (for example `mysqlbinlog --read-from-remote-server`) to the same locked bucket, replay to a target time in the drill, measured as `replay_seconds`. What changes: other tools and catalogue columns, one more reliance on PITR because DDL is not transactional, and the tenant extract is a `SELECT` from the PITR clone merged back with `INSERT … ON DUPLICATE KEY UPDATE` instead of `COPY (SELECT …)`. About the same effort.
+
+**What would flip the choice:** size and RTO, not features. At 10× (200 TB, 200 MB/s of WAL) one cluster is no longer recoverable (section 15), so shard into ~10 databases of 20 TB, each with its own lineage and drill, before considering another engine. Choose RDS or Aurora when the team will not run pgBackRest or WAL-G and can live with a fixed archive schedule; Aurora's continuous backup sits in its storage layer (which grows to 128 TiB, cheat sheet), so there is no agent or WAL archive to run, though 200 TB exceeds that too.

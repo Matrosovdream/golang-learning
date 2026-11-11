@@ -252,3 +252,57 @@ seconds, then write batched updates. Task 06 is this problem on its own.
 - QR code generation and link previews (fetching the target page safely: see SSRF in task 10).
 - Multi-region: read replicas per region, writes to one primary; what latency does a European click see?
 - Replace the sequence with a KGS and compare operational complexity.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Redirect + create API (Go, stateless) | 50k redirects/s peak + 1.2k creates/s | CPU | redirects 50k × 0.15 ms = 7.5 vCPU; creates 1.2k × 0.5 ms = 0.6; total 8.1 vCPU. N = ceil(8.1 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(1.9) = 2 → 3 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 3, one per zone | a redirect is parse, one Redis GET, write headers: pure CPU. Memory is ~25 MiB of connections (50k/s × 50 ms ≈ 2.5k open × 10 KiB) plus a small in-process cache, so `c` not `m`. 34 % busy at peak, 51 % with one zone down |
+| Redis (code → long URL, cache-aside) | ~55k ops/s (50k GET + ~5k fills on the 10 % misses); hot set 20M × 500 B = 10 GB | memory | 10 GB × ~1.5 overhead = 15 GB; `maxmemory` ≤ 70 % ⇒ ≥ 21 GB of RAM; 55k ops/s is about half of one core's ~100k | `r7g.xlarge` (4 vCPU / 32 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory-bound, so `r` (8 GiB per vCPU): `c` or `m` would buy 8–16 vCPUs just to get 32 GiB while Redis uses one core. A second shard only when ops or memory double |
+| Postgres `urls` | ~5k miss reads/s (10 % of 50k) + 1.2k writes/s; year 1 = 36.5B rows × 100 B = 3.65 TB + ~35 % PK index (1.3 TB) ≈ 5 TB | IOPS, then memory | hot codes live in Redis, so RAM only needs the index's inner levels (~0.5 % of 1.3 TB ≈ 7 GB) plus recent rows. A miss ≈ 2 disk reads (leaf + row): 5k × 2 = 10k; writes 1.2k × 2 = 2.4k ⇒ ≈ 12.4k IOPS ⇒ `gp3` at 14,000 (cap 16,000). CPU ≈ 1.2 vCPU of 4 | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ, `gp3` 5 TB (alternative: DynamoDB, same key-value shape, section 8) | 1 primary + synchronous standby | random point reads over 5 TB with 32 GiB of RAM are IOPS-bound, not CPU-bound; `r` keeps the index's upper levels cached. `gp3` is enough below 16k IOPS. Year 10 (37 TB) means partitioning by `hash(code)`, as section 10 says |
+| Click counter worker (+ queue) | 12k clicks/s avg, 50k/s peak, batched on the API nodes into ~3 messages/s | CPU (tiny) | sum a map, one batched UPDATE every few seconds: < 0.1 vCPU | `c7g.large` (2 vCPU / 4 GiB), SQS in between | 2, one per zone | availability, not load. Batching on the API nodes is a cost decision: one message per click would be 12k/s × 2.63M s ≈ 31.5B sends a month × $0.40 per million ≈ $12,600, more than the whole bill |
+
+Network: a redirect answers with ~400 B (assumption), so 12k/s × 400 B = 4.8 MB/s ≈ 12.6 TB a month out. That is far below any node's limit but a real bill line. Redis sits in one zone, so ⅔ of the lookups cross zones (12k/s × ⅔ × ~260 B ≈ 5.5 TB a month).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.2xlarge` (3 × $212) | $640 |
+| Redis: 2 × `cache.r7g.xlarge` (2 × $310) | $620 |
+| Postgres: `db.r7g.xlarge` ($155 × 2 managed = $310), Multi-AZ doubles | $620 |
+| `gp3` 5 TB + 11k extra IOPS ($400 + $55), × 2 for the standby | $910 |
+| Counter workers: 2 × `c7g.large` (2 × $53) | $110 |
+| ALB: $16 + ~50 LCU (assumed; new connections drive it) × $5.84 | $310 |
+| Egress: 12.6 TB × $0.09 | $1,130 |
+| Cross-zone Redis reads: ~5.5 TB × $0.02 (out + in) | $110 |
+| **Total** | **≈ $4,450** (≈ $3,750 with a 1-year commitment on the ~$2,000 of compute lines) |
+
+- **Biggest line and why:** egress (~25 %): every click gets a redirect over the internet, and `302` (not `301`, section 9.2) keeps every click coming back. The database with its disk is next (~34 %); the API servers are only ~14 %. Later the disk wins: year 10 is 37 TB (+ index ≈ 50 TB) ≈ 50,000 GB × $0.08 × 2 ≈ $8,000 a month for `gp3` alone.
+- **What changes at 10×:** 500k redirects/s + 12k creates/s ⇒ 75 + 6 = 81 vCPU ⇒ N = ceil(81 ÷ 4.27) = 19 → 21 × `c7g.2xlarge`. Redis at ~550k ops/s and ~150 GB (100 GB × 1.5) needs cluster mode, ~8 shards of `r7g.xlarge` (≈ 69k ops/s and ≈ 19 GB each). Misses become 50k/s ⇒ ~125k IOPS (100k reads + 24k writes), far past one `gp3` volume, so shard `urls` by `hash(code)` into ~12 databases (the first real architecture change) or move to DynamoDB. Egress ≈ 126 TB ≈ $11k a month before volume tiers.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- One table and one access path: a point lookup by `code` (section 8). The database sees ~5k miss reads/s plus ~1.2k inserts/s (50k redirects/s at peak, 90 % answered by Redis; sections 4 and 15).
+- 36.5B rows (~3.65 TB, ~5 TB with the index) in year 1 and ~37 TB after ten years at ~100 B a row. No joins, no range scans, no multi-row transactions.
+- The only integrity rule is "one row per code", which the primary key enforces (a taken alias is a `409`, section 9.5). Rows never change except `clicks`, which a worker updates in batches (task 06).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the primary-key constraint gives the race-free `409` for custom aliases, a sequence feeds the base62 code (9.1), and one `db.r7g.xlarge` Multi-AZ carries 5k indexed reads/s and 1.2k writes/s (section 15). Nothing here needs a feature only Postgres has: it is the track default |
+| MySQL (RDS / Aurora) | ✔ works, interchangeable | every feature used (primary-key uniqueness, one secondary index, single-row inserts) exists in InnoDB. The clustered primary key even suits a pure by-key table: a miss is one tree walk (~1 page read) where section 15 counts 2 (index leaf + heap row), so ~7.4k IOPS instead of ~12.4k at the same load. The price: a scrambled or custom-alias code is a random key, so page splits happen in the 5 TB table itself, not only in its 1.3 TB index |
+| DynamoDB (or Cassandra / Keyspaces) | ✔ works, the strongest alternative | the table is already a key-value shape (section 8): a conditional put on "code absent" is the `409`, hashing spreads 5k reads/s and 1.2k writes/s far under the ~3,000 reads and ~1,000 writes per second per partition, and there are no shards to run at 37 TB. Cost: no ad-hoc queries, so "my links" (`user_id`) becomes a secondary index you design up front |
+| Redis (ElastiCache) | ✖ as the record, ✔ as the derived cache | the 10 GB hot set is rebuildable from the table (9.3); 37 TB is not memory-sized and an evicting cache cannot be the only copy |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (the `db.r7g.xlarge` + `gp3` from section 15) as the system of record, with Redis as a derived cache in front. The deciding properties are modest and all portable: a primary-key constraint that settles alias races without a `SELECT` first, cheap indexed point reads, and a team that already runs it (section 8). `urls` is the record; every Redis entry can be rebuilt from it.
+
+**If it were MySQL instead:** almost nothing. MySQL has no sequence object, so the code comes from an `AUTO_INCREMENT` column or the one-row counter of task 04's ticket server; `TIMESTAMPTZ` becomes a UTC `TIMESTAMP`; the duplicate-key error (1062) replaces Postgres's unique violation for the `409`. The batched `clicks` updates leave no dead rows to vacuum. Section 15's disk need shrinks by the read IOPS above.
+
+**What would flip the choice:** the sharding trigger in section 15: ~10× load (≈ 125k IOPS, ~12 databases by `hash(code)`) or ~37-50 TB in year 10. At that point move the table to DynamoDB (same key-value shape, no shards to operate) or to Aurora, which grows storage by itself up to 128 TiB and offers up to 15 read replicas. Stay on one Postgres/MySQL primary while `gp3` at ≤ 16k IOPS covers the misses.

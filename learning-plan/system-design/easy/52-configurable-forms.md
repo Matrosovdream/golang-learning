@@ -355,3 +355,58 @@ stale save with `409`; `412` is just the HTTP-native status for a failed `If-Mat
 - **Per-tenant retention and legal holds** over sharded data, including exports already handed out.
 - **Webhooks per form** with their own signing secret and delivery log ([10](10-webhook-delivery.md)).
 - **Template marketplace:** copy-on-use versions, and what happens to a tenant's form when the template author changes theirs.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Submit API (Go, stateless; validate against the cached schema, append to the log) | 20k/s average, 200k/s peak | CPU | 200k × 0.25 ms (parse ~1 KB, validate ~8 fields, produce) = 50 vCPU. N = ceil(50 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(11.7) = 12. Memory: the hot subset of the 25 GB schema set is ~2.5 GB (assume the top 10 % of forms) | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 12, 4 per zone | validation is pure CPU with no database on the path, so `c`; 52 % busy at the spike, 78 % with a zone down; only 5 % busy on average, so run 3 nodes and scale to 12 for the 10-minute spikes |
+| Durable log in front of the shards (section 4's 72 GB spike backlog) | 200 MB/s in at peak (20 MB/s average); RF 3 ⇒ 600 MB/s into brokers | network, disk | 600 ÷ 6 brokers = 100 MB/s ≈ 0.8 Gbit/s in each, ≈ 95 MiB/s on its volume (gp3 includes 125 MiB/s). Partitions: 200 ÷ ~20 MB/s ≥ 10, use 64 (2 per shard). Retention 24 h: 1.73 TB × 3 = 5.2 TB ÷ 6 = 0.87 TB each | MSK `kafka.m7g.2xlarge` (8 vCPU / 32 GiB) + gp3 1 TB each; self-managed Kafka on `m7g.2xlarge` is the alternative | 6, 2 per zone | brokers are network- and disk-bound with little CPU, so `m` not `r`; `i4i` NVMe is next if volume throughput becomes the limit. It lets the shards be sized for 80k/s, not 200k/s: 48 shards fewer (48 × $1,240 ≈ $60k a month) for ≈ $4.8k |
+| Postgres data shards (`submissions`, outbox) | 625 inserts/s average per shard; ≤ 2.5k/s each while draining; 155 TB hot (90 days) = 4.84 TB per shard | storage volume, then write IOPS and CPU | gp3 6 TB per shard (4.84 TB + 20 % headroom). IOPS ≈ 2 per committed submission, outbox in the same transaction (assumption): 2.5k × 2 = 5k + ~1k listing and export reads ⇒ gp3 at 6,000 IOPS (3,000 included). CPU: 2,500 txn/s × ~1.5 ms (two inserts, JSONB, two indexes) = 3.75 of 8 vCPU. RAM: 6 h of recent writes = 625 × 1 KB × 21,600 s = 13.5 GB plus active-form indexes: fits 64 GiB | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ (self-managed Postgres on `r7g.2xlarge` halves the compute line) | 32 primaries + 32 standbys | recent pages and index leaves must sit in RAM, hence `r`. NVMe is the wrong shape: at ~230 GB per vCPU, 4.84 TB needs a 32-vCPU `i4i.8xlarge`, 4× the compute for IOPS we do not need. Storage, not IOPS, drives the cost |
+| Schema origin + Forms API (Go; CDN misses, editor) | 2M views/s peak × 5 % CDN miss (assumed 95 % hit) = 100k req/s | CPU | 100k × 0.1 ms (in-memory LRU, small JSON) = 10 vCPU ⇒ N = ceil(10 ÷ 4.27) = 3. Output 100k × 2 KB = 1.6 Gbit/s over 3 nodes, ~0.5 each | `c7g.2xlarge` | 3, one per zone | CPU and a bit of RAM for the LRU, so `c`. Origin to CloudFront transfer is free |
+| Control-plane Postgres (`forms`, `form_versions`) | 50M versions ≈ 250 GB; ~1k PK reads/s (1 % of origin requests miss the LRU, assumed) | memory (hot set) | hot set = current versions 5M × 5 KB = 25 GB + indexes ≈ 30 GB, so RAM ≥ 30 GB; 1k reads/s ≈ 1 of 8 vCPU; misses ≪ 3,000 IOPS | `db.r7g.2xlarge`, RDS Multi-AZ, gp3 250 GB | 1 primary + standby | 32 GiB (`xlarge`) would be 94 % full of hot set; `m.2xlarge` has only 32 GiB; so `r` at 64 GiB |
+
+**CDN (CloudFront) and S3:** nothing to size, only bytes. A view is the pointer plus the schema (5 KB compresses to ~1.3 KB, plus headers: ~2 KB, assumed): 200k/s × 2 KB = 400 MB/s = 3.2 Gbit/s ≈ 1,050 TB a month. CSV exports sit in S3 (nothing to size). Not sized: the workers (webhooks, email, projections), which section 4 gives no load for.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Submit API: 12 × `c7g.2xlarge` (12 × $212) | $2,540 |
+| ALB for submits: $16 + 800 LCU (20k new connections/s ÷ 25) × $0.008 × 730 | $4,700 |
+| Schema origin: 3 × `c7g.2xlarge` | $640 |
+| Control-plane Postgres: `db.r7g.2xlarge` $620, Multi-AZ doubles; gp3 250 GB × 2 ≈ $40 | $1,280 |
+| Log: 6 × `kafka.m7g.2xlarge` (6 × ≈ $480); 6 TB gp3; ⅔ of 1.73 TB/day × 2 (producers, consumers) × $0.02 | $4,800 |
+| Shards compute: 32 × `db.r7g.2xlarge` Multi-AZ (32 × $1,240) | $39,700 |
+| Shards disk: 32 × 6 TB × 2 × $0.08; extra IOPS 64 × 3,000 × $0.005 | $31,700 |
+| CloudFront egress: 1,050 TB × $0.085/GB, an upper bound at the first-tier price | $89,300 |
+| **Total** | **≈ $174,700** (≈ $158,200 with a 1-year plan on the $47,000 of instances and RDS) |
+
+- **Biggest line and why:** CloudFront egress, up to ~51 %, because 200k views/s each carry a schema and every byte is billed; it is an upper bound (volume tiers are cheaper, and the shards at ~41 % may really be larger). Levers: brotli the schema, inline the version in the embed script to drop the pointer hop, long browser caching. On the shards the lever is the hot window: 90 days on gp3 is $30.7k, and moving partitions older than 30 days to S3 ($0.023/GB: 103 TB ≈ $2.4k) cuts it by about two thirds.
+- **What changes at 10×:** 2M submissions/s ⇒ 2M × 0.25 ms = 500 vCPU ⇒ ceil(500 ÷ 4.27) = 118 → 120 × `c7g.2xlarge` (≈ $25k). Section 10's first break is the hot form (one viral form at 200k/s is already 80 shards' worth), fixed by sub-buckets, then the log's network: 6 GB/s into brokers is ~60 brokers at today's 100 MB/s, or `m7g.8xlarge`/`i4i` where sustained bandwidth is real. Every line scales ≈ ×10 (≈ $1.7M), so cut the hot window and negotiate CDN egress before buying 320 shards.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Control plane: 5M forms and ~50M immutable schema versions (~250 GB of `jsonb`, ~5 KB each), ~1k primary-key reads/s, rare edits (sections 4, 8, 15).
+- Data plane: ~20k submissions/s on average, 200k/s at a spike, ~1 KB each (`answers jsonb` keyed by field id, plus `form_version`): ~1.7 TB/day, ~155 TB for 90 days hot, over 32 shards by tenant (section 4).
+- Access is write-once and narrow: an idempotent insert committed with its outbox row, "this form's submissions, newest first" by keyset on `(form_id, id DESC)`, and an async CSV scan. Filtering on a field is a projection for at most three fields, not SQL over the JSON (9.2).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen, both planes | one ~1 KB `jsonb` row per submission instead of ~8 EAV rows (~160k row-writes/s, 9.2); insert + outbox in one shard-local transaction; `ON CONFLICT` and a unique `submission_key` make a retry idempotent; a `BEFORE UPDATE` trigger freezes published `form_versions`; an append-only monthly-partitioned table gives autovacuum little to do |
+| MySQL (RDS / Aurora) | ✔ works, nothing material | a `JSON` column holds the same row, and no design decision needs a Postgres-only feature (below). Sharded MySQL has the most proven tooling (Vitess), where Postgres sharding is by hand, Citus or Aurora Limitless (check availability): a real point for MySQL at 32 shards, and at 320 in the 10× case |
+| DynamoDB | ✔ works for submissions, ✖ for the control plane | key `(form_id + bucket, id)`; 1 KB is far under 400 KB. But a viral form at 200k/s needs ≥ 200 partition keys at ~1,000 writes/s each, so you write-shard it just as 9.2's `k` sub-buckets do; listing, filtering and CSV need a second system either way, and the outbox row needs a transaction |
+| MongoDB / DocumentDB | ✔ works, no clear gain | ~1 KB documents with a version field are its home turf and sharding is built in, which would replace the hand-managed 32 shards. But `jsonb` + `form_version` already absorbs the schema churn, the control plane is relational (immutability trigger, joins to tenants), and insert + outbox becomes a multi-document transaction. DocumentDB is a MongoDB-compatible API, not MongoDB |
+
+**Pick:** PostgreSQL on RDS Multi-AZ: one `db.r7g.2xlarge` for the control plane and 32 `db.r7g.2xlarge` data shards (section 15), with MSK only as a 24 h buffer in front of the shards (a transport, not a store). The submissions are the system of record; the filter projection rows, any search index and the CSV exports in S3 are derived and rebuildable from `answers` + `form_version`. The deciding properties are the one-row `jsonb` shape (9.2) and the shard-local insert + outbox with an idempotency key. Both exist in MySQL, so tooling and team skill are the real tie-breakers.
+
+**If it were MySQL instead:** nothing material. The partial unique `submissions_key_idx … WHERE submission_key IS NOT NULL` becomes a plain unique key (MySQL unique indexes already allow many `NULL`s), `RETURNING` becomes `LAST_INSERT_ID()` or a read by `submission_key`, `uuid` becomes `BINARY(16)`, and the freeze trigger becomes a `BEFORE UPDATE` trigger that raises `SIGNAL`. The same limit applies in both engines: on a partitioned table every unique key must contain the partition key (the lesson's `received_at` note), so neither makes `(form_id, submission_key)` unique across months by itself.
+
+**What would flip the choice:** the control plane stays Postgres. The submissions change store when hand-managed shards become the cost: at 10× (2M/s, ~320 shards, section 15) move them to DynamoDB with a write-sharded key, or to sharded MySQL with Vitess. If tenants need to filter or aggregate on any field, add a derived ClickHouse or OpenSearch index fed from the outbox rather than a different system of record.

@@ -300,3 +300,53 @@ func (w *Worker) once(ctx context.Context) (worked bool, err error) {
 - **A/B test descriptions** by traffic/CTR before choosing between two approved candidates.
 - **Reviewer analytics:** throughput, approve/edit/dismiss rates per reviewer, disagreement on a shared sample to calibrate quality.
 - **Auto-draft on create** as an accept/dismiss suggestion: the seed skipped it on purpose, since an unasked call for every new record is spend nobody pressed a button for. Revisit with budgets from [36](36-llm-gateway.md).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Draft workers (Go, leases) | 28.9 items/s for 48 h; ~87 model calls in flight (28.9 × ~3 s a vision call, assumed) | I/O wait on the model; CPU is tiny | 28.9 × 15 ms (fetch a rendition, base64, hash, JSON, guard regex, insert) = 0.43 vCPU; N = ceil(0.43 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3. Memory 87 × ~0.5 MB ≈ 45 MB. Out: 28.9 × ~200 KB (150 KB rendition in base64) = 5.8 MB/s ≈ 46 Mbit/s | `c7g.large` (2 vCPU / 4 GiB), **Spot** | 3 | `c`, because it is CPU glue around a network wait; Spot is safe: the lease expires, another worker redoes the item and `ON CONFLICT DO NOTHING` makes the redo free (reclaim notice is 2 minutes, a call is 3 s) |
+| The model | 6B in + 1B out tokens = 2.4M tokens/min while running | GPU memory if owned; in practice the provider's tokens-per-minute quota | paced at ≤ 30 % of the limit ⇒ the provider must grant ≥ 2.4M ÷ 0.3 = 8M tokens/min. Cost §4: $33k large, $2.75k small vision | **hosted vision API through the gateway (36), batch lane** (Bedrock inside AWS is the managed route); no GPU instances | 0 | a 48 h run a few times a year is ≤ 7 % duty cycle even monthly (48 ÷ 730), and owned GPUs bill idle hours while an API bills tokens. A GPU fleet rented only for the weekend could compete for a small open model, but the sheet has no GPU price and 12× cheaper hosted small models (§4) already shrink the prize |
+| Postgres (jobs, drafts, content_health) | 29 items/s × ~3 committed writes (claim, finish, draft insert) = 87 writes/s | memory (hot set), then churn of finished job rows | ≈ 2 IOPS a write ⇒ ~170 IOPS vs 3,000 included. Data: 7.5 GB drafts + ~3 GB jobs per run (9.1) + `content_health` 100M rows × ~170 B with its key ≈ 17 GB ≈ 28 GB; hot set (the run's jobs, pending drafts, the `words < 3` partial index) ≈ 12–15 GB. CPU < 1 of 4 vCPU | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 + standby | `r`: the hot set must stay cached (shared_buffers ≈ 25 % + OS cache of 32 GiB), CPU and IOPS are far from limits; `m` (16 GiB) would cache half of it. Batch-delete finished jobs by run to spare vacuum |
+
+The review API and queue (0.56 approvals/s, a few dozen reviewers) need no instance of their own: they run in the app fleet, and the Applier's saves and reindexes are the editor's load.
+
+**Rough monthly bill (≈, on-demand), a month that contains one 5M-item backfill**
+
+| Line | ≈ $/month |
+|---|---|
+| Workers: 3 × `c7g.large` (3 × $53); on Spot ≈ $50 | $159 |
+| Postgres: `db.r7g.xlarge` ≈ $310, Multi-AZ doubles | $620 |
+| gp3 200 GB: 200 × $0.08 = $16, ×2 for the standby | $32 |
+| NAT $33 + 1.0 TB of images to the provider (5M × ~200 KB) at $0.045 + $0.09 per GB | $168 |
+| **Model API, one backfill** | $33,000 large / $2,750 small vision |
+| **Total** | **≈ $34,000** large / **≈ $3,700** small (≈ $33,700 / ≈ $3,500 with a 1-year Savings Plan on the compute); a month without a run ≈ $840 |
+
+- **Biggest line and why:** the model call (97 % on the large model, 74 % on the small one; then the Multi-AZ database at 17 %). Hardware is a rounding error, and so is the model next to the people: 2,500 reviewer-hours (§4) at an assumed $20 an hour is $50,000. The levers are the small vision model (12×), the cached prefix, skipping unchanged inputs, and generating only what review can absorb.
+- **What changes at 10×:** 50M items at 289/s ⇒ 24M tokens/min (a provider limit of ≥ 80M tokens/min at 30 % pacing, the first thing to run out) and ~870 calls in flight; CPU 289 × 15 ms = 4.3 vCPU ⇒ N = ceil(4.3 ÷ 2.13) = 3 × `c7g.xlarge`. Images out grow to 10 TB (≈ $1,350 through NAT, so go through a VPC endpoint or the in-AWS model route). Postgres: ~870 writes/s ≈ 1.7k IOPS (still under 3,000), drafts 75 GB. Review (25,000 hours) broke long before any of this.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Small and write-light: ~29 items/s during a 48 h backfill is ~87 committed writes/s (claim, finish, draft insert); ~28 GB in all (7.5 GB of drafts and ~3 GB of jobs per run, `content_health` ~17 GB for 100M rows), a 12–15 GB hot set (sections 4, 15). The model is a hosted API, so nothing heavy lives in the database.
+- Access: claim the next job by priority with a lease (`SKIP LOCKED`), re-check the record, insert a draft idempotently, page the pending queue by `(tenant, entity, created_at)` with counts per tab, and apply an approval with `UPDATE … WHERE version = $2`.
+- The rules the design leans on are **unique constraints with a condition**: one active run per tenant, one pending draft per field, an idempotency key per `(field, input_hash, prompt_version)`. They must hold inside the database, not in worker code (sections 8, 9.1, 9.2).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | partial unique indexes carry the invariants (`ai_draft_runs_one_active … WHERE status IN (…)`, `ai_drafts_one_pending … WHERE state = 'pending'`) and a partial expression index `content_health_thin … WHERE words < 3` indexes only the thin slice of 100M rows; the lease claim is one `UPDATE … RETURNING` over `FOR UPDATE SKIP LOCKED`; `INSERT … ON CONFLICT DO NOTHING` makes a retried job free; `text[]` and `jsonb` columns need no side tables |
+| MySQL (RDS / Aurora) | ✔ works, with three workarounds | no partial indexes: each conditional unique rule becomes a generated column that is `NULL` outside the condition plus a unique index (a unique index allows many NULLs); `content_health_thin` becomes an index on a generated score that still holds an entry per row, all 100M, not just the thin ones; `SKIP LOCKED` exists (8.0) but there is no `RETURNING`, so a claim is `SELECT … FOR UPDATE SKIP LOCKED` then `UPDATE` in one transaction (run it at `READ COMMITTED` to avoid gap locks); `ON CONFLICT DO NOTHING` becomes `INSERT IGNORE`, which also swallows other errors, or `ON DUPLICATE KEY UPDATE id = id`; `text[]` becomes `JSON` |
+| DynamoDB | ✖ poor fit as the record | a conditional write guards one item, not "one active run per tenant across three statuses" (you would keep a lock item per tenant and use a transaction, ≤ 100 items); there is no cheap "highest priority still queued" claim, and the review queue's counts per tab, paging and "select all N except …" are ad-hoc queries |
+| SQS / Kafka for the jobs | ✖ poor fit | the lesson's own comparison (9.1): millions of messages up front make cancel a drain and priority awkward; a run row plus a jobs table makes pause, cancel and progress single statements |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (the `db.r7g.xlarge` of section 15), because three conditional unique indexes turn the lesson's rules into database guarantees, the claim and the idempotent insert are one statement each (`SKIP LOCKED` with `RETURNING`, `ON CONFLICT`), and the 12–15 GB hot set fits its RAM. System of record: the CMS's own records (drafts never write into them except through the editor); `ai_drafts` is the review inbox and the provenance record; `content_health` is derived and rebuildable from change events; `ai_draft_jobs` is transient (deleted per run).
+
+**If it were MySQL instead:** nothing breaks; you hand-write the generated-column versions of the two conditional unique rules, accept a `content_health` priority index that holds all 100M rows instead of only the `words < 3` subset, claim in two statements and use `INSERT IGNORE`. Roughly three workarounds, each easy to get subtly wrong.
+
+**What would flip the choice:** no number in this lesson. Even at 10× (870 writes/s, ~1.7k IOPS, 75 GB of drafts, section 15) one primary is enough, below the cheat sheet's ~10k durable writes/s. The provider quota runs out first. A second store would enter only if a queue had to feed many consumers outside the database (SQS or Kafka for jobs, with runs and drafts left in PostgreSQL).

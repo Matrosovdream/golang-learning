@@ -300,3 +300,52 @@ Every role create/edit/delete, grant change, membership change and bulk action w
 - **Temporary elevation and break-glass:** a role with an expiry, an approval, and loud auditing.
 - **Service accounts and API keys** with scoped permissions that can never exceed their creator's.
 - **Step-up authentication** for `dangerous` permissions (recent re-login or a one-time code).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API nodes (Go; the access resolver runs inside them) | 20k requests/s ⇒ 50k checks/s (§4) | CPU | the authorise path: 50k bit tests × ~0.2 µs + 20k × ~10 µs (in-process LRU, Redis client on a miss) ≈ 0.2 vCPU, negligible. The tier is sized by the product's own work: assume 1.5 ms per request ⇒ 30 vCPU; N = ceil(30 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(7.03) = 8 → 9 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 9, three per zone | CPU-bound; the LRU holds ~200k members × ~200 B = 40 MB per node (30 s TTL, assumption), so memory is irrelevant and `c` beats `m`. These nodes are the product's: RBAC adds about 1 % to them |
+| Redis (permission sets, tenant versions, sessions) | ~12k ops/s (assumption: 10 % LRU misses of 20k req/s = 2k, plus ~10k tenant-version reads with a 1 s in-process cache) | memory (small), then single-core ops | 5M bitsets × 40 B = 200 MB (§4); with key and per-key overhead ≈ 250 B ⇒ 1.25 GB; stale versions until TTL and sessions bring it to ~3 GB (assumption); `maxmemory` ≤ 70 % ⇒ ≥ 4.3 GiB; 12k ops/s is far under one core's ~100k | `cache.m7g.large` (2 vCPU / 8 GiB, ≈ $120) | 1 primary + 1 replica | the smallest node that holds it: `r` would add 8 GiB nobody uses. If Redis is down, nodes fall back to the LRU, then Postgres, and never fail open (§10) |
+| Postgres (roles, grants, memberships, audit) | 24M grants ≈ 1.5 GB, 6.5M memberships, 600k roles (§4); edits < 100/s; resolve queries after misses ≈ 200/s (1 % of requests, assumption) | memory (small); IOPS trivial | all RBAC data ≈ 3 GB (grants 1.5 GB, memberships ~0.7 GB, indexes, audit): fits in RAM several times over. 200/s × 0.3 ms = 0.06 vCPU; ≤ 100 edit commits/s ≈ 300 IOPS, inside the 3,000 included. Worst case (Redis down and every LRU cold): 20k × 0.3 ms = 6 vCPU, far more than 2 | `db.m7g.large` (2 vCPU / 8 GiB, ≈ $120), RDS Multi-AZ | 1 primary + synchronous standby | the smallest node; in practice these tables sit in the product's main database and add ~3 GB. The cold-cache worst case is solved with singleflight and a warm Redis, not a bigger primary |
+
+"A few small instances, for availability not load": the authorisation data is a few GB and the check is a bit test. The only large number is the API tier it rides on.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Redis: 2 × `cache.m7g.large` (2 × $120) | $240 |
+| Postgres: `db.m7g.large` ($60 × 2 managed), Multi-AZ doubles | $240 |
+| gp3 100 GB (= $8, ×2 for the standby) | $20 |
+| *Context, not RBAC's:* API tier, 9 × `c7g.2xlarge` (9 × $212) | $1,910 |
+| **Total** | **≈ $2,410, of which RBAC's own pieces are ≈ $500** (≈ $1,570 with a 1-year Savings Plan on compute, ≈ $330 for RBAC's own) |
+
+- **Biggest line and why:** the API tier (79 %), which is the product's, not RBAC's. What the design buys is visible in the rest: the seed's query per request would be 20k resolves/s × 0.3 ms = 6 vCPU, and at ≤ 60 % busy that needs ~10 vCPU, a `db.r7g.4xlarge` Multi-AZ at ≈ $2,480 plus a database round trip on every request; the cache design does it with Redis and a small Postgres for ≈ $500.
+- **What changes at 10×:** 200k req/s ⇒ 300 vCPU ⇒ N = ceil(300 ÷ 4.27) = 71 → 72 × `c7g.2xlarge` (≈ $15k). Redis at ~120k ops/s is past one core and ~30 GB of data needs ~43 GiB at the 70 % rule, so cluster mode with 3 shards of `cache.r7g.xlarge` (3 × 22 GiB usable), or a longer in-process TTL. Postgres still holds ~30 GB and takes ~2k resolves/s: unchanged; what hurts first is the cold-cache herd after a deploy, so pre-warm hot tenants and coalesce misses.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Tiny and relational: 600k roles, 24M grants (~1.5 GB with indexes), ~6.5M memberships; ~3 GB all told, all of it in RAM (sections 4, 15). Writes are people clicking in settings, far below 100/s.
+- The invariants are relational: a role in use cannot be deleted (`ON DELETE RESTRICT`), grants die with their role (`CASCADE`), `UNIQUE (tenant_id, slug)`, a composite foreign key from `membership_roles` to `memberships`, and a role edit, the `policy_version` bump and the audit row commit together (sections 8, 9.2, 9.5).
+- The read that matters, 50k checks/s, is not a database read: bit tests in process, with Redis behind them. The database sees ~200 resolve queries/s (1 % of requests, section 15's assumption), a three-table join on indexed keys.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | foreign keys (including the composite one), uniqueness, `CHECK (scope IN …)` and a multi-table transaction keep "no orphan grants, no deleting a role in use" inside the database; row-level security (`USING (tenant_id = current_setting('app.tenant_id')::bigint)`) is a second wall under a forgotten `WHERE` (9.4, section 10); `SELECT … FOR UPDATE` serialises the last-owner check |
+| MySQL (RDS / Aurora) | ✔ works, one loss | everything in section 8 is portable (composite foreign keys, `CHECK` since 8.0.16, joins, the optimistic `version`), and InnoDB's clustered keys `(role_id, permission_id)` and `(tenant_id, user_id, role_id)` keep a role's grants and a member's roles contiguous, which suits the resolve query. The loss: no row-level security, so the backstop under the application's filters is gone |
+| DynamoDB | ✔ as a derived store for effective sets, ✖ as the record | the cached bitset keyed by `(tenant, user, policy_version)` is a pure key lookup (what Redis does now). The record needs rules that span items: role in use, unique slug, last owner, and one edit touching grants, `policy_version` and audit together. Transactions stop at 100 items, there are no foreign keys, and "who holds this role" needs a GSI |
+| Redis (ElastiCache) | ✔ as the cache (section 15), ✖ as the record | `perm:{tenant}:{user}:{policy_version}` entries are derived and rebuilt by one query; with Redis down, nodes fall back to the in-process LRU, then Postgres, and never fail open (section 10) |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.large`, section 15), plus Redis (`cache.m7g.large`, primary and replica) as the derived cache. Relational is the obvious fit because authorisation is a web of small tables with integrity rules (who holds what, who may grant what), the data is 3 GB and the write rate trivial: nothing in the load asks for another kind of store, and everything in the correctness asks for constraints and transactions. Postgres is the system of record; the bitset sets in Redis and the LRU are derived. In practice these tables live in the product's main database and add ~3 GB; the standalone node is the sizing. What decides Postgres over MySQL is the row-level-security backstop and transactional guards, not speed.
+
+**If it were MySQL instead:** one material change, row-level security, which has no counterpart: the backstop becomes the data layer's `tenant_id` filters, per-tenant views at best, and the cross-tenant tests of section 10 (run every endpoint as a user of tenant B against tenant A's ids), which are then the only safety net. Smaller changes: `SMALLINT GENERATED ALWAYS AS IDENTITY` becomes `SMALLINT UNSIGNED AUTO_INCREMENT` (bit positions stay append-only; gaps are fine), and the last-owner `SELECT … FOR UPDATE` takes next-key locks under the default `REPEATABLE READ`, harmless at under 100 edits/s (use `READ COMMITTED` if deadlocks appear). The two engines are otherwise interchangeable here.
+
+**What would flip the choice:** not scale: at 10× section 15 still has ~30 GB and ~2k resolves/s on the same single node, and what hurts first is the cold-cache herd after a deploy. Per-resource sharing (ReBAC, "Alice may view this document", section 14) is the real trigger, because relation tuples grow per object and not per role; at hundreds of millions of tuples (a rule of thumb), or for "list everything Alice can see", use a dedicated relationship store. A multi-region active-active requirement with ~5 s revocation everywhere would put the derived layer on DynamoDB global tables while the record stays relational in one region.

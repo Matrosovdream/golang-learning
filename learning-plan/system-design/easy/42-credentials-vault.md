@@ -328,3 +328,52 @@ result, not a retry. At scale add:
 - **Anomaly detection:** per-tenant and per-worker open rates, geographic or time-of-day outliers, auto-disable on a burst.
 - **Secret scanning:** reject pasted values that match a known leaked-key pattern; scan logs for sealed-then-leaked values.
 - **Dual control:** two approvals to change the root key's policy; a break-glass role with an audited, time-boxed grant.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Secrets broker (Go, stateless, mTLS) | 20k `Open`/s (§2 says peak; §4 treats it as constant) + 5 `Seal`/s | CPU (TLS + AES-GCM) | 0.2 ms CPU an `Open` (kept-alive mTLS, hardware AES, job-id check, JSON) × 20,000 = 4 vCPU. N = ceil(4 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.88) = 2 → 3. Memory: ciphertext cache 1M × ~0.5 KB = 500 MB, KEK cache 3.2 MB, of 8 GiB. Traffic ≈ 20k × 0.5 KB = 10 MB/s | `c7g.xlarge` (4 vCPU / 8 GiB), one per zone; workers balance client-side (an ALB would add ≈ $230: ~36 GB/h ≈ 36 LCU) | 3 | `c`: crypto and TLS, no state worth RAM; 33 % busy normally, 50 % with a zone down. Each worker calls the broker in its own zone, so there is no cross-zone bill (≈ $350 if routed across zones) |
+| KMS (the root key) | KEK unwraps, not reads | request price and quota, not hardware | unwraps = brokers × tenants ÷ TTL = 3 × 100k ÷ 3,600 s = 83/s ≈ 219M a month. With 200 workers each caching for 5 min it is 17k/s (§4), and the quota (regional, roughly 5k-50k requests/s; check) | **AWS KMS**, one symmetric key (managed already; CloudHSM or a Vault cluster means owning HSMs or 3+ nodes plus unseal) | 1 key | few, fat brokers keep the cache count at 3, so each broker holds every tenant's KEK (3.2 MB). Every unwrap is a CloudTrail event (≈ 219M a month, ~0.2 TB): the audit trail the lesson wants |
+| Postgres (`integration_secrets`, keys, audit) | misses ≈ 1M secrets ÷ 3,600 s = 278 reads/s; `last_used_at` ≤ 278 writes/s; 5 sets/s | nothing; availability | ≈ 560 ops/s ≈ 600 IOPS vs 3,000 included; table 500 MB, ~1 GB with indexes, all in RAM | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ | 1 + standby | a separate instance from the product DB, so a dump or admin of one never holds the other's secrets; `m`, because the whole DB is 1 GB. Reads of ciphertext hit the broker's cache (1 h TTL, invalidated on write), so 20k/s never reaches Postgres |
+
+No GPU, no big instance: this is a crypto-and-cache service whose bill is one managed API's request count.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Brokers: 3 × `c7g.xlarge` (3 × $105) | $315 |
+| Postgres: `db.m7g.large` $120, Multi-AZ doubles | $240 |
+| gp3 20 GB × 2 | $3 |
+| KMS: 83/s × 2,628,000 s = 219M requests × $0.03 per 10,000 + $1 for the key | $658 |
+| **Total** | **≈ $1,200** (≈ $1,000 with a 1-year commitment on the $555 of compute; KMS is not discounted) |
+
+- **Biggest line and why:** KMS requests, 54 %, and the only line a design choice moves by 200×: per-worker caches with random routing mean 17k unwraps/s ≈ 45.5B a month ≈ **$137,000**. The lever is the cache count (unwraps = caches × tenants ÷ TTL: few, large brokers, a longer TTL, with revocation delayed by that TTL, 9.2).
+- **What changes at 10×:** 200k opens/s ⇒ 40 vCPU ⇒ N = ceil(40 ÷ (0.8 × 16 × ⅔ = 8.53)) = 5 → 6 × `c7g.4xlarge` (≈ $2,520), still 6 caches: ~167 unwraps/s ≈ $1,300 if tenants stay at 100k, ≈ $13,000 if they also grow 10×. Postgres sees 10M ÷ 3,600 = 2.8k reads and 2.8k `last_used_at` writes a second on 5 GB: one `db.m7g.xlarge` is enough. The broker CPU and the KMS quota run out first, not the database.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Tiny: ~1M sealed values of ≤ 300 B (~500 MB, ~1 GB with indexes) and 100k wrapped tenant keys. The database never sees the 20k reads/s: the broker caches ciphertext and keys, so ~278 reads/s, at most ~278 `last_used_at` writes/s and 5 sets/s arrive (sections 4, 15).
+- Access is by primary key `(tenant_id, slug, field)`, one re-seal sweep (`WHERE kek_version < $cur … FOR UPDATE SKIP LOCKED`) and two composite foreign keys; the values are opaque `bytea` that no query looks inside.
+- What matters is guarantees, not query power: one active key per tenant, a secret that can never point at a missing key, a dump that holds nothing usable (the root key is in KMS), and an instance separate from the product database.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `bytea` for the sealed blob; composite foreign keys `(tenant_id, kek_version)` stop a secret pointing at a missing key row; the partial unique index `tenant_keys_one_active … WHERE state = 'active'` makes "one active KEK per tenant" a database rule; `SKIP LOCKED` batches the sweep. Only that partial index is Postgres-only |
+| MySQL (RDS / Aurora) | ✔ works, equally good | `VARBINARY` or `BLOB` for the blob, foreign keys, `SKIP LOCKED` (8.0), `ON DUPLICATE KEY UPDATE` for a replace; the one-active rule is a generated column `IF(state = 'active', tenant_id, NULL)` plus a unique index (a unique index allows many NULLs). The clustered primary key keeps a tenant's secrets adjacent |
+| DynamoDB | ✔ works, no gain | one item per secret (≤ 300 B against 400 KB) and key reads are its strength, but there are no foreign keys (the key-exists check moves into code), "one active KEK" needs a conditional write, and the sweep by `kek_version` needs a GSI whose single key per version takes the sweep's ~1k writes/s, right at the ~1,000 writes/s-per-partition figure |
+| AWS KMS, and a secrets manager | ✅ KMS holds the root key (not a table), ✖ a managed secret per value | the root never leaves KMS and every unwrap is a logged event (section 15); 1M customer values as 1M managed secrets would turn a table lookup plus local AES-GCM into an API call per read. A secrets manager fits the platform's own few secrets, which §2 puts out of scope |
+
+**Pick:** PostgreSQL on its own RDS Multi-AZ instance (`db.m7g.large`, section 15) for `tenant_keys`, `integration_secrets` and `secret_audit`, plus AWS KMS for the single root key. This is a lesson where any relational database works; the tie-breakers are the team's skill, one engine to be on call for (so the product's), and one line of difference in how "one active key" is enforced. It is safe in an ordinary database because everything stored is a `wrapped_kek` (useless without KMS) or ciphertext bound by AAD to its row, so a dump, a backup ([41](41-backup-restore.md)) or a replica reveals nothing usable. System of record: the two tables of ciphertext and wrapped keys, and the root key in KMS (irreplaceable: lose it and every tenant's secrets are gone); derived: the broker's ciphertext and key caches (plaintext is never cached).
+
+**If it were MySQL instead:** nothing material: the crypto, the AAD and the broker are Go code. Differences are a generated column plus a unique index for the one-active rule, `ON DUPLICATE KEY UPDATE` instead of `ON CONFLICT`, and a sweep that selects with `FOR UPDATE SKIP LOCKED` then updates (no `RETURNING`). Keep it on its own instance either way.
+
+**What would flip the choice:** size never does: 10× is 10M values and 5 GB, one `db.m7g.xlarge` (section 15). Requirements would: owning the root key's hardware (CloudHSM or a Vault cluster behind the `KeyWrapper` interface), customer-managed keys (BYOK), which change KMS usage and not the table, or a no-servers, multi-region key lookup, where DynamoDB's per-key reads become attractive. If reads ever bypass the broker's cache, the KMS quota runs out before the database.

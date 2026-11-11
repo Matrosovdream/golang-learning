@@ -18,6 +18,8 @@ model, deep dives), the trade-offs, check questions, and ideas for extending the
 - [The method: how we attack any task](#the-method-how-we-attack-any-task)
 - [Toolbox: the building blocks](#toolbox-the-building-blocks)
 - [Estimation cheat sheet](#estimation-cheat-sheet)
+- [AWS sizing cheat sheet](#aws-sizing-cheat-sheet)
+- [Database choice cheat sheet](#database-choice-cheat-sheet)
 - [Task index](#task-index)
 - [Adding a task](#adding-a-task)
 
@@ -48,6 +50,7 @@ questions are where you find out whether it stuck.
 learning-plan/system-design/
 ├── README.md          # this file: method, toolbox, cheat sheet, index
 ├── PROGRESS.md        # tracker: ▶ Resume here + ticks
+├── KNOWN-ISSUES.md    # inconsistencies found in lesson text, to fix as each task is presented
 ├── _template.md       # skeleton for a new task file
 ├── easy/              # 🟢  one service, one or two interesting decisions
 │   ├── 01-url-shortener.md
@@ -56,9 +59,9 @@ learning-plan/system-design/
 └── hard/              # 🔴  distributed-systems problems (backlog in hard/README.md)
 ```
 
-Every task file has the **same 14 sections** (see [_template.md](_template.md)), so you always
+Every task file has the **same 16 sections** (see [_template.md](_template.md)), so you always
 know where to look, and so a task can grow for years: a new deep dive is a new `9.x` heading,
-a new idea goes under `14. Extensions`.
+a new idea goes under `14. Extensions`. Sections 15 (AWS hardware sizing) and 16 (database choice) apply the two cheat sheets below to the task's own numbers.
 
 ---
 
@@ -180,6 +183,140 @@ Base62 strings: 62⁶ ≈ 57 billion · 62⁷ ≈ 3.5 trillion · 62⁸ ≈ 218 
 
 Two components in series each at 99.9 %: about 99.8 %. Redundant in parallel: far better. Fewer
 serial hops and redundancy at each hop is how availability is actually bought.
+
+## AWS sizing cheat sheet
+
+> Orders of magnitude for reasoning, not a quote: on-demand prices, us-east-1, rounded, 730 h per month. AWS ships
+> a new instance generation about once a year; the **family and its memory-to-CPU ratio** are what stay true, so
+> pick the newest generation in your region (`c7g` → `c8g` …) and check the AWS pricing page before spending real money.
+> Every task's **section 15** turns that task's own numbers (section 4) into AWS instances with this sheet.
+>
+> **Graviton by default.** The `g` suffix (`c7g`, `m7g`, `r7g`) is AWS's arm64 CPU. Go cross-compiles to it with
+> `GOARCH=arm64`, and it costs roughly 15–20 % less than the x86 equivalent (`i` = Intel, `a` = AMD). One Graviton
+> vCPU is a whole core; one x86 vCPU is a hyperthread (half a core), so never carry numbers between the two without measuring.
+
+### 1. The instance family is a memory-to-CPU ratio. Pick it by what the workload is bound by
+
+| Family | GiB per vCPU | Bound it fits | Examples: vCPU / GiB, ≈ $ per month on-demand |
+|---|---|---|---|
+| **c** compute | 2 | **CPU-bound**: stateless Go APIs, parsing, JSON, crypto, encoding, load generators | `c7g.xlarge` 4 / 8, ≈ $105 · `c7g.4xlarge` 16 / 32, ≈ $420 |
+| **m** general | 4 | balanced: app servers with a local cache, small databases, queue brokers | `m7g.xlarge` 4 / 16, ≈ $120 · `m7g.2xlarge` 8 / 32, ≈ $240 |
+| **r** memory | 8 | **memory-bound**: Redis, Postgres or MySQL with a big working set, search nodes | `r7g.xlarge` 4 / 32, ≈ $155 · `r7g.2xlarge` 8 / 64, ≈ $310 · `r7g.4xlarge` 16 / 128, ≈ $620 |
+| **x / u** high memory | 16 up to TiBs | data sets above ~500 GiB that must sit in RAM | `x2gd.16xlarge` 64 / 1,024 (several $ thousand) |
+| **i / im / d** storage | local NVMe, ~230 GB per vCPU | **IOPS-bound**: databases above ~16k IOPS, Kafka and search hot nodes, NVMe caches | `i4i.xlarge` 4 / 32 + 937 GB NVMe, ≈ $250. NVMe is lost with the instance, so it needs replication |
+| **c7gn / …n** network | | **network-bound**: proxies, gateways, NAT, huge fan-out | `c7gn.16xlarge` up to 200 Gbps |
+| **g / inf / p** accelerators | | **GPU-bound**: inference, embeddings, training | `g6.xlarge` (1 × L4 GPU), `inf2.xlarge` (1 × Inferentia2) |
+| **t** burstable | | development, tests, near-idle tools | never for sustained production load: the CPU credits run out |
+
+Sizes double each step (vCPU, memory **and** price): `large` 2 vCPU → `xlarge` 4 → `2xlarge` 8 → `4xlarge` 16 →
+`8xlarge` 32 → `16xlarge` 64. Price is linear in size, so a stateless tier is cheaper to run as several mid-size
+nodes (smaller blast radius); a stateful tier is better on fewer, bigger nodes (fewer shards to operate).
+Network is also in the name of the size: an "up to 12.5 Gbps" figure is a **burst**; for *sustained* multi-Gbps flows
+use an `8xlarge` or larger, or an `n` family.
+
+### 2. From load to instances in four steps
+
+1. **CPU:** `required vCPU = peak requests per second × CPU-seconds per request`. Measure it. Starting points: ~0.1–0.3 ms
+   for a simple Go JSON API, 1–5 ms for work that renders, parses, encodes or does crypto, 50–500 ms per video minute or
+   photo transcode. (Time spent waiting on the database or network is **not** CPU.)
+2. **Memory:** working set + per-connection cost + headroom. Go: ~10 KiB per idle HTTP connection with buffers,
+   2–8 KiB per goroutine stack; keep 30–50 % headroom for the garbage collector. For databases: RAM ≥ the hot working set.
+3. **Node count** for a stateless tier, spread over 3 availability zones so that **losing one zone leaves the survivors at
+   most 80 % busy at peak**: `N = ceil( required vCPU ÷ (0.8 × vCPU per node × 2/3) )`, rounded **up to a multiple of 3**.
+   Example: 20k req/s × 0.2 ms = 4 vCPU; on `c7g.xlarge` (4 vCPU): 4 ÷ (0.8 × 4 × 0.667 = 2.13) = 1.9 → 2 → **3 nodes**,
+   about 42 % busy at peak in normal times. Stateful tiers: a primary plus a standby/replica in other zones instead.
+4. **Check the other three limits per node:** memory, *sustained* network bandwidth, and disk IOPS/throughput.
+   The one that runs out first is the bound; name it in the lesson and size by it.
+
+### 3. Rules of thumb per component
+
+| Component | Rule (assumptions to be re-measured) | Usually bound by |
+|---|---|---|
+| Stateless Go API | 1 vCPU ≈ 3–10k trivial requests/s, ≈ 1–3k with real work; plan ≤ 60 % CPU at peak in normal times | CPU |
+| PostgreSQL / RDS / Aurora | RAM ≥ hot working set (indexes + hot rows), `shared_buffers` ≈ 25 % of RAM and the OS cache the rest; ≈ 5–10 MiB per connection, so a pooler (PgBouncer, RDS Proxy) beyond a few hundred; a decent node (`r7g.2xlarge`–`4xlarge`) does ~10k+ indexed reads/s and a few thousand durable writes/s (track README) | memory, then IOPS |
+| Disk | `gp3`: 3,000 IOPS and 125 MiB/s included, up to 16,000 IOPS and 1,000 MiB/s; `io2 Block Express` up to 256,000 IOPS; the **instance** also caps EBS throughput; local NVMe (`i4i`) has far more IOPS but dies with the instance | IOPS / throughput |
+| Redis / ElastiCache | one core ≈ 100k simple ops/s (track README); memory ≈ data × 1.5–2 for small keys (per-key overhead, fragmentation); `maxmemory` ≲ 70 % of node RAM (snapshot fork and replica buffers need room); split into shards when memory or ops outgrow one node | memory, then single-core CPU |
+| Kafka / MSK | tens of MB/s per partition (track README); brokers are disk- and network-bound | network, disk |
+| OpenSearch / Elasticsearch | JVM heap ≤ 50 % of RAM and ≤ ~30 GiB; shards of 10–50 GB; hot nodes on NVMe | memory, IOPS |
+| Photo / video transcoding | CPU-heavy and bursty: `c` family on Spot, or a managed transcoder | CPU |
+| Embeddings / LLM inference | GPU or accelerator memory; below a few million tokens a day a hosted model API is usually cheaper than owning GPUs | GPU |
+| Object storage (S3) | nothing to size; ~3,500 PUT/s and ~5,500 GET/s per prefix (track README) | request rate per prefix |
+
+### 4. Price anchors (≈, on-demand, us-east-1)
+
+| Item | Price |
+|---|---|
+| `c7g.large` / `m7g.large` / `r7g.large` (2 vCPU) | ≈ $53 / $60 / $78 per month. Double per size step |
+| Managed service (RDS, Aurora, ElastiCache, OpenSearch Service) | ≈ **2×** the EC2 price of the same shape. RDS Multi-AZ doubles it again. Buys patching, backups, failover |
+| Savings Plans / Spot | ~30–40 % off for 1 year, ~50–60 % for 3 years / up to ~70 % off for interruptible workers (2-minute reclaim notice) |
+| EBS `gp3` / `io2` | $0.08 per GB-month (+ $0.005 per IOPS above 3,000) / $0.125 per GB-month + $0.065 per IOPS |
+| S3 Standard storage | $0.023 per GB-month |
+| Data out to the internet / via CloudFront | ≈ $0.09 / ≈ $0.085 per GB at the first tier, cheaper at volume. **1 Gbit/s sustained ≈ 324 TB a month ≈ up to $29k** at first-tier price |
+| Between availability zones | $0.01 per GB each direction |
+| NAT Gateway | ≈ $33 a month + $0.045 per GB processed |
+| Application Load Balancer | ≈ $16 a month + $0.008 per LCU-hour. One LCU is the **highest** of: 25 new connections/s, 3,000 active connections, 1 GB processed per hour, 1,000 rule evaluations/s. So a busy ALB is billed by bytes or by new connections, not by its $16 base: 55k small requests/s over keep-alive can cost far more than $20 |
+| SQS standard | ≈ $0.40 per million requests |
+
+Rules for reading a bill: **egress and cross-zone traffic often cost more than the servers**; storage is cheap and IOPS are
+not; a managed service is worth its 2× until the team is large or that single line dominates the bill; commit
+(Savings Plans) only for the steady baseline and leave peaks on on-demand or Spot.
+
+## Database choice cheat sheet
+
+> The default of this track is **PostgreSQL** (see the toolbox): relational, transactional, boring and very capable.
+> A different store has to be justified by a number or an access pattern. Every task's **section 16** applies this sheet
+> to that task's own data. Versions and limits move on; the *shape* of each trade-off is what stays true.
+
+### 1. Pick by access pattern
+
+| If the data is mostly… | Reach for | On AWS | Watch out for |
+|---|---|---|---|
+| relational: rows, joins, transactions, ad-hoc queries, up to a few TB and ~10k durable writes/s | **PostgreSQL** or **MySQL** | RDS (Multi-AZ), or Aurora | one primary takes all writes; read replicas lag; sharding is real work |
+| items fetched by key at very high write rates, no joins, predictable access paths, "no servers to run" | **DynamoDB**; **Cassandra** (Keyspaces) when you want an open API | DynamoDB, Keyspaces | design access patterns first; hot partitions; ≤ 400 KB per item; ~1,000 writes/s and ~3,000 reads/s per partition; transactions ≤ 100 items; no ad-hoc queries |
+| hot structures in memory: counters, sorted sets, locks, TTL keys, sessions | **Redis** (or Valkey) | ElastiCache; MemoryDB when it must be durable | memory-bound; a cache is not a system of record unless it is MemoryDB or the data can be rebuilt |
+| documents with a flexible schema | PostgreSQL `jsonb` first; **MongoDB** when whole-document access dominates and the schema churns | RDS/Aurora; DocumentDB (MongoDB-compatible API, not MongoDB) | joins and cross-document transactions get awkward |
+| full-text, faceted search, log search | **OpenSearch / Elasticsearch** as a *derived* index; Postgres full-text up to tens of millions of documents | OpenSearch Service | never the source of truth: it must be rebuildable from the real store |
+| analytics over billions of rows, append-mostly | **ClickHouse**, Redshift, or Athena over Parquet in S3 | Redshift, Athena | slow single-row updates; not an OLTP database |
+| time series | PostgreSQL partitions for modest volume; ClickHouse, Timestream or a Prometheus-style store beyond | Timestream | cardinality, retention, downsampling |
+| blobs and files | **S3** | S3 | key per object, not a database |
+| an ordered event log with many readers | **Kafka** | MSK, Kinesis | a log, not a query engine |
+| graphs, geography, vectors | PostgreSQL with recursive CTEs / **PostGIS** / **pgvector** first; a dedicated store only when it outgrows that | RDS/Aurora, Neptune | measure before adding a second database |
+
+### 2. PostgreSQL vs MySQL: both are good, so decide by the features the design relies on
+
+| Topic | PostgreSQL | MySQL (InnoDB, 8.x) |
+|---|---|---|
+| Indexes a design may lean on | **partial** indexes, expression indexes, GIN/GiST (arrays, `jsonb`, ranges, full-text, trigram), **exclusion constraints** (no overlapping bookings) | no partial indexes (workaround: a generated column that is `NULL` outside the condition + a unique index), functional and multi-valued JSON indexes, no exclusion constraints |
+| Types | ranges (`daterange`), arrays, `jsonb`, rich types and extensions (PostGIS, pgvector, pg_trgm) | JSON, spatial types; no range or array types |
+| Queue/dispatch locks | `FOR UPDATE SKIP LOCKED`, advisory locks (`pg_advisory_lock`), `LISTEN/NOTIFY` | `SKIP LOCKED` and `NOWAIT` since 8.0, named locks (`GET_LOCK`); no `LISTEN/NOTIFY` |
+| Writes | `INSERT … ON CONFLICT`, **`RETURNING`** | `INSERT … ON DUPLICATE KEY UPDATE`; no `RETURNING` (read `LAST_INSERT_ID()` or query again) |
+| Row storage | heap + separate indexes; updates make dead rows, so autovacuum, bloat and transaction-ID wraparound need watching | **clustered primary key**: a primary-key lookup or range is one tree walk, secondary indexes carry the PK (keep it small; a random UUID PK splits pages, see task 04); no vacuum |
+| Default isolation | `READ COMMITTED`; `SERIALIZABLE` via predicate locks | `REPEATABLE READ` with gap/next-key locks (surprising lock waits and deadlocks on range scans) |
+| Schema changes | DDL is transactional; many changes are metadata-only (`ADD COLUMN` with a constant default), `CREATE INDEX CONCURRENTLY` | DDL commits implicitly; `INSTANT` add-column and online index builds; large rebuilds via gh-ost or pt-online-schema-change |
+| Connections | a process per connection: a pooler (PgBouncer, RDS Proxy) beyond a few hundred | a thread per connection: thousands are cheaper, still pool |
+| Scaling out | read replicas, logical replication; sharding by hand, Citus, or Aurora Limitless (check availability) | read replicas, mature replication tooling; sharding with **Vitess** (proven at very large scale) |
+| Full-text / geo / vectors | `tsvector` + GIN, `pg_trgm`, PostGIS, pgvector | basic `FULLTEXT`, spatial indexes; no pgvector equivalent in the managed engines |
+
+How to use the table: list the database features the lesson's sections 8–9 *actually* depend on; if all of them exist in both,
+the engines are interchangeable and the choice is team skill and tooling; if one is Postgres-only (an exclusion constraint, a
+partial unique index, `jsonb` + GIN, `RETURNING`, `LISTEN/NOTIFY`), say that is the reason, and say what the MySQL workaround costs.
+
+**Aurora vs plain RDS** (for either engine): Aurora keeps six copies of the data across three zones in its own storage layer,
+allows up to 15 read replicas with low lag, fails over typically in well under a minute and grows storage on its own up to
+128 TiB; it costs more per instance-hour and bills storage and I/O separately. RDS Multi-AZ is simpler and cheaper for one
+primary. Choose Aurora for many replicas, fast failover or a very large, fast-growing data set.
+
+### 3. The rules these lessons follow
+
+1. **Start with one PostgreSQL primary + a standby in another zone**; add read replicas and a cache before anything exotic.
+2. **Name the deciding feature.** "Postgres because it has X, which the design uses in section 8" beats "Postgres because it is popular".
+3. **MySQL is a fine substitute** when the design needs only primary-key and secondary-index lookups, row locks and transactions;
+   the lesson says what changes if a Postgres-only feature is used.
+4. **DynamoDB / Cassandra** when access is by key, writes outgrow one primary (tens of thousands per second sustained) or the
+   operational budget is "none": model the access patterns first; you give up ad-hoc queries and joins.
+5. **One source of truth.** Caches, search indexes, analytics stores and read models are *derived*, rebuildable copies.
+6. **Redis is an accelerator**, not the record, unless it is durable (MemoryDB, or AOF plus replication) and the loss window is accepted.
+7. **Shard only when one primary cannot take the writes or the data**, by the key you query by; say what it costs (no cross-shard joins or transactions, hot shards, resharding).
 
 ---
 
@@ -338,7 +475,7 @@ Backlog in [hard/README.md](hard/README.md). Not written yet.
 ## Adding a task
 
 1. Copy [_template.md](_template.md) to `easy/NN-slug.md` (or medium/hard), next free number.
-2. Fill all 14 sections. Keep the task statement short and vague, the way interviewers do.
+2. Fill all 16 sections. Keep the task statement short and vague, the way interviewers do.
 3. Add a row to the index above and a tick line to [PROGRESS.md](PROGRESS.md).
 4. Link it from the previous task's `Next:` line.
 

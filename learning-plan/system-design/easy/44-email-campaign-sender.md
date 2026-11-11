@@ -338,3 +338,58 @@ Fairness: the bulk lane has its own concurrency (as the seed: a campaign never h
 - **Send-time optimisation:** per-recipient best hour from engagement history; where does that plan live without becoming a materialised plan?
 - **Multi-provider failover and cost routing:** unsent rows move to a second ESP; what happens to in-flight uncertainty?
 - **Own MTA and open tracking:** IP pools, per-ISP throttling, bot opens (mail privacy features open everything), and why most teams should not.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Dispatchers + planner + campaign API (Go, stateless) | 10k recipients/s design peak = 10 provider calls/s (§4) | CPU (small) | 10k × 0.3 ms (render, unsubscribe token, suppression lookup, JSON) = 3 vCPU; N = ceil(3 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.4) = 2 → 3. Payload 10k × 500 B = 5 MB/s ≈ 40 Mbit/s | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | pure CPU and ~1 GiB of memory, so `c`; 25 % busy normally, 38 % with a zone down. Sending is cheap: these nodes exist for availability, the ESP does the sending |
+| Event receiver + applier (webhooks, [18](18-inbound-webhook-receiver.md)) | 6.5k events/s peak (§4) | CPU | receive 6.5k × 0.3 ms ≈ 2 vCPU (signature check, JSON, durable insert) + apply 6.5k × 0.2 ms ≈ 1.3 ⇒ 3.3 vCPU; N = ceil(3.3 ÷ 2.13) = ceil(1.55) = 2 → 3 | `c7g.xlarge` | 3, one per zone | HMAC and JSON are CPU; writes go in batches of ~500 so Postgres never sees 6.5k single inserts; kept apart from the dispatchers so pausing a campaign never stops acking the ESP |
+| Postgres (recipients, events, suppressions, quotas) | ~20k recipient updates/s + 6.5k event inserts/s + ~5k flag updates/s ≈ 31k row writes/s in ~40 batched statements/s; 3.6 TB recipients (90 d) + 840 GB events (30 d) + 10 GB suppressions (§4) | memory and storage, not commits | hot set = 10 GB suppression list (10k random anti-join lookups/s) + ~40 GB active-day recipients + ~30 GB recent events ≈ 80 GB < 128 GiB. IOPS: 40 statements/s × 50–100 pages ≈ 2–4k, plus WAL fsyncs ⇒ ~5k ⇒ `gp3` 6,000 (3,000 included). WAL ≈ 31k × 0.6 KB ≈ 19 MB/s. Disk ≈ 4.5 TB. CPU ≈ 2–3 vCPU of 16 | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ, `gp3` 4,500 GB | 1 primary + synchronous standby | 31k rows/s sounds like a lot but arrives as ~40 commits/s, far under the few thousand durable writes/s one node does, so no `io2` or NVMe; the RAM is for the suppression anti-join and warm partitions (`r`, not `m`); retention drops whole day partitions, never `DELETE`, so vacuum stays off the 4.5 TB |
+
+The ESP does the sending (we make ~10 calls/s) and bills per message, which is not hardware but dwarfs it: 100M a day = 3B a month × ~$0.10 per 1,000 (an SES-class list price, an assumption to check) ≈ $300,000 a month. Egress to the ESP: 100M × 500 B = 50 GB/day = 1.5 TB a month through the NAT. No Redis here: quotas and cursors are Postgres rows.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Dispatchers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Event receivers: 3 × `c7g.xlarge` | $320 |
+| Postgres: `db.r7g.4xlarge` ($620 × 2 managed), Multi-AZ doubles | $2,480 |
+| gp3 4,500 GB + 3,000 extra IOPS (= $375, ×2 for the standby) | $750 |
+| ALB for webhooks and API: 140 GB/day ÷ 24 ≈ 6 LCU × $0.008 × 730, + $16 | $50 |
+| NAT: 3 × $33 + 1.5 TB to the ESP × ($0.09 out + $0.045 NAT) | $300 |
+| **Total** | **≈ $4,220** (≈ $3,130 with a 1-year Savings Plan on compute; the ESP fee is on top) |
+
+- **Biggest line and why:** the database (77 % of the hardware: instance 59 %, disk 18 %), because the product is bookkeeping: 3.6 TB of recipient rows and a suppression list that must stay in RAM. The lever is retention and partitioning, not a smaller node: 30 instead of 90 days of recipient rows frees ≈ 2.4 TB, ≈ $380 a month with the standby. The real money is outside this table: the ESP fee is ~70× the whole hardware bill.
+- **What changes at 10×:** dispatch 30 vCPU ⇒ N = ceil(30 ÷ 2.13) = 15 → 15 × `c7g.xlarge`; events 65k/s × 0.5 ms = 32.5 vCPU ⇒ ceil(15.3) = 16 → 18. Postgres runs out first: 310k row writes/s, ~44 TB of rows and ~200 MB/s of WAL are past one primary, so shard by tenant into ~6 clusters of ~7 TB (≈ 6 × $3,700 ≈ $22k) and move raw events to a columnar store. The ESP fee becomes ≈ $3M a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Bookkeeping, not sending: 100M recipient rows a day (~400 B each, 40 GB/day, 3.6 TB for 90 days), each updated twice (claim, then mark sent), so ~20k row updates/s at peak and ~31k row writes/s with events and flags, but only ~40 batched statements/s (sections 4, 15).
+- Access is by key and small ranges: claim ≤ 1,000 `queued` rows of one campaign and zone, a quota reserve on one `quota_usage` row, a suppression lookup by `(tenant_id, email)` (~10k/s over ~200M rows, ~10 GB), and a due-query over the cursor table with `SKIP LOCKED` (9.1, 9.2).
+- Idempotency and caps need unique keys and transactions: one row per address per campaign, events unique on `(provider, provider_event_id)`, a quota that can never pass `cap`. Retention drops day partitions; nothing is deleted row by row.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the claim index `recipients_claim` is partial (`WHERE status = 'queued'`), so it holds only the shrinking queued set; `UPDATE … RETURNING` gives the quota reserve (`RETURNING cap - used`) and the claimed rows in one round trip; `SKIP LOCKED`, day `RANGE` partitions with `plan_day` in the primary key, and `ON CONFLICT` for events cover the rest |
+| MySQL (RDS / Aurora) | ✔ works, with small workarounds | everything used exists in MySQL 8 except the partial index and `RETURNING` (see below). InnoDB updates rows in place, so there is no vacuum behind ~200M updates a day, a real point in its favour |
+| DynamoDB | ✖ poor fit | the claim is "give me 1,000 queued rows of this campaign": a GSI on status that every update moves items through, no `SKIP LOCKED`, and per-item conditional writes (transactions stop at 100 items) instead of one statement. One primary takes the load as ~40 commits/s, so there is nothing to outgrow |
+| ClickHouse | ✖ now, ✔ for raw events at 10× | events are append-only, 28 GB/day, and fit Postgres today (6.5k/s peak in batches of ~500); at 10× (65k/s, section 10) they move to a columnar store with per-campaign rollups kept hot. It has no unique constraint, so event idempotency would have to move elsewhere |
+| Redis (ElastiCache) | ✖ as the record, ✔ as a derived cache | an in-memory set or Bloom filter that skips lookups for the ~99 % of non-suppressed addresses is an extension (section 14); the suppression list and the quota must survive a restart, because the promise to stop mailing outlives the data |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.4xlarge` with `gp3` 4,500 GB (section 15), as the system of record for recipients, events, suppressions and quotas; nothing is derived elsewhere, and the ESP's event log is only consulted to reconcile (9.3). Three properties decide it: ~31k row writes/s arrive as ~40 commits/s of 1,000-row statements, far under the few thousand durable writes/s one node does, so no sharding, `io2` or NVMe yet; day partitions with the day in the key mean a claim reads one partition and retention is a `DROP`, so vacuum never sees the 4.5 TB; and the partial index plus `RETURNING` keep the claim and the quota reserve to one cheap statement each. It is a close call: MySQL would do this job too.
+
+**If it were MySQL instead:** about four rewrites, none structural.
+- `recipients_claim` becomes an ordinary index on `(campaign_id, tz, status, id)`: it covers all ~100M rows of the day's partition instead of only the queued ones, each status change rewrites an entry, and every secondary entry also carries the wide clustered key `(plan_day, campaign_id, email)`.
+- No `RETURNING`: the reserve is `UPDATE … WHERE used + n <= cap`, then the affected-row count (0 = the day's number is gone) and a read of `cap - used` in the same transaction; the claim is `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1000` followed by `UPDATE … WHERE id IN (…)`.
+- `recipient_id_seq` becomes an `AUTO_INCREMENT` column with its own index, `num_nonnulls` in `one_pace` becomes a plain expression check, `ON CONFLICT` becomes `INSERT IGNORE` or `ON DUPLICATE KEY UPDATE`, and dispatch transactions run at `READ COMMITTED` so range claims take no gap locks (MySQL defaults to `REPEATABLE READ`).
+
+**What would flip the choice:** at 10× (310k row writes/s, ~44 TB, ~200 MB/s of WAL, section 15) one primary is not enough: shard by `tenant_id`, the key everything is read by, into ~6 clusters, and move raw events to ClickHouse (section 10). If you would shard from day one, MySQL with Vitess is the more proven sharding path (cheat sheet); otherwise the engine stays. At a tenth of the volume (4 TB becomes 0.4 TB) a much smaller single node does the whole job.

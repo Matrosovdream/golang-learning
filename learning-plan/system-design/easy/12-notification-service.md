@@ -315,3 +315,61 @@ which is now required for bulk senders.
 - **Campaign service** on top: segments, throttled fan-out of millions of notifications into the low lane.
 - **Deliverability:** domain warm-up, DKIM/SPF/DMARC, bounce-rate monitoring per provider and per sending domain.
 - **Device token lifecycle** for push: registration, rotation, pruning on `unregistered`.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption; section 4 has no channel split, so assume 70 % email / 5 % SMS / 25 % push, ~40 KB per rendered email). Tiny hardware: nine small nodes for ~3 vCPU of work, chosen for zone spread and lane isolation.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API + provider-webhook ingest (Go, stateless) | 1,400/s campaign burst + ~115/s base ≈ 1,500 req/s; webhooks ~1,000 events/s (assume ~2 per send) | CPU, small | API 1,500 × 0.4 ms = 0.6 vCPU; webhooks 1,000 × 0.3 ms = 0.3; total 0.9. N = ceil(0.9 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | a JSON parse, one insert and one enqueue per request, so `c`; 15 % busy at peak. The zone rule sets the count |
+| Workers, high lane (OTP, receipts) | ~115/s (assume everything non-bulk is transactional) | availability, not load | 115 × 1.5 ms (prefs, render, one TLS call, one update) = 0.17 vCPU. N = 1 → 3 | `c7g.large` | 3 | a separate deployment so a bulk backlog or a bad bulk rollout can never take OTP capacity (section 9.3); 3 % busy is the price of that guarantee |
+| Workers, low lane (bulk) | up to 1,400/s in the worst mix (push is not provider-capped; email is capped at 500/s) | CPU, but the provider cap binds first | 1,400 × 1.5 ms = 2.1 vCPU. N = ceil(2.1 ÷ (0.8 × 4 × ⅔ = 2.13)) = 1 → 3. Memory ~1 GiB of 8 (templates, prefs, connection pools). Out: 500 × 40 KB ≈ 25 MB/s ≈ 200 Mbit/s in total | `c7g.xlarge` (4 vCPU / 8 GiB) | 3 | CPU is rendering and TLS, so `c`; adding nodes will not speed bulk email up: at 500/s a 5M burst takes 10,000 s ≈ 2.8 h whatever we run, the provider quota is the bound (section 10) |
+| Postgres (`notifications`, `deliveries`, prefs, suppressions) | ≈ 3,900 commits/s at peak (1,500 API + 1,400 sends + 1,000 webhook updates); 10 GB/day ⇒ 1 TB at 90 days + ~0.4 TB indexes | memory, then write IOPS | hot set: provider events land within ~3 days (assumption) ⇒ 3 × (10 GB rows + 4 GB indexes) ≈ 42 GB ⇒ 64 GiB RAM. IOPS ≈ 2 per commit ⇒ 7.8k + ~2k lookups ⇒ `gp3` at 10,000 IOPS, 2 TB. CPU 3,900 × 0.5 ms = 2 vCPU of 8 | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ | 1 primary + synchronous standby | the `provider_msg_id` and idempotency-key lookups are random, so the recent days must sit in RAM: `r`, not `m`. Partition by day and archive after 90 days (section 4). Above 16k IOPS: batch webhook updates, then shard by `user_id` |
+| Redis (daily caps, provider token buckets) | ~5M `(user, day)` counters × ~100 B = 0.5 GB; ~3k ops/s | none (tiny) | 0.5 GB × 2 for the fork = 1 GB; 3k ops/s ≪ one core | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache | 1 primary + 1 replica | smallest non-burstable node, memory is 12 % used; `r` would buy nothing. Losing the caps resets counters, which is acceptable |
+
+Queues: **SQS**, six queues (channel × lane), nothing to size: ≈ 1.2 requests per message (individual send, batched receive and delete) × 10M/day × 30.4 days × $0.40/M ≈ $150. If the queue were Redis (asynq), the 3.2M-message backlog (section 4) × ~0.6 KB ≈ 2 GB would join the Redis memory above.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.large` (3 × $53) | $160 |
+| Workers: high 3 × `c7g.large` ($160), bulk 3 × `c7g.xlarge` ($320) | $480 |
+| Postgres: `db.r7g.2xlarge` ≈ $620, Multi-AZ doubles | $1,240 |
+| gp3 2 TB + 7k extra IOPS: $160 + $35 = $195, ×2 for the standby | $390 |
+| Redis: 2 × `cache.m7g.large` (2 × ≈ $120) | $240 |
+| SQS ≈ $150, ALB ≈ $30 | $180 |
+| NAT: 3 × $33 + 8.7 TB × $0.045 | $490 |
+| Data out: 8.7 TB (email 7M/day × 40 KB × 30.4 days dominates) × $0.09 | $780 |
+| **Total** | **≈ $3,960** (≈ $3,220 with 1-year commitments, ≈ 35 % off the $2,120 of servers) |
+
+Not in the AWS bill, and far bigger: provider fees (off the sheet, rough): email ≈ 213M a month × $0.10 per 1,000 ≈ $21k, SMS ≈ 15M × ≈ $0.008 ≈ $120k, push free. The AWS bill is under 3 % of the real cost of this service.
+
+- **Biggest line and why:** the Postgres pair (41 % with its disks), because every notification is ~4 row writes and the last three days must stay in RAM; data out plus NAT together are 32 %, all of it rendered email bodies (a 60 % smaller body, or a provider's template API that takes only variables, would cut both). Lever: batch status and webhook updates to cut commits and IOPS.
+- **What changes at 10×:** 14k/s burst, so API + webhooks ≈ 9 vCPU ⇒ N = ceil(9 ÷ 2.13) = 5 → 6 × `c7g.xlarge`; bulk workers 14k × 1.5 ms = 21 vCPU ⇒ N = ceil(21 ÷ 4.27) = 5 → 6 × `c7g.2xlarge`. What really breaks first is provider quota (section 10: 14k/s is 28× one 500/s email account), then Postgres at ~39k commits/s and ~78k IOPS: split webhook status writes from the main table, partition by day, then shard by `user_id`. Data out plus NAT ≈ $12k.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 10M `notifications` a day, ~1 KB each with the rendered subject and status: 10 GB/day, ~1 TB at 90 days plus ~0.4 TB of indexes; ~4 row writes per message and ~3,900 commits/s at the campaign peak (sections 4, 15).
+- Every access is by key: the idempotency key, `(notification_id, channel)`, `(provider, provider_msg_id)` for webhooks (random lookups into the last ~3 days, a ~42 GB hot set), preferences by `(user_id, category, channel)`, suppression by `(channel, address)`. There are no joins on the hot path; a support question ("why did user 42 not get the receipt?") touches all four tables.
+- Exactly one send per idempotency key (section 9.2) should be a unique constraint, not application logic.
+- Daily caps and provider token buckets are tiny and expendable (~0.5 GB, ~3k ops/s).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the two unique keys give exactly-once at the database; the ~42 GB of random `provider_msg_id` lookups wants RAM (`db.r7g.2xlarge`, 64 GiB); `jsonb` for `data`. Cost: a `deliveries` row is updated ~3 times, so dead rows and autovacuum on a ~1 TB table; day partitions dropped at 90 days keep it bounded (section 15) |
+| MySQL (RDS / Aurora) | ✔ works, nothing material | every feature used (unique keys, primary-key and secondary-index lookups, forward-only status updates, transactions) exists. InnoDB's clustered key `(user_id, category, channel)` reads all of a user's preferences as one range, and updates happen in place, so no vacuum |
+| DynamoDB | ✔ works, a real alternative | every access is by key, items are ~1 KB (far under 400 KB), and random notification ids spread writes so the ~1,000 writes/s per-partition limit is not hit; the idempotency key becomes a conditional put. You give up ad-hoc queries across notifications, deliveries, prefs and suppressions, which is how support works |
+| Redis (ElastiCache) | ✔ for caps and rate limits, ✖ as the record | `(user, day)` counters and provider token buckets, ~0.5 GB on `cache.m7g.large`; losing them resets the counters, which section 15 accepts |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.2xlarge`, 2 TB `gp3` at 10,000 IOPS, section 15) as the system of record, Redis on ElastiCache for the counters (lossy, derived) and SQS for the six channel-by-lane queues (a transport, not a store). What decides it: unique constraints for exactly-once, enough RAM for the hot lookups, and one place to answer the support question. Honestly, PostgreSQL and MySQL are interchangeable here; team skill, tooling and the platform default (this track: PostgreSQL) are the tie-breakers.
+
+**If it were MySQL instead:** nothing material. `JSONB` becomes `JSON`; `ON CONFLICT DO NOTHING` becomes `INSERT IGNORE` followed by a read of the original row to return it with `200` (Postgres needs that second read too, since `DO NOTHING` returns no row); `TEXT` keys (`idempotency_key`, `provider_msg_id`, `address`) become `VARCHAR(n)`.
+
+**What would flip the choice:** at 10× (~39k commits/s, ~78k IOPS, section 15) one primary is past its ceiling. First split webhook status writes from the main table and batch them; then, because access is by key, move `deliveries` to DynamoDB or shard by `user_id`. Before that the provider quota breaks first (14k/s against a 500/s email account, section 10), which no database change fixes.

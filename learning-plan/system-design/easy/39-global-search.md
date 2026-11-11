@@ -289,3 +289,60 @@ func classify(q string) Plan {
 - **Multi-language analyzers** with a language field per document and per-tenant defaults.
 - **Cross-tenant "public" search:** a second index with only public docs, and none of the ACL machinery.
 - **Index tiering:** hot tenants on SSD, cold tenants on cheaper nodes, searched lazily.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Search API (Go, stateless) | 3,000 queries/s | CPU | 1 ms CPU a query (classify, build the query, decode hits, JSON) × 3,000 = 3 vCPU. N = ceil(3 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(2.8) = 3. Each query also does one 20-row verify: 3,000 batch lookups/s ≈ 30 % of one node's ~10k reads/s, spread over the product's existing replicas | `c7g.large` (2 vCPU / 4 GiB) | 3 | CPU glue around two network calls: `c`; 50 % busy normally, 75 % with a zone down; the verify load lands on existing replicas, not new hardware |
+| Index data nodes | 5B docs = 6.25 TB of primaries + 1 replica = 12.5 TB; 3,000 q/s; 3,500 docs/s | disk (NVMe) first; CPU about equal; memory | disk: 12.5 TB ÷ (937 GB × 0.75 ≈ 700 GB) = 17.9 → 18. CPU (x86 vCPUs): 3,000 × 10 ms + 3,500 × 2 ms = 30 + 7 = 37 vCPU ÷ (0.8 × 4 × ⅔ = 2.13) = 17.3 → 18. Heap 16 of 32 GiB; ~17 of 312 shard copies per node ≈ 700 GB | OpenSearch Service on `i4i.xlarge` (4 vCPU / 32 GiB / 937 GB NVMe); self-run on EC2 is half the price | 18, six per zone | `i`: the index must live on local NVMe (merges plus ~17 shards serving random reads; gp3's 3,000 IOPS baseline is thin), 8 GiB per vCPU leaves heap + page cache; not `r`: we need disk per node, not RAM. Zone loss: 12 survivors at 37 ÷ 48 = 77 %, shards run single-copy until the zone returns (12.5 TB does not fit 12 nodes to re-replicate) |
+| Dedicated masters | ~312 shard copies of cluster state | memory (state), not load | quorum of 3 | `m7g.large`, managed | 3 | availability of the cluster, not throughput |
+| Event stream | 3,500 events/s × ~200 B = 0.7 MB/s; ~20 GB a day | nothing (tens of MB/s per partition is the limit) | 3 days × 20 GB × 3 replicas = 180 GB | MSK `kafka.m7g.large` (managed ≈ 2 × `m7g.large`); the lesson's NATS on 3 small nodes is the cheaper self-run | 3 | three brokers for quorum and zones, at 1/50 of a partition's rate |
+| Indexers + outbox relay | 3,500 docs/s | CPU | 1 ms (re-read, build card, bulk body) × 3,500 = 3.5 vCPU; N = ceil(3.5 ÷ 2.13) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) | 3 | CPU plus waits; ~4 bulk calls/s; no more consumers than partitions |
+
+**Reindex is a capacity event, not just 28 h.** 50k docs/s is ~100 vCPU of indexing at 2 ms (more than the whole 72-vCPU cluster) plus a second 6.25 TB copy. Plan a burst of 18 more `i4i.xlarge` for ~2 days (9,000 × 48 ÷ 730 ≈ $590; ≈ 36 h at the spare ≈ 78 vCPU ÷ 2 ms ≈ 39k docs/s) and ~50 vCPU of Spot builders (4 × `c7g.4xlarge`, ≈ $20 for 28 h).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Search API: 3 × `c7g.large` (3 × $53) | $159 |
+| Index: 18 × `i4i.xlarge`, managed ($250 × 2 = $500 each) | $9,000 |
+| Masters: 3 × `m7g.large`, managed ($120 each) | $360 |
+| MSK: 3 × `kafka.m7g.large` ($120 each) + 180 GB × $0.08 | $375 |
+| Indexers: 3 × `c7g.xlarge` (3 × $105) | $315 |
+| S3 snapshots: 6.25 TB × $0.023 | $144 |
+| ALB: $16 + ~11 LCU (≈ 11 GB/h of results) | $80 |
+| Data out: ~1,000 q/s average (assumed peak ÷ 3) × ~3 KB gzipped ≈ 7.9 TB × $0.09 | $710 |
+| **Total** | **≈ $11,100** (≈ $7,600 with a 1-year commitment on the $10.2k of steady compute) |
+
+- **Biggest line and why:** the index nodes, 81 %, because 5B documents are 12.5 TB that must sit on NVMe, not because of queries (3k/s is the easy part). The lever is bytes: a smaller card and a shorter body excerpt, tenant tiering to cheaper nodes, or running them yourself (half). Sharded Postgres is not cheaper: 64 × `db.r7g.2xlarge` Multi-AZ at $1,240 ≈ $79k.
+- **What changes at 10×:** 50B docs = 125 TB with its replica ⇒ ~180 `i4i.xlarge` or, better for a stateful tier, 24 × `i4i.8xlarge` (7.4 TB NVMe each) ≈ $96k a month managed; 30k q/s ≈ 370 vCPU with indexing, still storage-bound. The write path runs out first (35k docs/s ⇒ 9 × `c7g.2xlarge` indexers; Search API 9 × `c7g.2xlarge`), then whale shards and reindex time (280 h at 50k docs/s, so incremental mapping changes only).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 5B documents (~1 KB each, ~5 TB of text, 6.25 TB of index, 12.5 TB with a replica) across 100k tenants, and every query stays inside one tenant (section 4).
+- Reads are search, not lookup: weighted words, typo-tolerant names (trigram), exact identifiers by a btree on `(tenant, kind, number)`, and an any-of ACL filter applied before ranking; 3,000 queries/s at peak, then a 20-row verify against the primary.
+- Writes are a stream: ~1,160 document updates/s on average, ~3,500/s at peak, forever, fresh within ~5 s; a full reindex is ~28 h, so it must be online (9.3).
+- The index is a derived copy: the product's rows decide, and the index can always be rebuilt from them.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen as the system of record, ✔ as the index below ~100M docs, ✖ as the index at 5B | `tsvector` with weights plus GIN, `pg_trgm` GiST for typos, a `text[]` ACL with `&&` and a partial unique index on `number` are the whole seed (p95 5–8 ms at 10k docs). At 5B it means 64 shards × ~78M docs that you build, rebalance and reindex yourself, ≈ $79k a month against ≈ $11k for the whole OpenSearch design (section 15) |
+| MySQL (RDS / Aurora) | ✔ as the system of record, ✖ as the index | the source rows and the outbox use only portable features. As an index it has basic `FULLTEXT` only (no weighted `tsvector`, no trigram index), a `FULLTEXT` index cannot lead with `tenant_id`, and the ACL overlap would be a JSON array with a multi-valued index; at 5B it has the same sharding bill as Postgres |
+| OpenSearch Service | ✅ chosen as the derived index | `routing = tenant_id` sends a query to one shard, `keyword` ACL tokens filter before ranking, analyzers, synonyms and fuzzy matching replace the trigram arm, and an alias swap makes the 28 h reindex online (9.1, 9.3); never the source of truth |
+| Kafka (MSK) | ✔ as the event log, not as a store of documents | 3,500 events/s × ~200 B is 0.7 MB/s; per-`(tenant, doc)` ordering and replay are what a dirty-key table taking ~100M inserts and deletes a day cannot give (9.2) |
+| DynamoDB / Cassandra | ✖ poor fit | key access only: no full-text, no typo matching, no ranking; it could hold documents by key, but the primary already does |
+
+**Pick:** PostgreSQL on RDS/Aurora stays the system of record. It is the product's own database; section 15 adds only the verify lookups on its existing replicas, and the outbox event commits in the same transaction as the row. OpenSearch Service (18 × `i4i.xlarge` plus 3 masters) is the derived index, fed through MSK. What decides it: tenant routing (one shard per query), an inverted index with analyzers and fuzzy matching at 5B documents, and the alias swap for an online reindex. Derived and rebuildable: the index and the stream; the record: the primary.
+
+**If it were MySQL instead:** nothing material on the record side. `src_version` compare-and-set and the outbox are portable, and `INSERT … ON DUPLICATE KEY UPDATE` replaces `ON CONFLICT`. The index is OpenSearch either way, so the product's engine does not change this design. What changes is the small-scale path of the seed: without trigram and weighted full-text, a MySQL product reaches for OpenSearch at its first typo-tolerant search box instead of at ~100M documents.
+
+**What would flip the choice:** down, under ~100M documents and no whale tenant, drop OpenSearch and keep the seed's single-Postgres `search_docs` (the cheat sheet puts Postgres full-text at tens of millions of documents). Up, at 10× (50B docs, ~125 TB with the replica) storage and indexing throughput run out, not the engine: fewer, larger `i4i.8xlarge` nodes (section 15); a hosted search service when nobody wants to run the cluster (9.1).

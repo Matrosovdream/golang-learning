@@ -341,3 +341,58 @@ func MatchKeys(email, phone, region string) (emailKey, e164 string, err error) {
 - **Households and companies:** link contacts to an account instead of merging people.
 - **Probabilistic matching:** learn the score weights from the review queue's accept/dismiss decisions.
 - **Cross-system ids:** the seed re-points the invoicing provider's customer record on merge so new invoices still reach the right customer; do the same for every integration.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Contact API (Go, stateless) | 5k find-or-create/s peak (1.5k/s avg) | CPU | parse and normalise (phone to E.164) + 1–2 indexed probes + JSON ≈ 0.4 ms; 5k × 0.4 ms = 2 vCPU. N = ceil(2 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(1.9) = 2 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | CPU work plus waiting on Postgres; memory is a few hundred MiB, so `c`, not `m`. 33 % busy at peak, 50 % with a zone down: sized for availability, not load |
+| Postgres (contacts, emails, phones, child tables) | 500M contacts ≈ 0.5 TB + phones ≈ 145 GB + emails ≈ 75 GB (assumed 150 B each) ≈ 0.72 TB; 5k probes/s, ~10 creates/s | memory, then IOPS (backfill) | hot set = the lookup indexes: emails ~30 GB + phones ~30 GB + contact PK ~10 GB (assumed from entry sizes) ≈ 70 GB, plus hot rows ⇒ ≥ 128 GiB. 5k/s × ~2 probes = 10k indexed reads/s ≈ 1 vCPU. IOPS steady ≈ 10 creates/s × ~10 + ~1k miss reads ≈ 1.1k; backfill: 10 merge workers = 500 merges/s × ~25 IOPS (assumed) ≈ 12k | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ, `gp3` 1 TB at 12,000 IOPS (self-managed: `r7g.4xlarge`) | primary + sync standby, plus 1 replica `db.r7g.2xlarge` for the review queue and scans | RAM holds every lookup index, so probes never wait on disk; `r7g.2xlarge` (64 GiB) is smaller than the index set. CPU stays ~20 %. The 12k IOPS exist for the one-day merge backfill; throttled to one worker (9 days) it fits the 3,000 included |
+| Workers: matcher, merge, import, outbox relay | ~10 new contacts/s × 100–300 comparisons; import 5k rows/s; merges up to 500/s in a backfill | CPU (mostly waiting on Postgres) | matcher 10 × 300 × 1 µs ≈ 0 vCPU; import 5k × 0.1 ms = 0.5; merges 500 × 1 ms (the other ~19 ms is Postgres time) = 0.5; relay ≈ 0.1 ⇒ ≈ 1.1 vCPU. N = ceil(1.1 ÷ 1.07) = 2 → 3 | `c7g.large` | 3 | tiny CPU. A lost node only delays the matcher backlog, which the lesson already says slips first |
+| Blocked full scan (backfills, big imports only) | ~25B pairs | CPU | 25B × 1 µs = 25,000 CPU-s ÷ 32 vCPU ≈ 13 min; reads ~50 GB of blocking keys (assumed 100 B × 500M) from the replica | `c7g.8xlarge` (32 vCPU / 64 GiB) on Spot, started per run | 1, for ~13 min | pure parallel CPU, so `c`; restartable per block, so Spot. ≈ $0.25 per run ($840 ÷ 730 h × 13 min) |
+
+Network: responses ≈ 0.5 KB (assumption) × 1.5k/s average ≈ 0.75 MB/s ≈ 2 TB a month out through the ALB. Multi-AZ replication traffic is inside the RDS price.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.large` (3 × $53) | $160 |
+| Workers: 3 × `c7g.large` | $160 |
+| Postgres: `db.r7g.4xlarge` ≈ $1,240, Multi-AZ doubles | $2,480 |
+| Replica: `db.r7g.2xlarge`, single zone | $620 |
+| `gp3` 1 TB + 9k extra IOPS ($80 + $45 = $125) × 2 for the standby, + $80 for the replica | $330 |
+| ALB ($16 + ~3 LCU) | $30 |
+| Egress: ≈ 2 TB × $0.09 | $180 |
+| Blocked scan: 13 min of `c7g.8xlarge` per backfill | ≈ $0 |
+| **Total** | **≈ $3,960** (≈ $2,760 with a 1-year plan on compute) |
+
+- **Biggest line and why:** the Postgres primary (~63 %; with replica and volumes the database is ~87 %). It is memory, not CPU: ~70 GB of lookup indexes must stay in RAM so 5k probes/s never touch disk, and it is Multi-AZ because identity data cannot be lost. The lever is measuring the real hot set: if it is under ~40 GB (most tenants idle), `r7g.2xlarge` saves $1,240.
+- **What changes at 10×:** 50k find-or-create/s ⇒ 20 vCPU ⇒ N = ceil(20 ÷ 4.27) = 5 → 6 × `c7g.2xlarge`. 5B contacts mean ~700 GB of lookup indexes, which no node holds, so shard by `tenant_id` into ~8 shards of today's `db.r7g.4xlarge` Multi-AZ (≈ $20k). The blocked scan grows to 250B pairs ≈ 2.2 h on the same 32 vCPU (≈ $2.5 on-demand): still cheap.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Almost every call is an exact-key lookup: 5k find-or-create/s at peak, ~2 indexed probes each (`contact_emails (tenant_id, email)`), but only ~10 creates/s (section 4).
+- 500M contacts and ~650M phones are ~0.72 TB, with a ~70 GB set of lookup indexes that has to stay hot (section 15).
+- Two writes need real guarantees: "one contact per email" under races (9.3), and a merge that repoints ~20 child rows across tables atomically, locking both contacts in id order (9.4).
+- Fuzzy matching is done by the matcher worker over blocking keys (9.2), not by the database.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the composite primary key is the arbiter, and `INSERT … ON CONFLICT DO NOTHING RETURNING` tells the loser of a race in the same round trip; `contact_emails_primary` is a partial unique index (one primary email per contact); `pg_advisory_xact_lock` serialises phone-only creators; `jsonb` holds `reasons` and `loser_snapshot` |
+| MySQL (RDS / Aurora) | ✔ works, small workarounds | this is key lookups, row locks and transactions, which InnoDB does well; the clustered primary key `(tenant_id, email)` makes each probe one tree walk. Different: no `RETURNING` (read the affected-row count), no partial indexes (generated column), named locks (`GET_LOCK`) instead of advisory locks |
+| DynamoDB | ✖ poor fit | the email lookup plus a conditional put is its native shape, but a merge is a multi-table repoint (a transaction is ≤ 100 items; a contact can have a million children), and the review queue, the child registry and the 40M-pair backfill need ad-hoc queries |
+| OpenSearch | ✔ only as a derived index | could replace the blocking-key lookups if fuzzy name matching outgrows them; rebuildable from `contacts`, never the record |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.4xlarge` with a `db.r7g.2xlarge` replica for the review queue and scans (section 15). Three properties decide it: the primary key as the unique arbiter with `ON CONFLICT … RETURNING`, one transaction that can lock both contacts and move every child table at once, and one node whose RAM holds all the lookup indexes. Postgres is the system of record; `duplicate_candidates` is derived and can be rebuilt by a rescan.
+
+**If it were MySQL instead:** the same tables. The lost-race branch reads the affected-row count (`INSERT IGNORE`, or an `ON DUPLICATE KEY UPDATE` no-op) instead of `RETURNING`; `contact_emails_primary` becomes a generated column that is `NULL` unless the row is primary, with a unique index on it; the open-review-queue index becomes `(tenant_id, status, score)`; the phone lock becomes a named lock held on one connection. `citext` is not needed, because the default collation already compares case-insensitively. About four small rewrites and nothing structural.
+
+**What would flip the choice:** sharding by `tenant_id` (section 15: ~8 shards at 10×) is the next step, not another engine. The one piece worth lifting out is the `(tenant, email) → contact` map, as DynamoDB items, if it outgrows what sharded Postgres should keep in RAM (~700 GB of lookup indexes at 10×); merges, the queue and matching would stay relational.

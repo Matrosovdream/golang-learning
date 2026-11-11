@@ -1,6 +1,6 @@
 # System Design Track · Progress
 
-Method, toolbox and index: [README.md](README.md). One task at a time; tick when you've gone
+Method, toolbox and index: [README.md](README.md). Known text issues to fix while presenting: [KNOWN-ISSUES.md](KNOWN-ISSUES.md). One task at a time; tick when you've gone
 through the task, questions, plan, solution, pros/cons and answered the check questions.
 
 > ▶ **Resume here:** 🟢 **easy** — task **10. Webhook Delivery** ([easy/10-webhook-delivery.md](easy/10-webhook-delivery.md)).
@@ -102,6 +102,7 @@ _No tasks written yet. Backlog: [hard/README.md](hard/README.md)._
 - 2026-11-11 — easy **09 Feature Flags** done. Started 10 (fixed its retry-load math: 5% × 6 retries = +30%, not +50%; completed the SSRF private-range list: `fc00::/7`, `fe80::/10`, `0/8`, `100.64/10`, IPv4-mapped IPv6).
 - 2026-11-11 — **36 new easy tasks (16–51)** mined from the `honeydolist-site` project and written at big scale, each with a 🌱 Seed line (what the project really does, with PLAN step / migration / ADR) and a *Here, at scale* line: intake & abuse (16–19), records & integrity (20–23), lifecycle & workflow (24–27), booking & commerce (28–31), content & SEO (32–35), AI & search (36–39), platform & operations (40–43), comms, access & analytics (44–47), tooling & settings (48–51). Nine ideas that didn't get a file are listed in the README's *Easy backlog*. Resume pointer unchanged (still task 10). All 14 sections, links and the 15→16 chain checked by script; numbers and SQL were re-read by the writers but not run — expect arithmetic fixes as each task is read, as with 06–10.
 - 2026-11-11 — **9 more easy tasks (52–60)** finished from the *Easy backlog* (configurable forms, web push/PWA, programmatic location pages, order timeline, related content & interlinking, event registration & waitlist, outbound click tracking, provider adapters & fakes, business-day time zones). The honeydolist-site seed is now fully mined: easy has **60 tasks**, the backlog is empty. Same checks as 16–51 (sections, links, Prev/Next chain); the Go in 60 was actually run, the SQL anywhere was not. Resume pointer unchanged (task 10).
+- 2026-11-11 — **two new sections on all 60 easy tasks:** `15. Hardware sizing on AWS` (per component: peak load, what it is bound by — CPU / memory / IOPS / network / GPU — the math, the instance family and why, count, rough monthly bill, what changes at 10×) and `16. Database choice and why` (PostgreSQL vs MySQL and the other stores that genuinely compete, the deciding feature, what changes on MySQL, what would flip the choice). Both are driven by new README cheat sheets (*AWS sizing* and *Database choice*) and the template/checker now require 16 sections. The writers also logged ~45 inconsistencies in the older lesson text: [KNOWN-ISSUES.md](KNOWN-ISSUES.md) (several are SQL that would fail, e.g. a primary key on a partitioned table without the partition column).
 
 ---
 *Global progress: [../PROGRESS.md](../PROGRESS.md).*

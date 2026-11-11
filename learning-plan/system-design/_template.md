@@ -9,7 +9,8 @@
 
 <!-- Section map (keep all 14, in this order):
      1 task · 2 questions · 3 requirements · 4 estimation · 5 plan · 6 high-level design · 7 API
-     8 data model · 9 deep dives · 10 scaling & failures · 11 trade-offs · 12 check yourself · 13 in Go · 14 extensions -->
+     8 data model · 9 deep dives · 10 scaling & failures · 11 trade-offs · 12 check yourself · 13 in Go · 14 extensions
+     15 hardware sizing on AWS (see the README's AWS sizing cheat sheet) · 16 database choice and why (see the README's database choice cheat sheet) -->
 
 
 
@@ -113,3 +114,42 @@ The problem. The options:
 ## 14. Extensions
 
 - 
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads come from section 4; every CPU cost per request is an assumption, say so)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| | | | | | | |
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| | |
+
+- **Biggest line and why:**
+- **What changes at 10×:**
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:** the access patterns (point reads by key, range scans, joins, transactions, aggregates, full-text), the consistency it needs, the size and the write rate, from sections 4 and 8.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | | |
+| MySQL (RDS / Aurora) | | |
+| DynamoDB / Cassandra | | |
+| Redis (ElastiCache / MemoryDB) | | |
+| (others that are genuinely relevant) | | |
+
+**Pick:** the store, the AWS service, and the two or three properties or features that decide it, tied to sections 8–9.
+
+**If it were MySQL instead:** what would change (a Postgres-only feature replaced by a workaround), or "nothing material".
+
+**What would flip the choice:** the number or requirement at which you would move to something else.

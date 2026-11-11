@@ -302,3 +302,60 @@ The dashboard never touches events. Closed days come from `page_day` and `site_d
 - **Consent and Do-Not-Track:** honour a customer's setting at the script and the edge; what changes in the numbers?
 - **Cross-day uniques with privacy:** why even a weekly salt changes the privacy story, and what to tell customers.
 - **Outbound click tracking** at scale (the seed's `/go/` redirect): dedupe, bot filtering, partner reports ("how many did you send us this month").
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Ingest nodes (Go, `204` at once) | 20k events/s peak, 3.9k average (§4); ~7k/s per node over 3 nodes | CPU (small) | 20k × 0.06 ms (JSON ≤ 2 KB, HMAC, GeoIP, bot test, Redis `SET NX` client, map update; TLS ends at the ALB) = 1.2 vCPU; on `c7g.large`: N = ceil(1.2 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(1.12) = 2 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3, one per zone | CPU-bound and tiny: 20 % busy normally, 30 % with a zone down. Memory is the 1M-site key map (~100 MB) plus the aggregation map, so `c`, not `m` |
+| Redis (visit dedupe, live counters, uniques, 60 s dashboard cache) | 20k `SET NX`/s plus counter and sketch updates ≈ 25k ops/s (assumption) | memory, then single-core ops | dedupe 36M keys × 60 B = 2.2 GB × 1.7 = 3.7 GB (§4); live counters and HLLs ≈ 3 GB and the dashboard cache ≈ 1.5 GB (assumptions) ⇒ ≈ 8 GB; `maxmemory` ≤ 70 % of 16 GiB = 11.2 GiB; 25k ops/s is under one core's ~100k | `cache.r7g.large` (2 vCPU / 16 GiB, ≈ $156) | 1 primary + 1 replica | memory-bound, so `r`: 8 GB of data behind a core doing 25k ops/s; `m7g.large` (8 GiB, 5.6 usable) cannot hold it. Losing Redis only over-counts visits briefly (§10) |
+| Queue (raw events and batches) | 20k events/s × 200 B = 4 MB/s if raw events ride it (§4) | disk and network, both far from their limits | 4 MB/s × 86,400 s = 345 GB/day × 3 replicas ≈ 1 TB for 24 h of retention; brokers see 4 MB/s in, 8 MB/s of replication, well under one partition's tens of MB/s | MSK `kafka.m7g.large` (2 vCPU / 8 GiB); self-run JetStream on `m7g.large` is about half the price | 3, one per zone | availability, not load: the stream is a tenth of what one broker moves. Partition by `site_id` (say 12 partitions) so one site's counters have one writer |
+| Aggregators + dashboard API + raw writer (Go) | 20k events/s in; ~20 statements/s out (§9.1); dashboards ≈ 2 views/s average, 20 peak (assumption: ~150k a day) | CPU (small) | aggregate 20k × 20 µs = 0.4 vCPU; Parquet raw writer 20k × 20 µs = 0.4; API 20 × 5 ms = 0.1 ⇒ 0.9 vCPU; N = ceil(0.9 ÷ 1.07) = 1 → 3 | `c7g.large` | 3, one per zone | stateless; three for availability, the queue's partitions spread over them |
+| Postgres (page_day, page_hour, site_day, paths) | 20 statements/s ≈ 25k row upserts/s (assumption: 5 s flush ⇒ ~50k distinct keys per flush on each of page_day and page_hour, plus site_day); 260 GB a year daily, 65 GB hourly (§4) | memory, then IOPS | hot set = today's page_day (0.7 GB) + the last day's page_hour (2.2 GB) + paths, site_day, indexes ≈ 12 GB < 32 GiB. IOPS: ~3 GB of dirty pages per 5-min checkpoint ≈ 10 MB/s ≈ 1.3k, plus WAL ≈ 5 MB/s ⇒ ~3k ⇒ `gp3` 6,000. CPU 25k × 25 µs ≈ 0.6 vCPU of 4. Disk ≈ 0.5 TB in year 1 ⇒ 1,000 GB | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 primary + synchronous standby | the rollups are cached, so memory then IOPS, never CPU: `r`. `m7g.xlarge` (16 GiB) would hold the 12 GB hot set with no slack. Counters are additive batches, so ~20 commits/s, not 25k |
+
+Raw events on S3 (7-day expiry): 470 GB × $0.023 ≈ $11, nothing to size. Beacons arrive free; the only egress is ~300 B per `204` (10B × 300 B = 3 TB a month). One note on the sketch: `site_day.uniques_sketch` is a 12 KB value, so rewriting it on every flush is large WAL for busy sites; keep live HLLs in Redis and write them to Postgres hourly.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Ingest: 3 × `c7g.large` (3 × $53) | $160 |
+| Aggregators, API, raw writer: 3 × `c7g.large` | $160 |
+| Redis: 2 × `cache.r7g.large` (2 × $156) | $310 |
+| Queue: 3 × MSK `kafka.m7g.large` (3 × $120) + ~1 TB storage × $0.08 | $440 |
+| Postgres: `db.r7g.xlarge` ($155 × 2 managed = $310), Multi-AZ doubles | $620 |
+| gp3 1,000 GB + 3,000 extra IOPS (= $95, ×2 for the standby) | $190 |
+| S3 raw events, 470 GB | $10 |
+| ALB: ~960 new TLS connections/s (a quarter of the 3.9k/s average, assumption) ÷ 25 = 39 LCU × $0.008 × 730, + $16 | $240 |
+| Egress: 10B `204`s × 300 B = 3 TB × $0.09 | $270 |
+| **Total** | **≈ $2,400** (≈ $1,840 with a 1-year Savings Plan on compute) |
+
+- **Biggest line and why:** Postgres with its disk (≈ 34 %), then the queue (18 %). All in, that is about $0.24 per million page views: this is a cheap workload because it is batched and the read side is a few hundred GB of rollups. The database is the one piece that cannot shrink: the rollups are the permanent record (the provider forgets after six months), so it stays Multi-AZ.
+- **What changes at 10×:** 200k events/s ⇒ 12 vCPU ⇒ N = ceil(12 ÷ 1.07) = 12 × `c7g.large` for ingest. The dedupe set is 360M keys ≈ 37 GB and 200k `SET NX`/s is two cores, so Redis goes to cluster mode (~4 shards of `cache.r7g.xlarge`). The queue moves 40 MB/s, so `m7g.xlarge` brokers and more partitions. Postgres runs out first (as §10 says): 250k upserts/s is past one primary, so shard by site across clusters and move hourly rollups to a columnar store.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- A firehose in and a tiny read side out: 10B events a month, ~3.9k/s on average and 20k/s at peak, 333M events a day (~67 GB raw, ~470 GB for 7 days). The rollups are small: ~15M daily rows a day (~260 GB a year) and ~45M hourly rows a day (~65 GB for 30 days) (section 4).
+- Writes are additive counters that must stay exact under redelivery: ~20 batched statements/s (~25k row upserts/s with a 5 s flush) that commit their queue offsets in `flush_log` in the same transaction (9.1).
+- Reads are range scans by key: a site's days, `GROUP BY path_id … LIMIT 20` over ~1,350 rows, cached for 60 s. "Today so far", visit dedupe (`SET NX EX 1800`), live counters and the HyperLogLogs live in Redis (9.2, 9.5).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for the rollups | `INSERT … ON CONFLICT DO UPDATE SET views = page_day.views + EXCLUDED.views` over `unnest` arrays plus a `flush_log` insert, in one transaction, gives exact counts under replay (a duplicate offset fails the batch); `RANGE` partitions by day give cheap retention and per-day backups; ~20 commits/s is nothing for one primary |
+| MySQL (RDS / Aurora) | ✔ works, nothing material | `INSERT … ON DUPLICATE KEY UPDATE views = views + …` and a duplicate-key error on `flush_log` do the same job. The clustered key `(site_id, day, path_id)` makes a site's 90-day top pages one contiguous range, and in-place updates mean no vacuum behind counters that are rewritten every 5 s |
+| ClickHouse | ✔ for raw events and drill-down, ✖ now for the rollups | the textbook store for 333M events a day: scanning 7 days (~2.3B rows) for drill-down is cheap and compression is high. But there is no transaction to hold `flush_log` and the counters together, and the rollups are a few hundred GB of key reads that do not justify a second system (9.3) |
+| Redis (ElastiCache) | ✅ for live counters, visit dedupe and HLL, ✖ as the record | derived and rebuildable: losing it only over-counts visits for a moment (section 10); the rollups in Postgres are the permanent record |
+| DynamoDB | ✖ poor fit | atomic `ADD` counters are easy, but the exact-once batch (~50k keys per flush on each of two tables) cannot be one transaction (limit 100 items), so replay safety is lost |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.xlarge`, `gp3` 1,000 GB, section 15) is the system of record for `sites`, `paths`, `page_day`, `page_hour`, `site_day` and `flush_log`. Redis (`cache.r7g.large`, primary and replica) holds the derived state (visit keys, live counters, sketches, the dashboard cache); raw events go to S3 with a 7-day expiry and are disposable; MSK is a transport, not a store. Postgres wins on two properties: the transaction that commits offsets with counts, so a 50k-key batch is never half-applied and a replay is skipped; and day partitions, dropped for retention and backed up one day at a time. The read side is a few hundred GB of range reads, which an OLTP database serves cheaply. One tuning note (a rule of thumb): the counters are rewritten every flush, so keep those updates HOT (no indexed column changes, a lower `fillfactor` on the active partitions) to keep autovacuum ahead.
+
+**If it were MySQL instead:** nothing material. The `unnest` upsert becomes a multi-row `INSERT … ON DUPLICATE KEY UPDATE` sent in chunks of a few thousand rows inside the same transaction; `BYTEA` becomes `BLOB`; the `RANGE` partitions keep working because `day` and `hour` are already in each primary key. In-place updates remove the HOT and vacuum tuning above. With the cheat sheet's rule, the choice is team skill and tooling.
+
+**What would flip the choice:** a product requirement for drill-down over raw events (filter by referrer, country or device across 7 days, ~470 GB) points to ClickHouse, or S3 with Athena, for raw and hourly data. At 10× (200k events/s, ~250k upserts/s, section 10) one primary is not enough: shard by site, which is already the queue's partition key so each site keeps one writer, and move the hourly rollups to a columnar store while Postgres keeps the daily rollups and `sites`. At a tenth of the volume one small primary and Redis do it all, and raw events could stay in partitions.

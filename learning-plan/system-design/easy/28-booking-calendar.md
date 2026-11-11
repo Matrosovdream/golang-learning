@@ -357,3 +357,57 @@ if errors.As(err, &pgErr) && pgErr.Code == "23P01" { // exclusion_violation
 - **External calendars (iCal feeds):** import as blocks; the hard part is a booking that arrives *after* your own for the same dates.
 - **Late binding for car-class pools** with per-day capacity counters and assignment at pick-up.
 - **Service due:** honeydolist records return condition, meter hours and `service_every_days` per unit (migration 0075); turn "due" into an automatic maintenance block through the deadlines machinery ([27](27-deadlines-escalation.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Booking + availability API (Go, stateless) | 90k availability checks/s + 3k booking attempts/s (160/s avg, so the peak is ~19×) | CPU | checks 90k × 0.15 ms (one pipelined Redis call + JSON) = 13.5 vCPU; attempts 3k × 0.5 ms (the DB time is waiting, not CPU) = 1.5; total 15 vCPU. N = ceil(15 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(7.03) = 8 → 9 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 9, three per zone | CPU only: ~10 KiB per connection × ~10k connections ≈ 100 MiB per node, so `c`. 42 % busy at peak, 62 % with a zone down. Many mid-size nodes keep the blast radius small. The average needs ~0.8 vCPU, so autoscale down to a 3-node floor outside long weekends |
+| Postgres (bookings, units; GiST exclusion) | 3k attempts/s ⇒ ~3k hold inserts/s, and later ~3k expiries/s ≈ 6k writes/s (a conflict still writes a dead tuple); hot set 67 GB (168M rows); archive 200 GB/yr | memory, then IOPS | RAM ≥ 67 GB ⇒ 128 GiB. IOPS ≈ 6k writes × 2 (assumed) = 12k + ~1k miss reads ⇒ `gp3` 14,000 (cap 16,000) on 500 GB (hot 67 GB + ~1 year of archive 200 GB). CPU: 3k × ~1.5 ms (GiST probe, `SKIP LOCKED` pick, insert into 4 indexes) + expiries 3k × 0.5 ms ≈ 6 vCPU of 16 | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ (self-managed: `r7g.4xlarge`) | primary + sync standby; 1 replica `db.r7g.2xlarge` for month views and history | the hot set (67 GB) is bigger than `r7g.2xlarge`'s 64 GiB, so memory picks the node, and 16 vCPU come with it (38 % busy at the peak). Multi-AZ because a confirmed booking must not be lost. 12k IOPS is near gp3's cap: past that, `io2` or shards |
+| Availability index + month-view cache (Redis) | ~90k checks/s × ~2 ops = 180k ops/s, + ~18k/s from the outbox updater | single-core ops/s, not memory | ~7M items (assumed 10M units ÷ 1.4) × (46 B bitmap + ~70 B key) ≈ 0.8 GB + month cache ≈ 3 GB (assumed) ≈ 4 GB × 1.7 ≈ 7 GB, so ~2.3 GB per shard. Ops: ~200k ÷ 100k per core = 2 cores ⇒ 3 shards at ~67 % | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache cluster mode | 3 shards × (primary + replica) = 6 | the limit is one core per shard, memory is ~30 % of 8 GiB, so `m` rather than `r`; a lost cache degrades search only, since the constraint is the truth |
+| Workers: reaper, outbox → index updater, nightly archive | ~6k events/s at peak; the reaper sweeps up to ~90k rows per 30 s | CPU, tiny | 6k × 0.15 ms ≈ 0.9 vCPU. N = ceil(0.9 ÷ 1.07) = 1 → 3 | `c7g.large` | 3 | small; the reaper is not critical (lazy expiry keeps correctness) |
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 9 × `c7g.xlarge` (9 × $105) | $950 |
+| Workers: 3 × `c7g.large` | $160 |
+| Redis: 6 × `cache.m7g.large` (6 × ≈ $120) | $720 |
+| Postgres primary: `db.r7g.4xlarge` ≈ $1,240, Multi-AZ doubles | $2,480 |
+| Replica: `db.r7g.2xlarge` | $620 |
+| `gp3` 500 GB + 11k extra IOPS ($40 + $55 = $95) × 2 for the standby, + $95 for the replica | $290 |
+| ALB ($16 + ~10 LCU on average) | $80 |
+| Egress: ≈ 7.6 TB × $0.09 (4.8k checks/s average × ~0.6 KB, assumed) | $680 |
+| **Total** | **≈ $6,000** (≈ $4,500 with a 1-year plan on the steady baseline: database, Redis, workers, 3 API nodes) |
+
+- **Biggest line and why:** the Postgres primary (~41 %; ~57 % with replica and volumes), because the 67 GB hot set forces 128 GiB and a confirmed booking must survive a zone loss. Reads never reach it (Redis answers 90k checks/s), so the lever is write churn, not a smaller node: holds are half its writes (3k inserts + 3k expiries/s), and a shorter hold, a hold cap per customer and a waiting room for hot items cut CPU and IOPS together.
+- **What changes at 10×:** 900k checks/s + 30k attempts/s ⇒ 135 + 15 = 150 vCPU ⇒ N = ceil(150 ÷ 4.27) = 36 → 36 × `c7g.2xlarge` (≈ $7.6k). 1.8M Redis ops/s is ~30 shards, which is the lesson's move to a sharded search tier (OpenSearch Service). 60k writes/s ≈ 120k IOPS is far past gp3 and one primary, so shard by `owner_id` into ~10 shards of today's shape (6k writes/s, 67 GB hot, ≈ 10 × $2,670 ≈ $27k).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The rule that matters is "no two live bookings of one unit overlap", and its conflict domain is a single unit (sections 8 and 9.6).
+- Writes: 3k attempts/s at peak means ~3k hold inserts/s and later ~3k expiries/s, ~6k writes/s on a 67 GB hot set; ~200 GB a year is appended (sections 4 and 15).
+- Reads that reach the database are per-unit overlap probes, "free units of this item", and one owner's month (~20k bookings for 5,000 units). The 90k availability checks/s are answered from a derived index.
+- Holds and cancellations are status changes, so rows are updated often and the live set is only ~45M of 500M a year.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `EXCLUDE USING gist (unit_id WITH =, stay WITH &&) WHERE (status IN ('held','confirmed','out'))` makes the rule hold for every writer, and a cancelled or expired row leaves the predicate with no delete; `daterange` gives half-open stays and open-ended blocks (upper bound `NULL`); `gist (owner_id, stay)` serves the month; `FOR UPDATE OF u SKIP LOCKED` picks a unit under contention (9.2) |
+| MySQL (RDS / Aurora) | ✔ works, with a heavy workaround | no range type, no exclusion constraint, no partial index. Either keep a night table with unique `(unit_id, night)` for blocking bookings only (~1.5B night rows a year at 3 nights per stay, and ~4 rows written per hold instead of 1), or lock the unit row, run an overlap query, then insert, which leaves the rule in code that every writer must remember (the con in 9.1) |
+| DynamoDB | ✖ poor fit | a conditional write guards one item, not a range; you would model one item per unit-night and run a transaction over a stay's nights (limit 100 items, so long stays and open-ended blocks need caps or a horizon), and the owner's month needs a GSI |
+| Redis (ElastiCache) | ✔ as a derived index and cache, ✖ as the record | the availability bitmaps and `cal:{owner}:{yyyymm}:{ver}` are rebuildable from `bookings`; a `SET NX PX` hold would sit outside the constraint (9.3) |
+| OpenSearch | ✔ only as a derived search tier at 10× | section 10's move for "which items in this city are free"; never the source of truth |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.4xlarge` with a `db.r7g.2xlarge` replica for month views and history (section 15). It is chosen for the exclusion constraint, which turns the hardest rule into a database guarantee (9.1); for range types and GiST indexes, which answer the calendar queries directly; and for `SKIP LOCKED` unit selection. `bookings` is the single system of record; the Redis bitmaps, month cache and any search tier are derived through the outbox and can be rebuilt from it.
+
+**If it were MySQL instead:** the same units and bookings tables plus one of two additions. With the night table, a hold or expiry touches 4 rows, so the peak is ~24k row writes/s instead of ~6k (an estimate, on a node planned around 12k IOPS), and an open-ended block needs a far-future sentinel. With lock-then-check, take the unit row lock first so writers queue instead of deadlocking on gap locks under `REPEATABLE READ`, then check overlap with a B-tree on `(unit_id, status, start)`, cheap because one unit has only a few dozen bookings. InnoDB has no vacuum, which would ease the hold-churn bloat that section 10 warns about, but it does not pay for the extra rows.
+
+**What would flip the choice:** the unit is the conflict domain, so ~10× (30k attempts/s, 60k writes/s, section 15) means sharding by `owner_id`, still on Postgres. Another engine is justified only if bookings must be accepted in several regions at once with no single primary per owner, which suggests per-unit ownership in a DynamoDB-style store, or if search outgrows Redis, which points to OpenSearch as a derived tier.

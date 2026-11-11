@@ -308,3 +308,56 @@ an instance running a 2-hour-old snapshot is the problem to alert on.
 - **Scheduled changes** (turn on at 09:00 Monday) via task 15.
 - **Approval workflow** for prod changes, and diffing two versions in the UI.
 - **Client-side SDK:** evaluate on the server per user and ship only resolved values to the browser.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). This is a tiny-hardware service: a few small instances for availability, not for load.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Flag API (Go, stateless): snapshot gateway + SSE + management/publish | 70 polls/s (2,000 ÷ 30 s, nearly all `304`); 2,000 SSE connections; publish stampede: a kill switch makes 2,000 instances refetch within ~2 s = 1k req/s of a 50 KB gzipped body | CPU, but ~0 | polls 70 × 0.1 ms = 0.007 vCPU; stampede 1k × 0.3 ms = 0.3 vCPU (the real peak); SSE keep-alives ≈ 0. Memory: 2,000 × ~20 KiB = 40 MiB + the 500 KB snapshot in RAM. N = ceil(0.3 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | the zone rule sets the count, not the load: ~0.3 vCPU of 6 is 5 % busy. `c` because it is CPU and bytes, never memory; the stampede is ≈ 50 MB/s ≈ 0.4 Gbit/s in total (≈ 0.13 per node), far under what a `large` can burst. The latest snapshot lives in each node's memory, so no Redis is needed |
+| Postgres (flags, flag_configs, flag_audit, snapshots) | ~50 writes/day; ~1,000 flags × 500 B = 0.5 MB current; snapshots 50/day × 500 KB ≈ 25 MB/day ≈ 9 GB/year | none (availability only) | RAM and IOPS are irrelevant: the whole current state is 0.5 MB, and 50 writes a day is ~0 IOPS. 20 GB `gp3` | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ | 1 primary + standby | the smallest non-burstable class is 1,000× the load. Multi-AZ because the kill switch is an emergency tool and publishing needs the database; single-AZ would be half the line |
+| Snapshot history (S3) | ≈ 18k immutable versions a year × ~50 KB gzipped ≈ 1 GB | nothing to size | | S3 Standard | | pennies: $0.023 × 1 GB |
+
+Network: 50 changes/day × 2,000 instances × 50 KB = 5 GB/day (150 GB/month), plus 70 polls/s × ~0.5 KB of `304` headers ≈ 90 GB/month: ≈ 240 GB, about $20 even priced as internet egress (in-region it is cheaper).
+
+Where the real cost would be: the rejected design. Evaluations are millions/s; assume 3M/s. Locally they cost ~1 µs each, ≈ 3 vCPU spread over 2,000 instances. A remote call at ~0.15 ms CPU each would need 3M × 0.15 ms = 450 vCPU, N = ceil(450 ÷ 4.27) = 106 → 108 × `c7g.2xlarge` ≈ $22,900 a month, before the network.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Flag API: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.m7g.large` ≈ $120, Multi-AZ doubles; 20 GB gp3 ≈ $3 | $240 |
+| Internal ALB: $16 + ~1 LCU × $0.008 × 730 | $20 |
+| Data transfer ≈ 240 GB × $0.09 (upper bound) | $20 |
+| S3 history | ~$0 |
+| **Total** | **≈ $440** (≈ $300 with 1-year commitments on the $400 of servers) |
+
+- **Biggest line and why:** the management Postgres (55 %), a floor price: Multi-AZ for a database that takes 50 writes a day. The whole service costs about two `c7g.2xlarge`; the design's real saving is the ≈ $22,900 a month of remote-evaluation servers it never needs.
+- **What changes at 10×:** 20,000 instances ⇒ 667 polls/s ≈ 0.07 vCPU and 20,000 SSE connections ≈ 0.4 GB spread over the same 3 × `c7g.large`. The one change is the publish stampede (20k × 50 KB = 1 GB in seconds ≈ 4 Gbit/s): serve snapshot bodies from S3 + CloudFront and let the origin answer revalidations (data ≈ 2.4 TB ≈ $200 a month). The first limit hit is snapshot size (section 10: segments), not hardware.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Tiny: ~1,000 flags × ~500 B of rules ≈ 0.5 MB of current state, ~50 writes a day, snapshots ~25 MB/day ≈ 9 GB a year, one audit row per change (sections 4, 15).
+- Access is by key (`flag_key, env`) and whole-document: rules are written and read as one JSON value and never queried inside. The audit log is append-only.
+- Evaluation never touches a database: SDKs hold a snapshot in memory (section 9.1), and the snapshot gateway serves a static versioned blob (~70 polls/s, nearly all `304`).
+- Publishing must be atomic: the new rules, the audit row and the new snapshot version change together (section 9.5).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | one transaction covers `flag_configs`, `flag_audit` and `snapshots`; `jsonb` holds the rules, `before`/`after` and the snapshot body as whole documents; the `(env, version)` primary key rejects a concurrent duplicate publish. At 0.5 MB any instance is oversized (section 15) |
+| MySQL (RDS / Aurora) | ✔ works, nothing material is lost | its `JSON` type stores the same documents, and no GIN index is needed because nothing queries inside the rules; the same transactions, primary keys and row locks |
+| DynamoDB | ✔ works, not needed | items are tiny (far under 400 KB), access is by key, ~50 writes a day. It would remove the ≈ $240 a month Multi-AZ floor that is 55 % of the bill (section 15), at the price of an audit trail you can only query along paths you designed up front ("who changed any flag in March") |
+| S3 | ✔ as a derived store for snapshot bodies | immutable versions, ~18k a year × ~50 KB gzipped ≈ 1 GB (section 15); `snapshots.body` may be an object key instead of a `JSONB` column. Redis is not needed: each API node keeps the latest snapshot in memory |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.large`, section 15) as the system of record for flags, rules, audit and snapshots; the in-memory snapshots in the API nodes and SDKs are derived copies. The deciding property is the transactional publish with its audit row, and `jsonb` documents; the honest reading is that 0.5 MB and 50 writes a day fit any relational database, so team skill and the platform's default (this track: PostgreSQL) are the real tie-breakers.
+
+**If it were MySQL instead:** nothing material. `JSONB` becomes `JSON`, `BIGSERIAL` becomes `AUTO_INCREMENT`, and the `TEXT` primary keys become `VARCHAR(n)` (InnoDB cannot index a bare `TEXT`; `key` is also a reserved word in MySQL, so quote it). The monotonic version bump needs a lock in either engine (a row lock on the environment, or `pg_advisory_lock` / `GET_LOCK`), with the `(env, version)` key as the backstop in both.
+
+**What would flip the choice:** not load: 10× the instances changes snapshot delivery (S3 + CloudFront, section 15), not the database. What would flip it is operations: a platform with no relational estate that wants zero database servers could run DynamoDB + S3, with a conditional write on `version` giving the monotonic bump. If the audit trail starts being queried across flags and time, stay relational.

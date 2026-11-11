@@ -360,3 +360,58 @@ func Charged(regular int64, sale, campaign *int64) int64 {
 - **Structured data:** honeydolist emits an `Offer` with `price`, availability (`InStock`, `OutOfStock`, `PreOrder` with its date) and `priceValidUntil` = the sale's last day; generate it from the same resolver.
 - **Flash sales:** hot-SKU admission control with a queue (medium backlog 07).
 - **Competitor-driven repricing** as a stream of price proposals that need approval before they are sealed.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Catalog API (Go, stateless) | 200k price reads/s = 8k page views/s × 24 offers; ~90 % hit the 60 MB local cache | CPU | per page 0.3 ms × 8k = 2.4 vCPU; per offer ~5 µs (map hit + `Charged`) × 200k = 1.0; misses 20k offers/s as ~8k `MGET`/s × 30 µs = 0.25; total ≈ 3.7. N = ceil(3.7 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.7) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | JSON encoding and in-memory resolution; the hot cache is 60 MB of 8 GiB, so `c`. 31 % busy at peak, 46 % with a zone down |
+| Order service (checkout) | 5k stock writes/s peak (100/s avg) | CPU, small | 5k × 0.5 ms (re-price, one transaction) = 2.5 vCPU. N = ceil(2.5 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(2.3) = 3 | `c7g.large` (2 vCPU / 4 GiB) | 3 | most of a checkout is waiting for Postgres; 42 % busy at peak, 63 % with a zone down |
+| Redis (price cache + campaign overlay) | whole cache 6 GB (100M × 60 B) + overlay 300 MB; ~20k key reads/s after the local cache | memory | (6 + 0.3) GB × ~1.7 ≈ 10.7 GB; `maxmemory` ≤ 70 % ⇒ ≥ 15.3 GiB of RAM, so `cache.r7g.large` (16 GiB) is borderline; ops ≈ 8k `MGET`/s, far under one core's ~100k | `cache.r7g.xlarge` (4 vCPU / 32 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory-bound, so `r` (8 GiB per vCPU); CPU is ~10 % of one core. Pre-warm the top 1M offers before a campaign so misses never reach Postgres |
+| Postgres (offers, dated prices, costs, `stock_moves`, orders) | 5k stock transactions/s peak; hot working set = offers 30 GB + indexes ~15 GB (assumed) ≈ 45 GB; whole DB ≈ 150 GB (prices 39 GB, costs ~4 GB, 90 days of `stock_moves` ~78 GB at ~100 B per row) | memory, then CPU at the peak | RAM ≥ 45 GB ⇒ 64 GiB. IOPS ≈ 5k × 2 (assumed) = 10k + ~1k misses ⇒ `gp3` 12,000 on 400 GB. CPU 5k × ~1 ms = 5 vCPU of 8 (62 %) only at the launch peak; the average (100/s) uses ~1 % | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ (self-managed: `r7g.2xlarge`) | primary + sync standby; 1 replica `db.r7g.xlarge` for staff views, seal checks and cache warm-up | RAM covers the offer working set, so `r`, not `c`; step to `4xlarge` if CPU measures above ~70 %. The hot SKU (20k attempts/s on one row) is a lock queue, not a hardware problem: rate-limit it ([03](03-rate-limiter.md)); a bigger node does not help |
+
+Shopper-facing bytes: ~3 KB per listing response (assumption). The 200k/s peak is ~4× the average (assumed), so ~2k page views/s × 3 KB = 6 MB/s ≈ 15.8 TB a month through CloudFront. Campaign upload and seal (5M rows ≈ 300 MB via `COPY`) is minutes of one core on the admin pods: nothing to size.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Catalog API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Order service: 3 × `c7g.large` | $160 |
+| Redis: 2 × `cache.r7g.xlarge` (2 × ≈ $310) | $620 |
+| Postgres primary: `db.r7g.2xlarge` ≈ $620, Multi-AZ doubles | $1,240 |
+| Replica: `db.r7g.xlarge` | $310 |
+| `gp3` 400 GB + 9k extra IOPS ($32 + $45 = $77) × 2 for the standby, + $77 for the replica | $230 |
+| ALB ($16 + ~22 LCU: 6 MB/s ≈ 21.6 GB/h) | $140 |
+| CloudFront egress: ≈ 15.8 TB × $0.085 | $1,340 |
+| **Total** | **≈ $4,360** (≈ $3,440 with a 1-year plan on compute) |
+
+- **Biggest line and why:** egress (~31 %), larger than any server (the primary is ~28 %). Reads are the load, so the bytes shoppers download cost more than the compute that makes them. The lever is bytes, not nodes: send only price and availability state; every 1 KB trimmed from a response saves ≈ $450 a month (2k/s × 1 KB × 2.63M s × $0.085).
+- **What changes at 10×:** 2M price reads/s ⇒ ~37 vCPU ⇒ N = ceil(37 ÷ 4.27) = 9 → 9 × `c7g.2xlarge` (≈ $1.9k). Redis misses reach ~200k key reads/s (~2 cores), so cluster mode with 3 shards (6 × `cache.r7g.xlarge` ≈ $1.9k). 50k stock writes/s ≈ 100k IOPS needs ~10 shards of `db.r7g.2xlarge` Multi-AZ (≈ $12k), but the first real change is the hot SKU (admission control or a queue, the medium flash-sale task). Egress becomes ≈ $13k.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Reads are the load: 200k price reads/s at peak, but ~90 % are answered by a 60 MB per-instance cache and the rest by Redis, so the database sees few of them (sections 4 and 15).
+- Prices are dated rows with one price per offer, kind and currency at any instant (8, 9.1); ordinary changes are ~12/s, and a 5M-row campaign is staged days ahead and then immutable.
+- Checkout is one transaction: conditional `UPDATE … WHERE stock_qty >= n`, a `stock_moves` ledger row and order lines that copy price and cost. 5k transactions/s at peak, and one hot SKU at ~20k attempts/s on a single row.
+- Cost price lives in its own table behind its own database role (9.5). Whole database ≈ 150 GB; the hot set is ~45 GB.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `EXCLUDE USING gist (offer_id WITH =, kind WITH =, currency WITH =, valid WITH &&)` over `tstzrange` guarantees one price per instant for every writer; `CHECK (stock_qty >= 0)` and the conditional update never oversell; `= ANY($1)` bulk reads and `COPY` for the campaign upload; `REVOKE` hides `offer_costs` from the public role |
+| MySQL (RDS / Aurora) | ✔ works, one small workaround | only the exclusion constraint is Postgres-only, and it guards a table that changes ~12 times a second: lock the offer row and check for overlap in the write path (9.1 already validates sale against regular there), plus the nightly audit. The conditional stock update, the ledger and per-table `GRANT`s are portable; `ANY($1)` becomes `IN (…)`, `COPY` becomes `LOAD DATA` or batched inserts |
+| DynamoDB | ✖ poor fit as the one store, ✔ for the read side | price and stock by offer id is its native shape (`BatchGetItem`, conditional decrement), but it has no range-overlap constraint for dated prices, checkout plus ledger plus order lines wants a transaction and joins for margin reports, and its ~1,000 writes/s per partition is below the hot SKU's 20k attempts/s (a lock queue in Postgres too) |
+| Redis (ElastiCache) | ✔ as a derived price cache, ✖ as the record | the 6 GB cache and the 300 MB campaign overlay are rebuildable from Postgres; stock must be exact and durable |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.2xlarge` with a `db.r7g.xlarge` replica for staff views and seal checks (section 15), and ElastiCache Redis (`cache.r7g.xlarge`, primary plus replica) as the derived price cache. It wins on the exclusion constraint for dated prices (the same trick as lesson 28), on one transaction covering stock, ledger and order lines (9.4), and on column and role separation for cost (9.5). Postgres is the record; the local cache and Redis hold copies that can be dropped at any moment.
+
+**If it were MySQL instead:** nothing else in the design depends on Postgres, so this is the closest to a coin flip of the six. The price-overlap rule moves to a locked check in the write path with an audit query behind it, and `option_values TEXT[]` becomes a JSON column. The hot paths (cache misses, conditional stock updates) behave the same. Choose by team skill and tooling.
+
+**What would flip the choice:** 10× is 50k stock writes/s, about 10 Postgres shards (section 15), but the first real change is admission control for the hot SKU, not an engine. A key-value store for the price and stock read model becomes attractive only if the catalogue grows by orders of magnitude and per-key reads dominate; the dated rows, orders and ledger stay relational.

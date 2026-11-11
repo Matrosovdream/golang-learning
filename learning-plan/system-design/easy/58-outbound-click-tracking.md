@@ -320,3 +320,59 @@ We cannot see a purchase on the partner's site; they tell us. The click id is th
 - **Privacy rules:** a consent-aware mode that omits `clk` for visitors who declined tracking, and what that does to attribution.
 - **Chargebacks:** partners disputing a month 60 days later; how long raw clicks must live, and what an archived-to-object-storage lookup costs.
 - **Multi-touch attribution:** several clicks before one conversion; a credit-split table instead of last-click.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). Small in hardware terms: 772 clicks/s on average and 5k/s at peak is about half a vCPU of redirecting. The money sits in 90 days of evidence (≈ 1.65 TB on a Multi-AZ disk pair) and in the load balancer's per-connection charge.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Redirector (Go, stateless: map lookup, UUIDv7, HMAC, `302`; TLS ends at the ALB) | 5k clicks/s at peak (§4) | CPU, barely | 5k × 0.1 ms = 0.5 vCPU. N = ceil(0.5 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | three for the zones, not the load: ~8 % busy at peak. Each pod holds the whole link cache (~200 B per link; the link count is not in section 4), so memory, not CPU, caps pods per node: the 20 pods of §9.2 are a blast-radius choice (a crash loses ~8 clicks) |
+| Classifier + rollup + archiver (Go workers) | 5k verdicts/s at peak; rollup upserts; weekly partition archive | CPU, barely | classifier 5k × ~0.1 ms (Redis `SET NX`, rules, batched verdict insert) = 0.5 vCPU; rollups, the statistics batch and archiving ~0.5; total ≈ 1 vCPU. N = ceil(1 ÷ 1.07) = 1 → 3 | `c7g.large` | 3 (sharded by `hash(link_id, visitor)`, §10) | async, so a lagging worker only delays verdicts; one shard per zone |
+| Redis (dedupe `SET NX EX 1800`, velocity counters) | 5k × (1 dedupe + ~4 velocity ops) ≈ 25k ops/s; keys 5k/s × 1,800 s = 9M (assumes the peak lasts 30 min, conservative) | memory (small), then one core | 9M × ~100 B = 0.9 GB × 2 (fork) = 1.8 GB ÷ 0.7 ⇒ ≥ 2.6 GiB; ops 25k × 10 µs = 0.25 core | `cache.m7g.large` (8 GiB), ElastiCache | 1 primary + 1 replica | 2.6 GiB is far under 8, so `m`, not `r`; the core has room (25 %). It fails open (§10), so the replica is only to avoid 30 minutes of weakened dedupe after a node loss |
+| Postgres ledger (`clicks`, `click_verdicts`, `click_rollups`) | 5k click rows/s + 5k verdict rows/s at peak (772 + 772 average), in ~100 batch commits/s; 90 days online: 960 GB (§4) + verdicts ≈ 600 GB (assumed ~100 B per click with index; §4 omits them) + rollups 88 GB/year ≈ 1.65 TB | disk size, then write IOPS | 10k rows/s × ~0.5 IOPS (random index pages, coalesced by checkpoints; assumption) = 5k IOPS at peak, ~0.8k average ⇒ `gp3` at 6,000. Storage 1.65 TB ⇒ 2 TB. Hot set = today's index tail ≈ 66.7M × 40 B = 2.7 GB + heap tails ≈ 6–8 GB; CPU 10k × 25 µs = 0.25 vCPU + rollups ≈ 1 of 4 | `db.m7g.xlarge` (4 vCPU / 16 GiB), RDS Multi-AZ, 2 TB `gp3` at 6,000 IOPS | 1 primary + synchronous standby | the data is big but the hot part is only today, so `m`, not `r`: the bill is disks, not the instance (storage is cheap, IOPS are not). Old partitions drop whole. A dispute export scans cold partitions at `gp3`'s 125 MiB/s (320 GB ≈ 40 min), so export from the S3 archive |
+
+Front door and bytes. The ALB costs by new TLS connections, not by servers: 772/s ÷ 25 per LCU = 31 LCU × $0.008 × 730 = $180, plus $16. The `302` is ~400 B out: 2 B × 400 B = 800 GB a month. S3 archive: dropped partitions are ≈ 520 GB a month (320 GB ledger + 200 GB verdicts), ÷ 4 compressed (assumed), × 12 months kept ≈ 1.6 TB.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Redirectors: 3 × `c7g.large` (3 × $53) | $160 |
+| Workers: 3 × `c7g.large` | $160 |
+| ALB: $16 + 31 LCU × $0.008 × 730 | $200 |
+| Postgres: `db.m7g.xlarge` ≈ $240 managed, Multi-AZ doubles | $480 |
+| gp3 2 TB ($160) + 3,000 extra IOPS ($15), × 2 for the standby | $350 |
+| Redis: 2 × `cache.m7g.large` (2 × ≈ $120) | $240 |
+| S3 archive: 1.6 TB × $0.023 | $40 |
+| Data out: 800 GB × $0.09 | $70 |
+| **Total** | **≈ $1,700** (≈ $1,340 with a 1-year plan on the $1,040 of steady compute) |
+
+- **Biggest line and why:** Postgres plus its disks (≈ $830, 49 %), for keeping 90 days of evidence on a Multi-AZ pair, not for load; the 2 TB of disk alone is $350. The whole bill is ≈ 0.85 % of one point of partner discrepancy ($200k a month, §4), so this is money well spent. Levers: a shorter online window if the contract allows it, and one index only.
+- **What changes at 10×:** 20 B clicks, ~50k/s peak (§10). Redirector 5 vCPU ⇒ N = ceil(5 ÷ 2.13) = 3 × `c7g.xlarge`, still small. The ALB's new-connection LCUs (≈ 308 ⇒ ≈ $1,800 a month) overtake all the servers: move TLS onto the redirectors behind an NLB. Redis needs ~250k ops/s (÷ 70k per core ≈ 4 shards) and ~90M keys (9 GB) ⇒ 4 shards of `cache.r7g.large`. The ledger is 107 GB a day ⇒ 9.6 TB + ≈ 6 TB of verdicts: past a comfortable single Postgres, so keep ~14 days in Postgres and move raw exploration to a columnar store (§10).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- An append-only ledger: 2B clicks a month = 66.7M a day (~772/s average, 5k/s at peak), ~160 B a row, ~10.7 GB a day, ~960 GB for the 90 days kept online (section 4). Facts and verdicts are inserted in batches (~100 commits/s) and never updated.
+- Reads are aggregates over small rollups (~5M rows a day) plus a few point lookups (a click by id for a postback) and dispute exports; nothing on the hot path joins.
+- Retention is by time: after 90 days a whole day leaves, which should be a partition drop, never a `DELETE` of billions of rows.
+- It is money: the count must be repeatable (recompute a day from facts plus rules), inserts must be idempotent (`(click_id, clicked_at)`), and a postback must be accepted once (`(partner_id, event_id)`).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | declarative `PARTITION BY RANGE (clicked_at)` by day: retention is detach, archive to S3, drop; batched `COPY` plus `ON CONFLICT DO NOTHING` makes a redelivered click vanish; ledger, verdicts, rollups and conversions in one engine make "why was click X not billed?" a join, and `PRIMARY KEY (partner_id, event_id)` makes postbacks once-only; the ledger is insert-only, so vacuum and bloat (the hot counter's problem in the seed) do not apply |
+| MySQL (RDS / Aurora) | ✔ works, interchangeable here | day partitions and `DROP PARTITION` exist too, with the same rule that every unique key contains the partition column; the PK starts with a time-ordered UUIDv7, so InnoDB's clustered index appends at the tail instead of splitting pages like a random UUID (task 04); nothing used here is Postgres-only |
+| ClickHouse (self-run, ClickHouse Cloud) | ✔ works, not needed yet: the 10× home of the raw ledger | columnar and compressed, fast for dispute exports and re-classification over billions of rows; but no unique constraint (the idempotent insert becomes a ReplacingMergeTree, which de-duplicates only at merge time), weak single-row work, and it is not an AWS-managed service (Redshift or Athena over Parquet are the AWS-native analytics); section 10 already puts raw exploration there at 10× |
+| DynamoDB | ✖ poor fit | keyed by `click_id` it spreads writes and TTL expires old items, but "all clicks of link X in October" is then a scan; keyed by link, one hot link at 10k/s passes the ~1,000 writes/s per partition limit; rollups and exports have no ad-hoc queries |
+| Redis (ElastiCache) | ✔ as the derived dedupe and velocity store, ✖ as the ledger | `SET NX EX 1800` (~9M live keys, section 15) fails open, and the classifier re-runs the window rule over the ledger afterwards |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, the `db.m7g.xlarge` with 2 TB `gp3` at 6,000 IOPS from section 15, because day partitions turn 90-day retention into a metadata operation, `COPY` with `ON CONFLICT DO NOTHING` gives idempotent batch ingest, and facts, verdicts and conversions live in one engine. Record: `clicks`, `click_verdicts` (facts and judgments) and `conversions`. Derived and rebuildable: `click_rollups` and the Redis dedupe keys. Cold archive: dropped partitions go to S3, and disputes are served from there (section 15).
+
+**If it were MySQL instead:** nothing material. `COPY` becomes `LOAD DATA` or multi-row `INSERT`; `ON CONFLICT DO NOTHING` becomes `INSERT IGNORE` (which also turns other errors into warnings) or `ON DUPLICATE KEY UPDATE`; `BYTEA` becomes `BINARY(16)`; the instant columns become `DATETIME` kept in UTC (a daily `RANGE COLUMNS` partition works on it, see 60 for the time types). The secondary index `(link_id, clicked_at)` carries the 16-byte primary key in InnoDB, which is why the key stays small. The choice is then team skill and tooling.
+
+**What would flip the choice:** at 10× (~107 GB a day, ~9.6 TB online plus ~6 TB of verdicts) the raw ledger is too big for one comfortable Postgres: keep ~14 days there and move raw clicks to ClickHouse (or Parquet in S3 queried with Athena), while rollups, links and conversions stay relational (section 10). A contract that demands zero click loss calls for a durable log (Kafka/MSK) in front, not another database. Aurora instead of RDS if you would rather not provision and double a 2 TB disk: its storage grows on its own, and replicas can serve the partner dashboards, but storage and I/O are billed separately.

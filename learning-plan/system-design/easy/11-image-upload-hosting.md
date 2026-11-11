@@ -275,3 +275,56 @@ signed link can be shared until it expires; make the expiry short and re-sign on
 - **Video**: a transcoding pipeline with HLS output and adaptive bitrate (medium).
 - **NSFW / malware scanning** as a pipeline stage that gates `ready`; what does the UI show meanwhile?
 - **Multi-region replication** of the bucket for durability and faster origin misses.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). The hardware is tiny; the bytes are not: servers come to under 2 % of the bill.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Processing workers (Go + libvips: sniff, decode, 3 encodes, sha256) | 60 uploads/s (12/s average) × 200 ms CPU (section 4) | CPU, then network | 60 × 0.2 s = 12 vCPU (average 2.3, section 4's "≈ 3 cores"). N = ceil(12 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.8) = 3. Memory: assume a 100 MP pixel cap (section 9.2 gives none) ⇒ ≤ ~0.8 GB per decode × 8 parallel = 6.4 GB of 16 GiB. Network: 60 × (2 MB in + 2.2 MB out) = 252 MB/s ≈ 2 Gbit/s ÷ 3 = 0.67 Gbit/s per node | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS, on Spot behind autoscaling on queue depth | 3 at peak, one per zone; fewer between peaks | image work is pure CPU, so `c`; the pixel cap is what keeps memory at 6 GB, raise it and it needs `m`. 50 % busy at peak, 75 % with a zone down. Jobs are idempotent (section 9.3), so a 2-minute Spot reclaim only delays a thumbnail. Network is sustained for the minutes a peak lasts: check the instance's baseline, not its "up to" figure. A VPC gateway endpoint keeps S3 traffic off a NAT, which would add $0.045/GB × ~128 TB ≈ $5.8k a month |
+| API (Go, stateless: presign, status polls, metadata) | 60 presigns/s × 1 ms (section 9.1) + assumed ~900/s of status polls and metadata reads × 0.2 ms | CPU, ~0 | 0.06 + 0.18 ≈ 0.25 vCPU. N = ceil(0.25 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3, one per zone | tiny: the zone rule sets the count, not load (4 % busy); upload bytes never come here, which is the point of presigning |
+| Postgres (`images`, `blobs`) | ~12 image rows/s (60 peak) × 3 writes ≈ 180 commits/s at peak; 300 MB/day ≈ 110 GB/year (+ ~20 GB index) | none (small), then memory | ≈ 2 IOPS per commit (assumption) ⇒ ~360 + ~300 misses ≈ 700, under `gp3`'s 3,000 included. Hot set = last week's rows ≈ 2 GB ≪ 8 GiB. CPU ≈ 0.25 vCPU of 2. 200 GB `gp3` covers year one | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ | 1 primary + standby | the smallest non-burstable node already has 4× the memory the hot rows need; no `r`, no extra IOPS. Old rows are read only for an owner's gallery |
+
+Nothing to size: **S3** (peak ~60 PUT/s from clients + ~180/s from workers and ~500/s of CDN misses, all far under ~3,500 PUT/s and ~5,500 GET/s per prefix; `images/{sha}/` spreads keys), **CloudFront** (the egress in the bill below), and **SQS** (≈ 2M messages a day, because the S3 event and `/complete` both enqueue; × 3 requests × 30.4 days × $0.40/M ≈ $70). Stored per image ≈ 2 MB original + 0.2 MB medium + ~0.02 MB thumbnail ≈ 2.2 MB, so ≈ 2.2 TB/day ≈ 810 TB after one year (section 4's 730 TB counts originals only; dedup would trim it 20–40 %).
+
+**Rough monthly bill (≈, on-demand; storage priced at month 12, ~810 TB held)**
+
+| Line | ≈ $/month |
+|---|---|
+| CloudFront data out: 20 TB/day × 30.4 = 608 TB × $0.085 (first-tier price; volume tiers lower it) | $51,700 |
+| S3 Standard: 810 TB × $0.023 (grows ≈ $1.5k each month) | $18,600 |
+| Workers: 3 × `c7g.2xlarge` (3 × $212), less on Spot | $640 |
+| API: 3 × `c7g.large` ($159) + ALB (≈ $30) | $190 |
+| Postgres: `db.m7g.large` ≈ $120, Multi-AZ doubles; 200 GB gp3 × 2 = $32 | $270 |
+| SQS | $70 |
+| **Total** | **≈ $71,500** (≈ $71,100 with 1-year commitments: the $1,040 of servers hardly moves it) |
+
+Not counted (off the sheet, from memory): CloudFront request fees on ~3B views a month and S3 request fees on ~120M PUTs, each a few $k at most.
+
+- **Biggest line and why:** CloudFront data out (72 %), then S3 storage (26 %). Everything with an instance is 1.6 %. CloudFront bills the bytes it sends to viewers whether the CDN hit or missed, and S3 to CloudFront is free, so on AWS the CDN hit rate (section 10) lowers origin load, not this line. The levers are bytes per view (WebP, smaller `m` variant), a committed-use contract, and for storage tiering originals to infrequent access and dedup.
+- **What changes at 10×:** 600 uploads/s ⇒ 120 vCPU ⇒ N = ceil(120 ÷ 4.27) = 29 → 30 × `c7g.2xlarge` (≈ $6.4k, a lot less on Spot), still 0.67 Gbit/s per node; Postgres at ~1,800 commits/s ⇒ `db.m7g.2xlarge` with ~4k IOPS. Neither is the problem: data out ≈ 6 PB a month (≈ $0.5M at first-tier price) and ≈ 8 PB stored after a year (≈ $186k a month at the anchor) make bytes, tiering and CDN contracts the whole business.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two kinds of data. Bytes: ~2.2 MB stored per image (original, medium, thumbnail) ≈ 2.2 TB/day and ≈ 810 TB after a year, immutable once written and served by a CDN (sections 4, 15). Metadata: ~12 rows/s (60/s at peak), ~300 B each ≈ 110 GB a year, ~180 commits/s at peak.
+- Bytes are fetched whole by key (`images/{sha}/{variant}`). Metadata is fetched by primary key plus one range (`owner_id, created_at DESC`), and dedup is "does this `sha256` exist, then bump `ref_count`".
+- Only the metadata needs transactions (an `images` row and `blobs.ref_count`).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✔ as the system of record for metadata, ✖ for the bytes | `images` and `blobs` use primary-key lookups, the gallery index, a `ref_count` under a row lock and `variants JSONB` read whole. Putting the bytes in `bytea` would push ~2.2 TB/day through the WAL, backups and the standby, and 810 TB is more than two orders of magnitude above the "few TB" one primary is sized for (cheat sheet) |
+| MySQL (RDS / Aurora) | ✔ as the system of record for metadata, ✖ for the bytes | the metadata uses only portable features, so the verdict matches Postgres; `BLOB` columns have the same problem as `bytea` at this size |
+| DynamoDB | ✔ works for metadata, no reason to add it; ✖ for the bytes | ~300 B items and 60 writes/s are nowhere near its limits, the gallery would be an index and `ref_count` an atomic counter, but it replaces a ~$270 a month line (section 15) with a second data model; originals of up to 20 MB are far over its 400 KB item limit |
+| S3 | ✅ chosen for the bytes | one immutable object per variant, the CloudFront origin (S3 to CloudFront transfer is free, section 15); well under the per-prefix 3,500 PUT / 5,500 GET per second; presigned PUTs keep the bytes off our servers (section 9.1); lifecycle rules expire `uploads/` after a day and tier originals |
+
+**Pick:** S3 for the bytes (~810 TB after a year, the second line of section 15's bill) and PostgreSQL on RDS Multi-AZ (`db.m7g.large`, 200 GB `gp3`) for the metadata. Bytes are immutable objects behind a CDN; metadata is a small relational table whose one consistency need is `ref_count`. S3 holds the record of the image (the re-encoded original `o`; medium and thumbnail can be regenerated from it), Postgres holds ownership and status, and the CDN cache is derived.
+
+**If it were MySQL instead:** nothing material. `JSONB` becomes `JSON` (read whole, never queried inside); the blob upsert `ON CONFLICT (sha256) DO UPDATE SET ref_count = ref_count + 1` becomes `ON DUPLICATE KEY UPDATE ref_count = ref_count + 1`; a decrement-and-check in one statement (`RETURNING`) becomes an `UPDATE` then a `SELECT` in the same transaction; `TEXT` keys become `VARCHAR(n)` or `CHAR(64)`. At 12 inserts/s the page splits of a random `sha256` primary key in InnoDB are invisible.
+
+**What would flip the choice:** the bytes never move to a database. The metadata flips on a requirement, not a number: at 10× it is ~1,800 commits/s, still one `db.m7g.2xlarge` (section 15); uploads that must be accepted in several regions at once are where per-key ownership (DynamoDB) becomes attractive. The cost levers are S3 tiering and dedup (20-40 %), not another engine.

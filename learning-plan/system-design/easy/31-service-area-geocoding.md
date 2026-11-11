@@ -346,3 +346,60 @@ type Geocoder interface {
 - **Tax place from the address:** the area/tax-jurisdiction link honeydolist stores on towns, as input to [30](30-invoicing.md).
 - **Nearest-merchant search at 100k+/s:** shard cells by region, keep them in memory, rebuild from the database.
 - **Abuse analytics:** per-key spend dashboards and anomaly alerts on lookups per IP.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4 and 9.4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Location API (Go, stateless; also proxies autocomplete) | 6k lookups/s (§4) + ~4.6k autocomplete calls/s (§9.4: 20M entries × ~4 calls ÷ 86,400 × 5) | CPU | lookups 6k × 0.3 ms = 1.8 vCPU; autocomplete 4.6k × 0.5 ms (half answered from the prefix cache, half proxied over TLS) = 2.3; road-distance worker 0.35 (below); total ≈ 4.5 vCPU. N = ceil(4.5 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.1) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | JSON, TLS and a Redis call are all CPU; memory is ~1 GiB of heap plus a ~300 MB in-process cache of hot addresses, so `c` not `m`. 37 % busy at peak, 56 % with a zone down |
+| Redis (address cache + autocomplete prefixes) | ~13k ops/s (6k lookup GETs + 4.6k prefix GETs + ~2.3k prefix SETs); 20M addresses × 300 B = 6 GB (§4) | memory | 6 GB × ~1.7 overhead = 10.2 GB; prefixes ≈ 1M × 1 KB × 1.7 = 1.7 GB; total ≈ 12 GB; `maxmemory` ≤ 70 % ⇒ ≥ 17 GiB of RAM; 13k ops/s is ~13 % of one core's ~100k | `cache.r7g.xlarge` (4 vCPU / 32 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory-bound, so `r` (8 GiB per vCPU); `r7g.large` has 16 GiB, just under the 17 the data needs; CPU idles, so a second shard only when memory or ops double |
+| Postgres primary (places, lookups, routes, areas) | ~290 geocode results/s + ~350 route rows/s (5M and 6M rows a day × 5 ÷ 86,400); ≈ 27 GB | neither (sized for availability) | (290 × 2 rows + 350) × ~2 IOPS ≈ 1,900 IOPS < gp3's 3,000 included; size: 6 GB places + 2 GB lookups + 11 GB routes (6M × 30 d × 60 B, no repeats) + 0.6 GB cells, +35 % indexes | `db.m7g.xlarge` (4 vCPU / 16 GiB), RDS Multi-AZ | 1 + synchronous standby | writes are tiny, so no `i` family or `io2`; 16 GiB keeps the indexes warm; the standby is for the zone loss |
+| Postgres read replicas (PostGIS `ST_Covers`, place and route reads) | `ST_Covers` 6k/s × ~0.5 ms = 3 vCPU (§4, simple polygons); Redis misses ≈ 300 reads/s | CPU | survivors ≤ 80 %: one replica alone is 3 ÷ 4 = 75 %, so 2 replicas; polygons (5,000 × ~100 KB = 0.5 GB) + GiST + hot places fit in 16 GiB | `db.m7g.xlarge` (4 vCPU / 16 GiB), RDS read replicas | 2, one per zone | geometry tests are CPU, so `m` (4 GiB per vCPU), not `r`; 38 % busy with both up, 75 % with one zone down; go to `2xlarge` if polygons cost more than 0.5 ms |
+
+The road-distance worker (6M route calls/day ÷ 86,400 × 5 ≈ 350/s × ~1 ms, mostly waiting on the provider) is a second process on the API nodes, fed by SQS (6M messages/day, batched by 10). Provider traffic leaves through NAT: ~51M calls/day (5M geocode + 40M proxied autocomplete + 6M route) × ~3 KB ≈ 150 GB/day. S3, the CDN and GPUs: nothing to size.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Redis: 2 × `cache.r7g.xlarge` (2 × ≈ $310) | $620 |
+| Postgres primary: `db.m7g.xlarge` ≈ $240 managed, Multi-AZ doubles | $480 |
+| 2 read replicas: `db.m7g.xlarge` (2 × $240) | $480 |
+| gp3: 4 volumes × 100 GB (primary, standby, 2 replicas), IOPS inside the free 3,000 | $30 |
+| NAT: 3 gateways ($99) + 4.6 TB processed × $0.045 | $310 |
+| Data out to the provider: ~1 KB per call × 51M × 30 = 1.5 TB × $0.09 | $140 |
+| ALB: $16 + ~11 LCU (2.1k req/s average × 1.5 KB ≈ 11 GB/h) × $0.008 × 730 | $80 |
+| SQS: 1.8M requests/day × 30 × $0.40 per million | $20 |
+| Geocoding provider: 5M calls/day (95 % cache hits) × $0.005 × 30 | $750,000 |
+| **Total** | **≈ $752,500** (≈ $751,800 with a 1-year plan on the ≈ $1,900 compute baseline: a rounding error) |
+
+- **Biggest line and why:** the provider, 99.7 % of the bill. All the AWS hardware is ≈ $2.5k a month, because §4 already says it: the cost is the paid call, not CPU. Each point of cache hit rate is 1M calls × $0.005 = $5k a day ≈ $150k a month; at 70 % hits the same line is $4.5M. Normalisation, debounce, sessions and a shortlist-only road API move the bill; a bigger instance does not. Route and autocomplete calls are extra (§4 gives no price or hit rate): each 1M uncached calls a day adds ≈ $150k a month at the same assumed $5 per 1,000.
+- **What changes at 10×:** 1B lookups a day, 60k/s peak. API: 18 + 23 + 3.5 = 44.5 vCPU ⇒ N = ceil(44.5 ÷ 2.13) = 21 → 21 × `c7g.xlarge`. Redis: 60 GB × 1.7 = 102 GB ÷ 0.7 ⇒ ≈ 146 GiB ⇒ 3 shards of `r7g.2xlarge` (64 GiB), each with a replica. `ST_Covers` would be 30 vCPU, so move coverage into the API's memory (24M H3 cells ≈ 0.6 GB per node, §4) and leave the replicas only the place and route reads. The provider line becomes 50M calls/day = $250k a day ≈ $7.5M a month: the own-address-database path is the real project. NAT would process ≈ 46 TB (≈ $2k a month): run the API in public subnets with no inbound rules instead.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two kinds of data with opposite shapes. A **cache of the provider's answers** (`geo_places`, `geo_lookups`, `geo_routes`): point reads by key, ~20M addresses ≈ 6 GB, ~290 geocode rows/s and ~350 route rows/s written, rows that must age out at 30 days (section 4, section 15). And **authored data** (`service_areas`): 5,000 merchants' postal lists and polygons, ~0.5 GB of geometry, edited by people.
+- The only non-trivial query is point-in-polygon, `ST_Covers(boundary, point)`, at ~6k/s × ~0.5 ms ≈ 3 cores (section 4), plus a postal-code lookup in a `text[]` and a nearest-merchant ranking.
+- Everything is small: ~27 GB in Postgres (section 15), no write rate near one primary's ceiling. The money is in the provider's calls, not in the database, but that makes the cache tables **expensive to lose**: 20M distinct addresses × $0.005 (the assumed price) = $100k to re-geocode.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL + PostGIS (RDS / Aurora) | ✅ chosen | `geometry(MultiPolygon, 4326)` with a **partial GiST** index (`WHERE is_published AND deleted_at IS NULL`) answers `ST_Covers` in one indexed statement; a partial GIN index on `postal_codes text[]` serves the cheap rule; `jsonb` holds `components`; the `<->` nearest query uses the same GiST index (9.3); one engine, so a polygon edit and its row commit together |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | spatial types and R-tree `SPATIAL` indexes exist, so point-in-polygon is possible, but: no partial index (the published filter runs after the index), a spatial index needs a `NOT NULL` column (the optional `boundary` moves to its own table), no `text[]`/GIN (postal codes become a child table or a JSON multi-valued index), `ST_Contains` instead of `ST_Covers` (points exactly on the edge differ), and SRID 4326 is latitude-first by default, the opposite of the longitude-first `ST_MakePoint` bug that 9.2 warns about |
+| H3 cell sets (`area_cells`) in app memory or Redis | ✔ as a derived index, never the record | ~24M rows ≈ 0.6 GB at resolution 9: a point becomes a cell, a cell becomes area ids in microseconds, no geometry at query time. That removes the database from the path at 10×. It is rebuilt from `boundary`, and on-edge cells fall back to the exact test, so a boundary store is still needed. Portable: `(res, cell, area_id)` is an ordinary primary key in either engine |
+| Redis (ElastiCache) | ✔ as the front cache, ✖ as the record | the address cache (~12 GB with prefixes, section 15) answers 6k lookups/s; but a flush or failover must not turn into $100k of provider calls, so the durable copy stays in Postgres (Redis → Postgres → provider, section 6) |
+| DynamoDB | ✔ for the cache tables, ✖ for areas | `geo_places` and `geo_lookups` are pure key lookups of ~300 B; but its TTL deletes lazily (hours to days), so reads still check `expires_at` (the licence rule, 9.1); there is no polygon-containment query at all, and ~290 writes/s needs no scale-out store |
+
+**Pick:** PostgreSQL with PostGIS on RDS Multi-AZ (`db.m7g.xlarge` primary and two `db.m7g.xlarge` read replicas for `ST_Covers`, section 15), with Redis in front. Deciding properties: PostGIS (geometry type, GiST, `ST_Covers` and `<->` in one engine), the partial indexes of section 8, and `text[]` + `jsonb` on the same rows. System of record: `service_areas` (authored). Derived and rebuildable: `area_cells` (from `boundary`), the Redis cache (from Postgres), and `geo_*` (re-buyable from the provider, but at a price, so backed up).
+
+**If it were MySQL instead:** the same tables with a separate `service_area_polygons` table (`NOT NULL` geometry plus a `SPATIAL` index), a `service_area_postal_codes (area_id, postal_code)` child table with a plain index, and a published-flag check after the spatial lookup. It works at 3 cores of load; what you pay is code that must handle the axis order and edge-case semantics, and a test of the function you use on your exact version. If the H3 path is taken, the choice stops mattering because the hot query leaves the database.
+
+**What would flip the choice:** containment above what the replicas can carry (~6k/s on 3 cores today; the lesson's own 10× answer is 60k/s) means H3 cells in the API's memory (24M rows ≈ 0.6 GB per node), not a different database; polygons that are huge or need unions and drive-time shapes keep you on PostGIS; the cache working set growing 10× (60 GB, section 10) means Redis shards first, and DynamoDB only when "no cache servers to run" matters more than the TTL quirk.

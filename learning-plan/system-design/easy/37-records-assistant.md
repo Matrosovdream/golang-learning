@@ -265,3 +265,56 @@ You cannot review 2M answers a day; you can run 500 questions before every promp
 - **Cost showback:** per-tenant questions, tokens, cost from the gateway's rollups.
 - **Multilingual:** language in the rules, evaluation per language.
 - **Answer quality loop:** weekly review of 👎 and fallbacks → new tools or new ready answers.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| The model | ~115 questions/s × 2.3 calls ≈ 270 calls/s; 5,750 in + 350 out tokens a question | GPU memory if you own it; in practice the provider's tokens-per-minute quota and the bill | peak 115 × 6,100 = ~700k tokens/s ≈ 42M/min; average 23 × 6,100 = ~140k/s, so GPUs bought for the peak are ~20 % busy (avg ÷ peak). 12.2B tokens a day is thousands of times the "few million a day" below which the sheet says an API wins | **hosted model API behind the gateway (36)**; inside AWS, Amazon Bedrock is the managed route; no `g6`/`p` instances | 0 | volume alone no longer decides, but three things keep it hosted: the large model does not fit one `g6` GPU (multi-GPU `p` fleets have no price in the sheet), the 5× peak means paying for idle silicon while an API bills tokens, and the ops (batching, model upgrades). Owning can start to pay for the small-model lookup class (an extension): measure tokens/s per GPU first |
+| Assistant service (Go, stateless, SSE) | 115 questions/s; ~460 open streams (115 × ~4 s, assumed) | CPU (small); mostly waits on the model | 10 ms CPU a question (2.3 streamed gateway calls, NFKC, result lines, SSE framing) × 115 = 1.15 vCPU; memory 460 × ~50 KiB ≈ 25 MiB. N = ceil(1.15 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(1.08) = 2 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | three for availability, not load: 19 % busy normally, 29 % with a zone down; `c` not `m` because memory use is megabytes |
+| Tool queries | 150/s on read replicas | memory (the product's hot set), not CPU | 150 ÷ ~10,000 indexed reads/s (sheet) = 1.5 % of one replica | the product's existing read replicas (RDS/Aurora replicas): no new instance | 0 | the 2 s statement timeout and the per-tenant concurrency cap, not hardware, protect the replica from a user-triggered slow query |
+| Postgres (threads + question log) | 115 thread rewrites/s (~30 KB jsonb) + 115 log inserts/s | memory (hot threads), then disk space | ~3.5 MB/s of rows; ≈ 2 IOPS per commit ⇒ ~460 IOPS, under gp3's 3,000; hot set ≈ 10 % of 1M daily threads × 30 KB = 3 GB of 30 GB live; log 1.1 TB a year + ~30 % indexes ≈ 1.5 TB | `db.r7g.large` (2 vCPU / 16 GiB), RDS Multi-AZ | 1 + synchronous standby | the hot set fits RAM with room for the log's index tail; CPU ≈ 0.15 of 2 vCPU; old log partitions can move to S3 later |
+
+The gateway (36) and the search prefetch (39) are sized in their own lessons.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Assistant service: 3 × `c7g.large` (3 × $53) | $159 |
+| Postgres: `db.r7g.large` ≈ $156, Multi-AZ doubles | $312 |
+| gp3 1.5 TB: 1,500 × $0.08 = $120, ×2 for the standby | $240 |
+| NAT ×3 ($99) + 1.5 TB processed ($67) + 1.4 TB out to the provider at $0.09 ($126) | $292 |
+| ALB | $20 |
+| **Hosted model API** (§4: $26,370 a day with the cached prefix × 30.4 days) | $801,600 |
+| **Total** | **≈ $802,600** (≈ $802,500 with a 1-year Savings Plan on the compute; the model line is not discounted by it) |
+
+- **Biggest line and why:** the model API, 99.9 % of the bill; servers and database together are ≈ $1,000. A tiny-hardware lesson whose cost sits in third-party calls. Levers are all in 9.4: fewer calls (prefetch: 3 → 2), the cached prefix (without it $45k a day ≈ $1.37M a month), a small model for simple lookups, per-tenant budgets (36).
+- **What changes at 10×:** 20M questions/day ⇒ 1,150 q/s ⇒ 11.5 vCPU ⇒ N = ceil(11.5 ÷ 4.27) = 3 × `c7g.2xlarge`, ~4,600 streams (still ~230 MiB). Postgres: 35 MB/s of thread rewrites and ~2.3k IOPS (near gp3's 3,000), 11 TB of log a year, so thread state moves to a cheaper store and old partitions to S3. What runs out first is the provider quota (~420M tokens/min at peak) and a ≈ $8M monthly bill; at that spend, pricing a self-hosted small model for the lookup class is worth a measured test.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The model is a hosted API, so the database holds only the assistant's own rows: one thread row rewritten per question (a ~30 KB `messages` blob, ~115 rewrites/s at peak, ~30 GB live, emptied a day after the last question) and one log row per question (115 inserts/s, ~3 GB/day, ~1.1 TB a year, partitioned by `created_at`); sections 4 and 8.
+- The tools' own reads (~150/s at peak) are ordinary indexed point and list queries on the product's read replicas: no new access pattern, no join across the assistant's tables, no transaction wider than one row (the `saves` compare-and-set).
+- What picks the engine's features is isolation: one tenant's and one user's data must never mix. It is enforced in the tool first (9.1) and, if the database can, below the tool as a second lock.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | native **row-level security** is the "second lock" of 9.1: `CREATE POLICY … USING (tenant_id = current_setting('app.tenant_id')::bigint)` with `SET LOCAL app.tenant_id` inside each tool transaction, so a tool with a forgotten `WHERE` still sees only its tenant (the app role must not own the tables or hold `BYPASSRLS`, because owners and such roles skip policies unless `FORCE ROW LEVEL SECURITY` is set); `jsonb` keeps the model's turns verbatim; the log's range partitions are dropped by month; same engine as the product replicas the tools already query |
+| MySQL (RDS / Aurora) | ✔ works, without the backstop | threads and log are portable: a `JSON` column, `UPDATE … WHERE saves = $n`, `RANGE` partitions on `created_at` (the key `(created_at, id)` already contains the partition column). **MySQL has no native row-level security**: tenant and ACL scoping live only in the tool code and a shared query helper that always adds `tenant_id = ?`, kept honest by tests; nothing in the engine stops a tool that forgets it |
+| DynamoDB | ✖ for the log, ✔ for threads only | a thread is read and written by id (~30 KB against the 400 KB item limit) and TTL can empty it, but 115 writes/s does not justify a second store, and the log is read by tenant and time and by outcome for the thumbs-down and fallback review (9.2, 14): ad-hoc queries |
+| Redis (ElastiCache / MemoryDB) | ✖ as the record, ✔ as a thread cache | 30 GB of live threads would have to sit in RAM (about one `r7g.2xlarge`, 64 GiB) where Postgres needs a ~3 GB hot set (section 15), and a lost thread breaks follow-ups |
+| S3 + Athena | ✔ for aged-out log partitions | old months detach from Postgres and move to S3 (section 15) and are queried rarely; not for live threads |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (the `db.r7g.large` of section 15) for threads and the question log, and the product's existing replicas for tool reads. The deciding properties: native row-level security as the in-database second lock, `jsonb` plus a `saves` compare-and-set for verbatim thread turns, and a partitioned log you retire by dropping a partition. System of record: the product's own tables (the assistant only reads them); threads are disposable after a day; the question log is the durable record; the search prefetch ([39](39-global-search.md)) is a derived index.
+
+**If it were MySQL instead:** tables and tool code are unchanged apart from `JSON` and `AUTO_INCREMENT`. What disappears is the database-side backstop, so the "same question as two roles" permission set of 9.5 plus a test that every tool query carries the tenant filter become the only guard for isolation. That is a real loss for a lesson whose one hard rule is "no leakage by construction", but not a design change.
+
+**What would flip the choice:** writes and size, not features. At 10× the thread rewrites reach ~2.3k IOPS, close to gp3's 3,000 (section 15), and the log reaches 11 TB a year: move thread state to a cheaper key-by-id store (DynamoDB with TTL, or Redis) and old log partitions to S3, keeping recent months in PostgreSQL.

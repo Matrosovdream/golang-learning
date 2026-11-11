@@ -281,3 +281,52 @@ Make tuning safe: bounds on save (a typo of `1` a minute locks out everyone; `0`
 - **Shadow mode:** log "would have refused" for 24 h before enforcing a new limit.
 - **SMS/OTP pumping:** endpoints that trigger paid messages need hard per-destination caps and country allowlists.
 - **Global limits across regions:** approximate counting and token leasing (hard track: global rate limiter).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API write tier (Go: traps, limiter client, scorer, form handler) | ≈ 1,000 write requests/s; with 40 % bots 340/s die in the traps and 660/s go on | CPU (scoring is ≈ 58 % of it) | trap 50 µs (section 4) + ~50 µs HTTP and `ClientIP` = 0.1 ms: 1,000 × 0.1 = 0.1 vCPU; limiter peek + record 660 × 1 ms = 0.66; score 660 × 3 ms = 1.98; form handler 660 × 1 ms = 0.66; total 3.4 vCPU. N = ceil(3.4 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.6) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) behind the reverse proxy | 3, one per zone | Link, domain and repeat checks plus one Redis round trip are CPU, so `c`. 28 % busy, 43 % with a zone down. The quiet botnet is the real load: 16.7k/s more, of which 14.2k/s die in the trap (1.4 vCPU) and 2.5k/s pass and cost ≈ 5 ms each (12.8 vCPU) ⇒ 17.6 vCPU ⇒ N = 9 while it lasts, scaled on the trap-rate alarm |
+| Redis (limiter counters) | 4,000 ops/s (1,000/s × 2 policies × peek + record); 10M active keys × ≈ 100 B ≈ 1 GB | memory, but small | 1 GB × ~1.5 overhead = 1.5 GB; `maxmemory` ≤ 70 % ⇒ ≥ 2.2 GB of RAM; 4k ops/s (9k if the botnet's passers are counted) against ~100k per core | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache | 1 primary + 1 replica in another zone | The smallest non-burstable 2-vCPU shape; `m`, not `r` (no need for 16 GiB). The replica is for fast failover: the limiter fails open and a lost key is a fresh start. Keep it on write endpoints only: on all 100k req/s it would be ≈ 200k ops/s, two cores' worth (section 4) |
+| Postgres (`is_spam`, `spam_score`, `ip_hash`, `settings`) | 660k stored rows/day ≈ 7.6/s; settings reads 40/s; flagged rows 73 MB/day, 2.2 GB over 30 days | nothing here | extra columns ≈ 40 B a row ≈ 26 MB/day, two partial indexes, 40 reads/s: noise next to task 16's database | the form database of [16](16-public-form-intake.md) (`db.m7g.xlarge`, Multi-AZ); no new instance | 0 | The spam verdict is a column beside the pipeline, not a system; the 30-day purge keeps it at ≈ 2.2 GB |
+
+Not sized here: the CDN/WAF, because section 3 puts volumetric defence out of scope. 100k req/s is 8.64 B requests a day, ≈ 260 B a month; at any per-request fee that is far larger than every line below, and it is the platform's edge, not this design's cost. The 200 nodes in section 4's settings math are the whole site's fleet; the write tier above needs 3.
+
+**Rough monthly bill (≈, on-demand; without the CDN/WAF and without task 16's database)**
+
+| Line | ≈ $/month |
+|---|---|
+| API write tier: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Limiter Redis: 2 × `cache.m7g.large` (2 × $120) | $240 |
+| ALB: $16 + ≈ 7 LCU-hours average (≈ 2 MB/s ≈ 7 GB/h) × $0.008 × 730 | $60 |
+| Egress: 1,000/s × ~0.3 KB replies ≈ 0.8 TB a month × $0.09 | $70 |
+| **Total** | **≈ $690** (≈ $490 with 1-year commitments on the compute lines) |
+
+- **Biggest line and why:** the three API nodes (≈ 46 %), and they are mostly idle: 28 % busy at 1,000 writes/s, three being the floor for three zones; the 9-node botnet case is paid only while the attack lasts. The honest answer is tiny hardware. The real costs sit outside this bill: the CDN/WAF's per-request fees, and people, since 48,600 flagged rows a day need a human verdict and 600 of them are real customers.
+- **What changes at 10×:** 1M req/s at the edge ⇒ 10k write requests/s ⇒ 34 vCPU if scored in-process ⇒ N = ceil(34 ÷ 4.27) = 8 → 9 × `c7g.2xlarge`; scoring is ≈ 20 of those 34 vCPU, so it moves to an async scorer pool behind a queue (section 10) and the clean majority never waits for it. Redis: 40k ops/s is still under one core, but keys grow to ≈ 100M ⇒ ≈ 15 GB ⇒ ≈ 21 GiB of RAM ⇒ `cache.r7g.xlarge` (32 GiB), the first time memory picks the family. The shared limiter on all traffic would be 2M ops/s, which is why reads keep a per-pod coarse limiter.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The hot path has no database. Limiter state is a counter with a TTL per key: 10M active keys ≈ 1 GB and ~4,000 ops/s on the write endpoints (section 4). It fails open, and a missing key is a fresh start (section 8).
+- The database holds only the verdict: three columns on `submissions` (`is_spam`, `spam_score`, `ip_hash`, ≈ 40 B a row) for 660k stored rows a day (≈ 7.6/s), of which ≈ 48,600 are flagged (7.4 %, 73 MB a day), plus a `settings` table of a few rows read ~40 times a second.
+- Queries stay on the lead's own table: the inbox (`NOT is_spam`), the Spam chip (`is_spam`), and mark/unmark that restores the old status exactly. Settings need an optimistic `version` check.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for verdicts and settings, ✖ for the counters | the lead database of task 16, no new instance; `ADD COLUMN is_spam boolean NOT NULL DEFAULT false` is a metadata-only change; the partial indexes `… WHERE is_spam AND deleted_at IS NULL` keep the Spam-chip index to the ≈ 7 % flagged rows; `jsonb` setting values with a `version` column. As the limiter store it would mean ~4,000 counter updates a second and a TTL-delete job on the database that holds the leads |
+| MySQL (RDS / Aurora) | ✔ works | `INSTANT` add-column does the same job as the constant default; no partial indexes, so the chip uses `(is_spam, created_at DESC, id DESC)` and the inbox `(form_id, is_spam, created_at DESC, id DESC)` over every row (≈ 14× the entries of the partial chip index, still small); `JSON` setting values. The same ✖ as the limiter store |
+| Redis (ElastiCache / MemoryDB) | ✅ chosen for limiter state | one round trip per check, a TTL per key equal to the window, 1 GB fits any node; the data is disposable because the limiter fails open, so ElastiCache, not MemoryDB |
+| DynamoDB | ✔ for counters, ✖ for verdicts | atomic `ADD` plus a TTL attribute give fixed-window counters, but update expressions have no min/max, so a token bucket needs read-modify-write retries, and each check is a slower network call than Redis; verdicts belong in the lead's own row so *Not spam* restores it exactly |
+
+**Pick:** Redis (`cache.m7g.large`, primary + replica) for the counters; PostgreSQL (task 16's `db.m7g.xlarge`, Multi-AZ) for the verdict columns and settings. Postgres is the system of record here; Redis state is derived and disposable (fail open, a lost key is a fresh start). The only Postgres-specific feature used is the partial index, and a composite index replaces it.
+
+**If it were MySQL instead:** the same columns and logic; the two partial indexes become the composite indexes above, and the settings value is `JSON`. Nothing material otherwise. If task 16's lead database is MySQL, this lesson adds nothing that would need a different engine.
+
+**What would flip the choice:** the limiter outgrowing one Redis core (~100k ops/s; section 15's all-traffic case is ~2M ops/s) means cluster mode or per-pod coarse limiters, still Redis. Spam labels growing into billions for classifier training means exporting them to S3 and Athena or ClickHouse, not changing the OLTP store.

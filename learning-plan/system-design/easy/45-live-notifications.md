@@ -310,3 +310,65 @@ Losing a node returns 250k clients to the load balancer. The seed's `retry: 3000
 - **Per-user notification rate limit** and smart batching ("12 new comments") before the router, to protect users and the bus.
 - **Multi-region gateways:** where is a user's connection, and how does a publish find it across regions?
 - **Digest ranking:** which 5 of 200 unread items go in the morning email?
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Gateway nodes (Go, SSE) | 5M concurrent streams, 200k deliveries/s, 5M ÷ 30 s = 170k heartbeats/s (§4) | memory (connections), not CPU | 250k connections per node once a zone is lost × ~20 KB = 5 GB (§4); × 1.5 GC headroom = 7.5 GB + ~1 GiB OS ≈ 8.5 of 16 GiB. CPU then: (10k deliveries + 8.3k heartbeats)/s × 30 µs = 0.55 vCPU, plus a zone-loss reconnect surge 1.67M ÷ 30 s ÷ 20 nodes = 2.8k/s × 0.2 ms = 0.56 ⇒ 1.1 of 2 vCPU | `r7g.large` (2 vCPU / 16 GiB, $78) in an Auto Scaling group | 30 (10 per zone) = 5M ÷ 250k = 20, × 1.5 (§4) | ~8 GiB of RAM for ~1 vCPU of work is the `r` ratio; `c7g.2xlarge` has the same 16 GiB but 8 vCPU we would never use, at 2.7× the price ($212 vs $78); fewer, bigger nodes only make a node loss a bigger reconnect storm (9.5). 167k connections per node normally, 250k after a zone loss |
+| Load balancer (TLS and HTTP/2 end here, §6) | 5M active connections, 60 MB/s, 8.3k new connections/s in a storm (§4) | the LB's per-connection billing and limits | LCUs per hour = the largest of: connections 5M ÷ 3,000 = 1,667; bytes 216 GB/h ÷ 1 GB = 216; new connections 8.3k ÷ 25 = 333. Connections decide: ≈ 1,667 LCU at the peak | ALB; an NLB passing TLS through bills per ~100k connections (far cheaper) but puts TLS on the gateways: more CPU and ~+25 KB per connection (not in the sheet, verify) | 1, spans 3 zones | the LB, not the servers, is where 5M connections cost money: 1,667 LCU × $0.008 × 730 ≈ $9.7k a month at the peak. Each client stream is one LB-to-node TCP connection, so 250k sockets per node need at least 4 LB source IPs per node (64k ports each); the ALB adds IPs as it scales, but confirm with AWS before 5M |
+| Bus (NATS core, subject per user) | 200k publishes/s × ~300 B = 60 MB/s; 5M subscriptions (§4, 9.2) | memory (subscription table), then network | assume ~500 B per subscription × 5M = 2.5 GB on every server (each learns all interest) × 1.5 = 3.75 of 8 GiB. Traffic: 60 MB/s in × ~2.7 copies (in, route hop 2/3, out) ≈ 160 MB/s ≈ 1.3 Gbit/s cluster, 0.43 per node; CPU 200k × 2.7 × 3 µs ≈ 1.6 vCPU in all | `m7g.large` (2 vCPU / 8 GiB), self-run (no AWS-managed NATS; sharded ElastiCache pub/sub is the AWS-native stand-in, not priced) | 3, one per zone | the subscription table needs ~4 GiB, so `m` (8 GiB), not `c` (4 GiB) and not `r` (16 GiB unused); with a zone down 2 nodes carry 0.8 vCPU each of 2 (40 %) |
+| Router, outbox relay, push and escalation workers (Go) | 10k events/s × ~20 recipients = 200k recipient resolutions/s (§4, 9.4); push assumed 2k/s | CPU | 200k × 15 µs (cached audience, prefs, publish) = 3 vCPU; 10k × 0.1 ms = 1; push 2k × 0.5 ms (TLS to the vendor) = 1 ⇒ 5 vCPU; N = ceil(5 ÷ 2.13) = ceil(2.35) = 3 | `c7g.xlarge` | 3, one per zone | stateless CPU work; the audience cache is a few MB in process, so `c` |
+| Postgres (inbox, prefs, watchers, outbox) | 20k stored items/s peak, 5k average; 1.9 TB for 30 days, ~2.7 TB with 3 indexes (assumption) (§4) | IOPS (random index pages), then storage | ≈ 3 IOPS per stored item (3 indexes on random users, data ≫ RAM; assumption) ⇒ 20k × 3 = 60k IOPS; gp3 stops at 16k. io2 would be 60k × $0.065 + 3 TB × $0.125 ≈ $4,300 per copy, $8,550 Multi-AZ. CPU 20k × 0.1 ms ≈ 2 vCPU | `i4i.4xlarge` (16 vCPU / 128 GiB / 3.75 TB NVMe, ≈ $1,000), self-managed Postgres; managed: Aurora PostgreSQL or RDS on io2 | 1 primary + 2 replicas, one per zone | past ~16k IOPS the sheet says NVMe: 2.7 TB fits (72 %) and local IOPS are far above 60k, for $3,000 instead of $8,550+. NVMe dies with the instance, so the two streaming replicas are the durability, and they serve `GET /inbox` and replay |
+| Redis (session and audience caches) | handshakes 8.3k/s in a storm, audience lookups; ~30k ops/s (assumption) | memory | ~3 GB of sessions and audiences (assumption) × 1.7 overhead = 5 GB; `maxmemory` ≤ 70 % ⇒ ≥ 7.3 GiB; 30k ops/s is under one core's ~100k | `cache.r7g.large` (2 vCPU / 16 GiB, ≈ $156) | 1 primary + 1 replica | memory per core: `r`; a miss costs a database read, so no bigger |
+
+Egress is the other place connections cost money. Deliveries: 60 MB/s at peak, but the average is ~25 % of it (the lesson's 5k vs 20k stored items), so ~15 MB/s ≈ 38.9 TB a month. Heartbeats: 5M ÷ 30 s at ~100 B on the wire (SSE frame, HTTP/2, TLS, TCP/IP; assumption), with average concurrency half the peak: 2.5M ÷ 30 × 100 B = 8.3 MB/s ≈ 21.6 TB a month. The keep-alive costs half as much as the content, so its cadence is a cost lever.
+
+**Rough monthly bill (≈, on-demand; average concurrency 2.5M, deliveries 25 % of peak)**
+
+| Line | ≈ $/month |
+|---|---|
+| Gateways: 30 × `r7g.large` (30 × $78) | $2,340 |
+| Bus: 3 × `m7g.large` (3 × $60) | $180 |
+| Router and workers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Postgres: 3 × `i4i.4xlarge` (3 × $1,000) | $3,000 |
+| Redis: 2 × `cache.r7g.large` (2 × $156) | $310 |
+| ALB: 2.5M ÷ 3,000 = 833 LCU × $0.008 × 730, + $16 | $4,880 |
+| Egress, deliveries: 38.9 TB × $0.09 | $3,500 |
+| Egress, heartbeats: 21.6 TB × $0.09 | $1,940 |
+| Cross-zone bus hop: 38.9 TB × ⅔ × $0.02 (clients connect to their own zone's NATS node) | $520 |
+| NAT + Web Push: 3 × $33 + 500 pushes/s × 1.5 KB ≈ 1.9 TB × ($0.09 + $0.045) | $360 |
+| **Total** | **≈ $17,400** (lines sum to $17,350; ≈ $15,200 with a 1-year Savings Plan on the $6,150 of compute) |
+
+- **Biggest line and why:** the network, not the servers. The ALB, egress and cross-zone traffic are ≈ 65 % of the bill and the 30 gateways only ≈ 13 %: 5M open connections are billed per connection and per byte, almost none of it CPU. Levers: heartbeat cadence (every +10 s saves ≈ $480 a month), and at much larger scale an NLB or own L4 tier instead of an ALB.
+- **What changes at 10×:** 50M concurrent ⇒ 300 × `r7g.large` (50M ÷ 250k = 200, × 1.5; ≈ $23k); the ALB would be ≈ 8,300 LCU average, ≈ $49k a month, so move to an NLB with TLS on the gateways; 50M subscriptions is ~25 GB per NATS server, so shard users across NATS clusters; 200k stored items/s ≈ 600k IOPS, so shard the inbox over ~10 NVMe clusters or move it to a TTL store; egress grows ~10× (≈ $54k).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The stored part is the inbox: ~5k items/s on average and 20k/s at peak, 432M rows a day (~65 GB), so 30 days is ~13B rows and 1.9 TB (~2.7 TB with 3 indexes) (sections 4, 15). The hot reads are one user's range: replay `WHERE user_id = $1 AND id > $2 ORDER BY id LIMIT 200`, and the unread list.
+- Writes must be atomic with their neighbours: inbox row, unread counter and outbox row in one transaction ("announced only if committed"), and a grouped insert that folds fifty comments in a minute into one row (section 8, 9.3).
+- Small relational lookups sit on the routing path: prefs, role defaults, watchers and the permission join, batched with `WHERE user_id = ANY($1)` (9.4). The live fan-out (5M streams, 200k deliveries/s) is not the database's job: NATS carries it (9.2).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen (self-managed on NVMe in section 15; Aurora or RDS on `io2` are the managed alternatives) | the grouped insert is one statement because of the partial unique index `inbox_group_key` and `ON CONFLICT (…) WHERE read_at IS NULL DO UPDATE`; the partial `inbox_unread` index holds only unread rows; 16 hash partitions by `user_id` keep a replay inside one partition; `SKIP LOCKED` for the outbox relay |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | the grouping rule needs a generated-column unique index, and there is no partial index for `inbox_unread`, so that index covers all ~13B live rows. In its favour: the clustered key `(user_id, id)` stores a user's items together, so replay and the inbox list are one contiguous range. Missing `LISTEN/NOTIFY` costs nothing, because 9.2 already replaces it with outbox plus NATS |
+| DynamoDB | ✔ for the inbox alone (the 10× move), ✖ for the rest | the inbox is pure key access: partition key `user_id`, sort key `id`, ~150 B items (limit 400 KB), and 20k writes/s over 100M users never nears 1,000 writes/s on a partition; TTL expires the 30 days without the ~5k deletes/s that 9.3 calls vacuum work. Costs: inbox row plus counter become a `TransactWriteItems`, grouping needs its own key design, and prefs, watchers and the permission join stay relational |
+| Redis (ElastiCache) | ✔ as a derived cache (sessions, audiences), ✖ as the inbox | 1.9 TB × 1.5–2 for per-key overhead (cheat sheet) is 3–4 TB of RAM for a 30-day inbox; the unread counter is already atomic with the insert in the inbox database |
+
+**Pick:** PostgreSQL, self-managed on `i4i.4xlarge` (16 vCPU / 128 GiB / 3.75 TB NVMe) with one primary and two streaming replicas in different zones, as in section 15. NVMe because the inbox is IOPS-bound: ~3 IOPS per stored item × 20k/s = 60k IOPS against gp3's 16k cap, and the replicas are both the durability and the readers for `GET /inbox` and replay. The managed alternatives (Aurora PostgreSQL, or RDS on `io2` at ≈ $8,550 a month Multi-AZ against ≈ $3,000 here) trade money for not running it yourself. The deciding features are the partial unique index with `ON CONFLICT … WHERE`, the partial unread index, per-user hash partitions and the same-transaction counter plus outbox. The inbox is the system of record; Redis caches are rebuildable; NATS is at-most-once and recovered through the inbox.
+
+**If it were MySQL instead:**
+- `inbox_group_key` becomes a generated column `open_bucket = IF(read_at IS NULL, bucket, NULL)` with a unique index on `(user_id, entity_type, entity_id, event, open_bucket)` (NULLs do not collide, so read rows drop out of the rule), and the grouped insert is `INSERT … ON DUPLICATE KEY UPDATE count = count + 1`.
+- `inbox_unread` becomes an ordinary `(user_id, read_at, id)` index over all ~13B live rows, not just the unread ones: the largest single cost.
+- `inbox_id_seq` becomes ids minted by the app (task 04), because InnoDB's `AUTO_INCREMENT` must lead an index and the key is `(user_id, id)`.
+- Unchanged: outbox plus NATS, the NVMe-and-replicas shape, a `SKIP LOCKED` relay (8.0), run at `READ COMMITTED`. Gained: contiguous replay reads, and retention deletes are purged instead of vacuumed.
+
+**What would flip the choice:** at 10× (200k stored items/s ≈ 600k IOPS, section 15) the inbox outgrows one NVMe primary: shard it by user across ~10 clusters or move it to a TTL store keyed by user (DynamoDB with TTL), keeping prefs, watchers and permissions in Postgres. At a tenth of the load (2k items/s ≈ 6k IOPS) plain RDS Multi-AZ on `gp3` is enough and the NVMe question disappears. If the team will not run self-managed Postgres, Aurora or `io2` is the price of that, at about three times the storage bill.

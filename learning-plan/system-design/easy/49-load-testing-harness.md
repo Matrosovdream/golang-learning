@@ -319,3 +319,58 @@ floor ignores 2 ms → 4 ms. Two pipelines: a **PR smoke** (short, strict on err
 - **Chaos during load:** kill a replica, add latency to a dependency, and record the recovery curve.
 - **Replay production traffic** (sampled, scrubbed) as a scenario instead of hand-written journeys.
 - **Cost and quota accounting** per team; a fair queue when ten teams want the same shared stage.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). The interesting hardware here is the **generator fleet itself**; the target stack under test belongs to the team that owns it and is not in this bill.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Load generator workers (Go, open-loop arrival loops), one ephemeral fleet per run | largest run: 200k req/s, 100k VUs, 20k in flight, 3.2 Gbit/s of responses | CPU, then NIC and ephemeral ports | section 4's worker: 8 vCPU ÷ 25k req/s = 0.32 ms per request; 200k × 0.32 ms = 64 vCPU flat out. Size to 70 % (the lesson's own "generator saturated, run invalid" line; the 80 % × ⅔ zone rule is for serving users, a run is disposable): N = ceil(64 ÷ (0.7 × 8 = 5.6)) = ceil(11.4) = 12. Memory: 8.3k connections × ~10 KiB + 1.7k in-flight goroutines (20k ÷ 12) × 8 KiB ≈ 0.1 GiB. Network: 267 Mbit/s responses + ~67 Mbit/s requests (0.5 KB each, assumed) | `c7g.2xlarge` (8 vCPU / 16 GiB), started per run (ECS on Fargate in the same shape is the managed route: dearer per vCPU, not priced here) | 12 for the biggest run, 4 per zone; ~39 at the daily peak | CPU decides the count and memory uses 1 % of the 16 GiB, so `c` (2 GiB per vCPU), not `m` or `r`. Graviton: Go cross-compiles, a vCPU is a whole core (the 25k figure is a Graviton figure: re-measure on x86). Not `t`: its credits run out mid-run and a throttled generator silently becomes the bottleneck. Not `c7gn`: 12 nodes at ~0.33 Gbit/s are nowhere near a NIC limit. 8 vCPU keeps a lost worker to 1/12 of the rate |
+| Control API + coordinator (Go; start barrier, histogram merge) | ~600 KB/s of histograms with ~25 runs live (180 KB/s for the largest run alone) | none (idle); availability | merging adds ~3 KB of bucket counts per worker per 10 s: assume 0.1 vCPU in total, N = ceil(0.1 ÷ 1.07) = 1, rounded up to 3 for zones | `c7g.large` (2 vCPU / 4 GiB) on ECS | 3, one per zone | a few small instances, for availability not load. Restartable by design (workers keep to the plan and buffer windows, pushes are idempotent), so no state lives on the box. The observer (target's `pg_stat_statements`, container memory, pprof) runs inside it |
+| Postgres (tests, `load_windows`, baselines) | ~125 window rows/s (25 runs × 50 endpoints ÷ 10 s); 7 GB/day, ~200 GB at 30 days | memory (hot set), then storage | hot set = the last day of windows ≈ 7 GB + indexes ≈ 8 GB: fits in 16 GiB (`shared_buffers` 4 GiB + OS cache). IOPS ≈ 2 per commit (assumption); even if every row committed alone: 125 × 2 = 250, under gp3's 3,000 included. CPU ≈ 0.1 vCPU | `db.r7g.large` (2 vCPU / 16 GiB), RDS Multi-AZ, gp3 300 GB (200 GB data + index and vacuum headroom) | 1 primary + synchronous standby | the cheapest shape that keeps the hot set in RAM: `r.large` is 16 GiB for $78, `m.xlarge` 16 GiB for $120, and we need no CPU. Partition by day so 30-day retention is `DROP PARTITION`, not a huge `DELETE` |
+
+**Fleet and mix** (assumption: the lesson gives only the largest run and the 15 min median). Per day: 400 small runs at 5k req/s (1 worker), 90 medium at 50k (50k × 0.32 ms = 16 vCPU ÷ 5.6 = 2.9, so 3 workers), 9 large at 200k (12), one 4 h soak at 20k (2); each billed 15 min plus ~2 min start-up and wind-down. Worker-minutes: 400 × 17 + 270 × 17 + 108 × 17 + 2 × 242 = 13,710 ≈ 228 worker-hours a day. Peak: 25 runs × 1.56 workers (780 ÷ 500) ≈ 39 workers ≈ 312 vCPU, so request a ~400 vCPU EC2 quota (room for a second large run).
+
+**Traffic is the real cost of a generator.** Replies into EC2 are free, but a request and reply that cross a zone pay $0.01 per GB each way. At 2.5 KB per round trip a large run moves 500 MB/s × 900 s = 450 GB; ⅔ of it crosses a zone when workers and the target's load balancer both span 3 zones: 300 GB × $0.02 = $6, against $0.99 of workers. Workers belong in the target's VPC on private IPs: behind a NAT gateway the same run costs 450 GB × $0.045 = $20.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Workers: 228.5 h/day × 30.4 days = 6,950 h × `c7g.2xlarge` $0.29/h | $2,000 |
+| Worker ↔ target traffic across zones: 19.4 TB/day × ⅔ × $0.02/GB | $7,900 |
+| Control API + coordinator: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.large` ≈ $156, Multi-AZ doubles | $310 |
+| gp3 300 GB × 2 (standby) × $0.08 | $50 |
+| Histograms to the coordinator: 210 GB × $0.09 (worst case, cross-region) | $20 |
+| ALB for the API and UI | $20 |
+| **Total** | **≈ $10,500** (≈ $10,300 with a 1-year commitment on the control plane; the fleet is bursty, so it goes on Spot, not a plan) |
+
+- **Cost per run (workers + traffic):** small ≈ $0.23 ($0.08 + $0.15), medium ≈ $1.75 ($0.25 + $1.50), a 200k req/s run ≈ $7 ($0.99 + $6.00), the 4 h soak ≈ $12 ($2.34 + $9.60); average ≈ $0.65 over 500 runs ($325 a day).
+- **Biggest line and why:** cross-zone traffic, ~75 % ($7,900 of $10,460): a generator's whole job is to move bytes. The lever is topology, not instance size: each worker uses the load-balancer address in its own zone (9.3 already says to spread over addresses: do it within the zone first), and if that line all disappears the total is ≈ $2,600. Spot on the 490 small and medium runs (83 % of worker-hours) then takes ≈ $1,000 more off at ~60 % off; keep the nightly gate and the soak on-demand, because a reclaimed worker makes a degraded run and a degraded run proves nothing.
+- **What changes at 10×:** the largest run, 2M req/s (section 10): 2M × 0.32 ms = 640 vCPU ⇒ N = ceil(640 ÷ 5.6) = ceil(114.3) = 115 → 117 × `c7g.2xlarge` (936 vCPU, close to section 10's 120), 32 Gbit/s in total but still ~0.33 Gbit/s per worker. What runs out first is the account's vCPU quota (936 vCPU for one run: ask ahead) and ports, NAT and load-balancer addresses, not the instances; one such run costs 117 × $0.08 ≈ $10 of workers and 3 TB crossing a zone × $0.02 = $60 of traffic. Postgres follows run count, not rate (a histogram's size is endpoints × windows): at 10× the runs it takes 70 GB/day, ~2 TB at 30 days; move to `db.r7g.2xlarge` and archive windows older than a week to S3. Run count ×10 also multiplies the fleet to ≈ $20k and the traffic to ≈ $79k, which is when pinning workers to a zone stops being optional.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- A small relational control plane: targets, tests (`load` and `budgets` as `jsonb`), statements and baselines, ~500 new tests a day, plus one hard rule: at most one active run per target (section 8).
+- The measurements are `load_windows`: one merged histogram (~3 KB `bytea`) per (test, 10 s window, scenario, endpoint), ~125 rows/s, ~7 GB/day, ~200 GB at 30 days (sections 4, 15). A run's series is at most 90 windows × 50 endpoints = 4,500 rows read by `test_id`; percentiles come from adding bucket counts, never from averaging (9.1, 9.3).
+- Raw samples are what the histograms replace: 2.9 GB for one 15-minute run at 200k req/s, about 26 GB a day for the nine large runs alone (section 15's mix).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `load_one_active_per_target` is a partial unique index (`WHERE status IN ('preparing','running','finishing')`), so the database itself refuses a second active run on a target; day partitions make 30-day retention a `DROP PARTITION`; 125 rows/s is a few percent of the few thousand durable writes/s one primary takes, and the ~8 GB hot set fits 16 GiB of RAM |
+| MySQL (RDS / Aurora) | ✔ works, with two workarounds | no partial index: use a generated column that is `target_id` while the status is active and `NULL` otherwise, with a unique index on it (NULLs do not collide). A partitioned InnoDB table cannot have foreign keys, so a day-partitioned `load_windows` loses `REFERENCES … ON DELETE CASCADE` and the retention job cleans up instead |
+| ClickHouse / Timestream | ✖ not needed here, ✔ if raw samples were kept | 125 rows/s is far below what a time-series store is for, and keeping only scalar p95/p99 per window would lose the ability to re-merge windows into a run-level p99 (9.3), so the histogram stays a column. Raw samples (200k a second from one large run) are the workload that would justify it |
+| S3 | ✔ for archives and artifacts, ✖ as the query store | windows older than a week (section 15's 10× plan), pprof profiles, report JSON/Markdown and, if ever kept, raw samples as compressed files per run; the live view and the baseline query need rows by key, not files |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.large`, gp3 300 GB, section 15) for everything the platform stores itself. Two things decide it: the partial unique index enforces the "one run per target" safety rule (9.5), and day partitions bound a table that grows 7 GB a day. The windows are the record of a finished run, since raw samples are never kept; `load_baselines` is derived from them and can be rebuilt while they are retained. S3 holds only archives and profiles.
+
+**If it were MySQL instead:** the generated-column unique key replaces the partial index and the foreign key from `load_windows` goes, so orphan windows are removed by the retention job. `text` columns inside keys (`scenario`, `endpoint`, and `query` in `load_statements`) become bounded `VARCHAR`s, because MySQL cannot index a `TEXT` column in full; `jsonb` becomes `JSON`, `bytea` becomes `BLOB`, identity becomes `AUTO_INCREMENT`. InnoDB's clustered key `(test_id, window_start, …)` makes a run's series one range scan, a small plus that does not decide anything at 4,500 rows per run.
+
+**What would flip the choice:** not size: at 10× the runs (section 15) it is ~70 GB/day and ~2 TB at 30 days, which means a bigger node (`db.r7g.2xlarge`) and windows older than a week archived to S3. The windows (not the control plane) would move to ClickHouse or Timestream if you decide to keep raw per-request samples, or to query months of windows across every team at roughly 100× today's 125 rows/s; the control plane stays in Postgres.

@@ -367,3 +367,53 @@ The review UI is bulk: select 50, accept (rules `source = 'suggested'`, 302 unti
 - **Edge deployment:** compile the snapshot to a CDN worker's KV; how do you keep one source of truth and propagate in seconds?
 - **Redirect monitor:** crawl the top 10k rules daily and alert on chains, loops and targets that now 404 (honeydolist's `redirectcheck` does this for its old domain).
 - **Per-country or per-device rules** and A/B redirects (302, never indexed): what do they do to caching and to crawlers?
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| App nodes carrying the redirect middleware (Go, stateless) | 100k lookups/s worst case, one per request (§4); ~3k/s live-misses ask, ~1k/s Bloom false positives reach the table | CPU for the app's own work; the rules need memory, not CPU | app work 100k × ~0.1 ms (cached page, as in 34) = 10 vCPU; rules add 100k × 0.2 µs (hash + Bloom) + 1k × 20 µs (table probe) + a 20M-entry rebuild ≈ 10 CPU-s per 10 min ⇒ ≈ 0.1 vCPU. N = ceil(10.1 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.4) = 3. Memory per node: index 0.32 GB + Bloom 24 MB, both ×2 while a rebuild swaps, + miss LRU 100 MB + live-path Bloom 60 MB + Space-Saving 15 MB ≈ 1 GB heap, ×1.5 for GC; app heap ~1 GiB; strings page cache up to 2 × 2.6 GB during a swap ⇒ ≈ 8 GiB worst case | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 3, one per zone | 42 % busy, 63 % with a zone down. The packed layout is what keeps this a `c` node: a Go `map` (5 GB × 2 during a swap + GC headroom ≈ 16 GiB) would not fit 16 GiB and would force `m7g.2xlarge` |
+| Postgres (redirects, redirect_changes, miss_daily, url_history) | edits and imports (a few per second; a 2M-rule import in chunks); 3 nodes poll the change log (~1 qps); 4.5 GB of rules (§4) | availability (CPU, IOPS and memory are all small) | table 3 GB + unique index 1.5 GB (§4); `miss_daily` ≈ 120k rows/day × ~150 B ≈ 18 MB/day ≈ 6.6 GB/yr; each node's 10-minute rebuild streams ~2.6 GB, so 3 × 2.6 GB ÷ 600 s ≈ 13 MB/s; a 2M-rule import is ~4M row writes in batches ≈ 1 GB with WAL: minutes, not IOPS-bound | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ | 1 + synchronous standby | 4.5 GB fits in 8 GiB and IOPS are in the tens, so not `r` or `i`; Multi-AZ because rule edits and the 404 review stop when it is down (nodes keep serving their snapshot) |
+
+Redis: ~250 `ZINCRBY`/s (3 nodes × ~5,000 deltas per 60 s push, assumption) on ≈ 200k members × ~100 B × 1.7 ≈ 35 MB is 0.25 % of a core. It should share the platform's Redis: stand-alone, the smallest pair is `cache.r7g.large` ≈ $310 for 35 MB. The CDN carries the only bytes this feature serves: ~1k redirects/s (assumed average) × 0.4 KB + 300 404s/s × ~2 KB (the shared body, gzipped) ≈ 1 MB/s ≈ 2.6 TB a month. S3, queue, GPU: none.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| App nodes: 3 × `c7g.2xlarge` (3 × $212); if the middleware rides on an existing tier the feature adds RAM, not nodes | $640 |
+| Postgres: `db.m7g.large` ≈ $120 managed, Multi-AZ doubles | $240 |
+| gp3: 2 volumes × 100 GB (primary, standby) | $20 |
+| CDN egress: redirects and 404 bodies, ~2.6 TB × $0.085 | $220 |
+| Redis: shares the platform's (stand-alone pair ≈ $310) | $0 |
+| **Total** | **≈ $1,120** (≈ $810 with a 1-year plan on the $880 compute baseline) |
+
+- **Biggest line and why:** the app nodes, 57 %, but they exist to serve pages, not redirects. The feature itself adds ~0.1 vCPU and 5–8 GiB of RAM per node; its own bill is the database and the CDN bytes, ≈ $480. This is honest tiny hardware: the whole design is a memory layout (Bloom + packed table + overlay) that turns 20M rules into a few hundred MB, and the money is not where the design effort is.
+- **What changes at 10×:** 200M rules, 1M lookups/s. App work 1M × 0.1 ms = 100 vCPU + 1 for rules ⇒ N = ceil(101 ÷ 4.27) = 24 → 24 × `c7g.2xlarge`. The per-node rebuild breaks first: 24 nodes × 26 GB ÷ 600 s ≈ 1 GB/s of database reads. Build once centrally, ship the packed file through S3 and rebuild hourly, or move the rules to a small hash-routed tier (3 × `r7g.2xlarge`, 64 GiB). The hot index alone is 3.2 GB × 2 per node, so nodes that keep the rules would be `m7g.2xlarge` (32 GiB).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 20M rules × ~150 B ≈ 3 GB heap + 1.5 GB unique index (section 4). Writes are a few per second plus occasional multi-million-row imports. The database sees ~1 qps of change-log polling and each node's 10-minute rebuild (~2.6 GB streamed); the **100k lookups/s never reach it**, they are answered from the node's Bloom filter and packed table (9.1).
+- A rule write needs real constraints in one small transaction: `UNIQUE (tenant_id, match_kind, from_path)`, same-site `CHECK`s on the target, a recursive walk to refuse loops and long chains (9.2), and the rule plus its `redirect_changes` row committed together (section 8).
+- The 404 stream is ~300/s, 26M/day, 5M distinct paths/day, mostly scanner junk; only the top ~5,000 paths an hour (~120k rows/day) are meant to land in a table (9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `WITH RECURSIVE` with a depth guard checks loops and chain length on write; the `UNIQUE` key and the `CHECK`s (including a regex `!~` on the target) keep bad rules out at the door; `text[]` holds `top_referrers`; `pg_trgm` ranks similar live paths for suggestions (9.5); the whole data set (~4.5 GB) sits in the 8 GiB of a `db.m7g.large` |
+| MySQL (RDS / Aurora) | ✔ works, with small workarounds | recursive CTEs exist in 8.0, so the loop check ports (`bool_or` becomes `MAX(path = ?)`). The `from_path` key needs care: InnoDB caps an index key at 3,072 bytes, so a path of up to 2 KB wants `VARBINARY` or a hash column, and the default collation is case- and accent-insensitive (`/café` and `/cafe` would collide), so use a binary collation. No `pg_trgm`: suggestions use token overlap in Go over the section's live paths. `top_referrers` becomes a `JSON` array |
+| Redis (ElastiCache) | ✅ for the live 404 counters (derived), ✖ as the rule store | `ZINCRBY miss:{day}` on a set capped at ~200k members is ~35 MB and ~250 ops/s (section 15). As the **rule** store it would put a network round trip on every request against the lesson's ≤ 50 µs budget; a shared, hash-routed rules tier is a 10× answer (section 15), not the base design |
+| DynamoDB | ✔ works for rules, no gain | rules are fetched by key and 5 GB is tiny, but the hot path never reads the store, and the change log, a recursive loop check (up to 6 key reads) and the review queue gain nothing from it |
+| Athena or ClickHouse over CDN/access logs | ✔ for exact 404 audit counts, ✖ for the live dashboard | an exact count per path over 5M new distinct paths a day is the ~365 GB-a-year table of section 4; a daily `GROUP BY` over 26M log rows belongs in a columnar store if logs are already shipped (9.3), not in the OLTP database |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.large`, section 15) as the single system of record for rules, the change log, `miss_daily` and `url_history`; **everything on the hot path is derived and rebuildable**: each node's snapshot (Bloom filter, packed table, overlay) is rebuilt from the rules table, and the Redis counters are a live view. The properties that decide it: atomic write of rule and log row, constraints that refuse bad rules at write time, and the fact that the database is off the request path, so no engine speed matters at 100k lookups/s.
+
+**If it were MySQL instead:** the same tables with a binary-collation or `VARBINARY`/hash key for `from_path`, `JSON` for `top_referrers`, `AUTO_INCREMENT` for `seq`, `REGEXP` (or application code) for the target check, and suggestion ranking moved out of SQL. The clustered primary key makes each node's 10-minute rebuild scan sequential, a small win. Material cost: the trigram suggestions and a few key-design pitfalls; the design is otherwise unchanged.
+
+**What would flip the choice:** at 10× (200M rules, 1M lookups/s) the per-node rebuild reads ≈ 1 GB/s from the database (section 15), so build the packed file once centrally and ship it through S3, or move rules to a small hash-routed tier or an edge key-value store; a wish for exact counts of every junk path moves the 404 stream to log analytics, never a row per miss in Postgres (1.5k writes/s, ~365 GB/yr).

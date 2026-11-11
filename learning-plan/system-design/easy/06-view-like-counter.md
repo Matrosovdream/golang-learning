@@ -266,3 +266,58 @@ Display formatting ("1.2M") belongs in the client. Send the integer.
 - **Sharded counters in Postgres** as a pure-database alternative; benchmark against a hot single row.
 - **Fraud signals:** views per IP per video, velocity checks; where in the pipeline do they go?
 - **Like notifications** ("Alice liked your post") via task 12 without touching the like transaction's latency.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API (views, likes, count reads) | 100k views/s + 100k count reads/s (assumed 1 per view, not in section 4) + 5k likes/s peak | CPU | views 100k × 0.1 ms = 10 vCPU; reads 100k × 0.15 ms = 15; likes 5k × 0.5 ms = 2.5; total 27.5 vCPU. N = ceil(27.5 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(6.4) = 7 → 9 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 9, three per zone | parse, rate-limit check, a map increment under a mutex: CPU, and the aggregator map is a few MB, so `c` not `m`. 38 % busy at peak, 57 % with a zone down. 9 nodes (not the 100 of section 4's example) batch even better: ≤ 9 `INCRBY`s per item per second |
+| Redis (view counts, HLLs, like-count cache) | 100k `INCRBY`/s (section 4, worst case: no coalescing) + 100k GET/s = 200k ops/s; assume 100M counters × 100 B = 10 GB + HLLs for the 1M most recent videos × 12 KB = 12 GB | one core, then memory | 200k ops/s ÷ ~100k per core = 2 cores ⇒ at ≤ 50 % busy: 4 shards of 50k ops/s. Memory 22 GB ÷ 4 = 5.5 GB per shard, ≤ 70 % of 16 GiB (11.2 GB) | `cache.r7g.large` (2 vCPU / 16 GiB), ElastiCache cluster mode | 4 shards × (primary + replica in the other zone) = 8 nodes | ops outgrow one core before memory outgrows one node, but an 8 GiB `m` node would sit at 98 % of its `maxmemory` with 5.5 GB per shard, so `r`. Replicas keep the unflushed ≤ 10 s of deltas and avoid a cold start of 100k reads/s on Postgres |
+| Postgres (likes, `posts.likes`, `videos.views`) | 5k like transactions/s peak (avg 1.25k); flush of ~100k touched videos per 10 s ≈ 10k row updates/s (assumed); `liked_by_me` ≈ 2k/s (assumed); year 1 = 39.4B likes × 50 B ≈ 2 TB | IOPS, then CPU | likes 5k × 2 IOPS = 10k; flush 10k row updates/s batched at ~0.5 IOPS each = 5k ⇒ ≈ 15k IOPS ⇒ `gp3` at 16,000 (its cap). CPU: 5k × 0.4 ms + 10k × 0.1 ms + 2k × 0.2 ms = 3.4 vCPU of 8. Hot rows and index pages fit in 64 GiB | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ, `gp3` 2 TB (alternative: Aurora) | 1 primary + synchronous standby | a write-heavy store: IOPS is the wall, at 15k of 16k with no headroom, so beyond this move to `io2` or `i4i` NVMe, or shard likes by `post_id` (section 4 already partitions from day one). 64 GiB because the hot rows and the `views` index must stay in RAM |
+| Flusher (Redis deltas → Postgres, every 10 s) | ~100k keys per cycle | CPU (small) | `GETDEL` pipelined over 100k keys ≈ 0.5 s of client CPU + building batched `UPDATE`s ≈ 0.5 s ⇒ ~1 s per 10 s ≈ 0.1 vCPU | `c7g.large` (2 vCPU / 4 GiB) | 2, one per zone (leader-elected, one active) | availability, not load; Spot would also do, since a reclaimed flusher only delays the flush |
+
+For contrast, the naive `UPDATE … +1` per view is 100k row updates/s ≈ 200k IOPS (`io2`: 200,000 × $0.065 ≈ $13,000 a month for IOPS alone) and still serialises on the hot row (section 9.1). Batching is the cheapest "hardware" in this design. Redis traffic crosses zones for ⅔ of the calls: 200k ops/s × ⅔ × ~100 B ≈ 35 TB a month.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 9 × `c7g.2xlarge` (9 × $212) | $1,910 |
+| Redis: 8 × `cache.r7g.large` (8 × $156) | $1,250 |
+| Postgres: `db.r7g.2xlarge` ($310 × 2 managed = $620), Multi-AZ doubles | $1,240 |
+| `gp3` 2 TB + 13k extra IOPS ($160 + $65), × 2 for the standby | $450 |
+| Flushers: 2 × `c7g.large` (2 × $53) | $110 |
+| ALB: $16 + ~100 LCU (assumed; new connections drive it) × $5.84 | $600 |
+| Cross-zone Redis traffic: ~35 TB × $0.02 (out + in) | $700 |
+| **Total** | **≈ $6,300** (≈ $4,700 with a 1-year commitment on the ~$4,500 of compute lines) |
+
+- **Biggest line and why:** the API fleet (~30 %), because the event rate is the load: 100k views/s each cost a request however little each one does. Postgres with its disk is ~27 %. The lever is fewer events, not bigger boxes: count a view only after N seconds of playback and let the player batch beacons (section 10); halving events roughly halves this line.
+- **What changes at 10×:** 1M views/s ⇒ 100 + 150 + 25 = 275 vCPU ⇒ N = ceil(275 ÷ 4.27) = 65 → 66 × `c7g.2xlarge` (≈ $14k). Likes at 50k/s peak ⇒ ~100k IOPS, past one `gp3` volume and one primary, so shard likes by `post_id` into ≥ 8 databases or move to `io2`/NVMe. Redis at 2M ops/s (1M GET + up to 1M `INCRBY`) would need ~40 shards, so add a 1-second in-process count cache on the API nodes (a few seconds stale is the requirement) and Redis sees nodes × distinct items per second again.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two counters with different promises (section 1). Views: approximate (~1 %, seconds stale), 100k increments/s with one video at 10k/s, and a crash may lose about a second plus up to 10 s of deltas. Likes: exact, one per user, none lost (section 3).
+- Views never reach the database one by one: batching turns 100k events/s into `INCRBY`s and a flush of ~10k row updates/s (sections 4, 15). A row update per view would be ~200k IOPS.
+- Likes are rows: `(post_id, user_id)` is the primary key, ~5k inserts/s at peak and ~40B rows (~2 TB) a year; the hot queries are "who liked this post" (a range by `post_id`), "liked by me" for 50 posts, and `ORDER BY views DESC`.
+- Unique viewers are a cardinality estimate: ~12 KB per video as a HyperLogLog.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen as the record for likes and flushed totals, ✖ as the per-view path | `INSERT … ON CONFLICT DO NOTHING` plus a conditional `UPDATE` in one transaction makes a retried like idempotent, and `DELETE … RETURNING` does the same for un-like (9.3); the composite key is the integrity rule. A per-view `UPDATE` would queue 10k/s on one row lock and leave dead tuples (9.1); even the batched flush rewrites an index entry in `videos_views_idx`, so those updates are never HOT |
+| MySQL (RDS / Aurora) | ✔ works, a few idioms change | `INSERT … ON DUPLICATE KEY UPDATE` with a no-op update (rows affected 1 = inserted, 0 = duplicate) decides the counter bump; un-like is a `DELETE` plus rows affected, so no `RETURNING` is missed. A clustered key `(post_id, user_id)` stores one post's likes side by side, so "who liked this post" and "liked by me" are single tree walks over adjacent rows. The hot-row queue of 9.1 is identical; there is no vacuum, but an updated indexed column still rewrites its index entry |
+| Redis (ElastiCache) | ✅ chosen for live view counts and HLLs, ✖ as the record for likes | `INCRBY` is atomic; 200k ops/s is ~2 cores, so 4 shards (section 15); `PFADD`/`PFCOUNT`/`PFMERGE` give uniques in ~12 KB. Losing ≤ 10 s of view deltas is accepted, so replicas suffice; a like that vanishes is not accepted |
+| DynamoDB | ✔ works for likes, ✖ for views and sorting | an item per `(post, user)` with a conditional put is the idempotent like, an atomic `ADD` bumps the counter, and a transaction (≤ 100 items) ties them. But a viral post at ~1k likes/s is already at one partition's ~1,000 writes/s, views at 10k/s on one item are 10× over it, and "most viewed" has no ad-hoc sort |
+| Kafka + ClickHouse | ✔ if views must be exact, replayable or sliced by hour (section 14), ✖ here | 100k events/s is ~8.6B a day; for "a number within 1 %, a few seconds stale" that is more machinery than the requirement (9.2's event-stream row) |
+
+**Pick:** two stores with different promises. PostgreSQL on RDS Multi-AZ (`db.r7g.2xlarge`, `gp3` 2 TB, section 15) is the system of record for likes and the durable copy of the `views` totals; Redis (4 shards, each with a replica) holds the live counts and HLLs and is derived: after a loss it restarts from the last flush. What decides it: a transactional insert-or-ignore plus a conditional increment for the exact path (9.3), a sortable `views` column, and an atomic in-memory counter for the approximate one.
+
+**If it were MySQL instead:** the architecture is unchanged, since batching, Redis and delta flushes do not depend on the engine. The like path uses the MySQL idioms above; the clustered key is a small read win for the like lists and the absence of vacuum removes one worry, but the flush still rewrites the `views` index. Nothing forces a switch either way, so the tie-breaker is team skill.
+
+**What would flip the choice:** likes at ~50k/s peak is ~100k IOPS (section 15), beyond one primary and one `gp3`: shard likes by `post_id` (≥ 8 databases), or move likes to DynamoDB if you would rather not run them. Views that must be exact or time-sliced call for an event log and ClickHouse; Redis at ~2M ops/s calls first for a short in-process count cache on the API nodes (section 15), not a different store.

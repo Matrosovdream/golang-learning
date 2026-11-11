@@ -323,3 +323,56 @@ a false conflict. If you must use a timestamp, send it as an opaque string (an E
 - **Draft autosave** for the displaced editor, so a takeover never costs typed work.
 - **Cross-region:** where does the lock live for a team spread over two continents?
 - **Presence in lists at scale:** a cheap per-record "someone is here" count, kept by the gateways, for 1,000-row virtual lists where a batch lookup per scroll is too heavy.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| WebSocket gateways (Go, stateful) | 2M open sockets; heartbeats 100k/s (a ping every 20 s); 9k changes/s and 9k pushes/s | memory (sockets), not CPU | assume ~30 KiB per socket (two goroutines, buffers, TLS state): 50k × 30 KiB = 1.5 GB, × 1.4 GC headroom = 2.1 GB per node; CPU 100k ÷ 42 = 2.4k pings/s × 20 µs = 0.05 vCPU. Count by sockets, not CPU: 2M ÷ 50k = 40 → 42 | `m7g.large` (2 vCPU / 8 GiB) behind an NLB | 42, 14 per zone | a lost zone leaves 28 nodes at ≈ 71k sockets ≈ 3.0 GiB of 8, which fits; `c7g.large` (4 GiB) would be at 75 %; CPU is idle, so no bigger family. A deploy's reconnect herd (50k sockets over 10 s ≈ 5k handshakes/s ≈ 3.5 vCPU) spreads over the other 41 nodes |
+| Redis (presence hashes, locks, pub/sub) | ≈ 100k refresh ops/s + 9k changes × 3 ops (`HSET`, `PUBLISH`, lock script) = 27k ⇒ 127k writes/s; ≈ 50k reads/s (assumed 2k list screens/s × 25 `HGETALL`, not in section 4); memory 0.6 GB | single-core CPU (ops/s); memory is tiny | one core ≈ 100k simple ops/s, plan ≤ 60 %: 127k ÷ 60k = 2.1 ⇒ 3 shards; each primary takes 42k ops/s, each replica applies 42k + serves 17k reads = 59k; memory 0.6 GB × 1.7 ≈ 1 GB in all, ≈ 0.35 GB per shard | `cache.m7g.large` (2 vCPU), ElastiCache cluster mode | 3 shards × (primary + replica) = 6 | not an `r` node: ~0.4 GB per shard wastes 8 GiB per vCPU, and ops/s is the bound; shard by `{entity}:{id}` so a record's hash, lock and channel share a node. The node lease (9.2) cuts refresh ops from 100k to ~13/s and the cluster to one shard |
+| API (Go, stateless: saves, take-over, list lookups) | ≈ 1.1k saves/s (one per edit start, 2.2k ÷ 2) + ≈ 2k list lookups/s (assumed) | CPU | 1.1k × 1 ms + 2k × 0.3 ms = 1.7 vCPU. N = ceil(1.7 ÷ (0.8 × 4 × ⅔ = 2.13)) = 1 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | availability more than load; each lookup is one Redis pipeline, so the wait is Redis, not CPU |
+| Postgres (orders and other records; the `version` compare-and-set) | this lesson adds ≈ 1.1k committed writes/s; 50M records × ~1 KB (assumed) ≈ 50 GB + 30 % indexes ≈ 65 GB | memory | hot set ≈ 10 % ≈ 7 GB, fits in 32 GiB; IOPS ≈ 1.1k × 2 = 2.2k, under gp3's 3,000 included; CPU ≈ 1.1k × 0.5 ms = 0.55 of 4 vCPU | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 primary + synchronous standby | the app's existing records DB: presence adds only the CAS writes, and the 100k heartbeats/s never reach it, which is the point of Redis; the app's own reads are another lesson's load |
+
+Network: a pong is ≈ 100 B on the wire (frame + TLS + TCP/IP headers, assumed), so 100k/s ≈ 10 MB/s out, plus 9k pushes/s × ~400 B = 3.6 MB/s: ≈ 13.6 MB/s ≈ 36 TB a month to the internet. Per node that is 0.3 MB/s, so bandwidth is no bound, only a bill line. An ALB would bill 2M open sockets as ≈ 670 LCU (3,000 active connections per LCU, assumed) ≈ $3,900 a month, so the front is an NLB (a price not in the sheet; ≈ $100 assumed).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Gateways: 42 × `m7g.large` (42 × $60) | $2,520 |
+| NLB (price not in the sheet; assumption) | $100 |
+| API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Redis: 6 × `cache.m7g.large` (6 × $120) | $720 |
+| Postgres: `db.r7g.xlarge` ≈ $310, Multi-AZ doubles; 100 GB gp3, ×2 ($16) | $640 |
+| Data out: 36 TB × $0.09 per GB | $3,200 |
+| **Total** | **≈ $7,500** (≈ $6,000 with 1-year commitments on the $4,180 of compute) |
+
+- **Biggest line and why:** data out (≈ 43 %), then the gateway fleet (≈ 34 %): the bill is bytes and sockets, not CPU. The keepalive pongs carry no information but are ≈ 26 TB ≈ $2,400 of the egress; a 30 s ping (90 s lease) cuts that by a third. The node lease does not, because the socket pings remain.
+- **What changes at 10×:** 20M sockets ⇒ 400 → 402 × `m7g.large` (≈ $24k), and memory per socket is the lever (30 → 15 KiB halves the fleet); Redis refresh at 1M ops/s needs ≈ 21 shards ((1M + 270k) ÷ 60k) without the node lease and ≈ 5 with it (270k ÷ 60k = 4.5); egress ≈ 360 TB ≈ $32k; Postgres CAS at 11k/s ≈ 22k IOPS passes gp3's 16k cap (`io2`, or shard by tenant).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Ephemeral: 2M open sessions, 100k heartbeats/s against ≈ 9k real state changes/s; the whole presence state is ≈ 0.6 GB and may be forgotten on a restart (sections 2, 4).
+- The operations are leases and TTLs, not queries: `SET NX PX` to take a lock, a compare-and-extend script on every ping, a hash per record with a 120 s TTL, a pub/sub channel per record (9.2, 9.4).
+- The durable part is one integer: `orders.version`, a compare-and-set at ≈ 1.1k committed writes/s on 50M records ≈ 65 GB (section 15). It is the real guarantee; presence is allowed to be wrong while Redis is down (9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen as the system of record, ✖ as the presence store | `UPDATE orders SET …, version = version + 1 WHERE id = $1 AND version = $2` is the guarantee, and the records already live here. As presence it works to ≈ 5k tabs (an `UNLOGGED` table plus the partial unique index `WHERE editing`, 9.1), but 100k heartbeat updates/s means dead tuples, vacuum and a sweeper, and there is no row TTL |
+| MySQL (RDS / Aurora) | ✔ same for `version`, ✖ as the presence store | the compare-and-set is plain SQL (check rows affected). As presence it is no better than Postgres: no `UNLOGGED` table (every heartbeat is a logged InnoDB write), no partial unique index (a generated `editor` column that is `NULL` unless `editing`, under a unique index, gives the same one-editor rule), and the `MEMORY` engine locks whole tables and empties on restart |
+| Redis (ElastiCache, cluster mode) | ✅ chosen for presence, locks and fan-out | a TTL makes state vanish if nobody renews it; `SET NX PX` is an atomic lease; Lua does compare-and-extend; pub/sub carries the pushes; 127k writes/s over 3 shards, 0.6 GB |
+| MemoryDB | ✔ works, not needed | a durable Redis (Multi-AZ log) would let a lock survive failover, but presence is explicitly allowed to be lost and the version check covers a lost lock, so the extra cost buys nothing here |
+| DynamoDB | ✔ for the lock alone, ✖ for heartbeats and fan-out | a conditional put (`attribute_not_exists(pk) OR expires_at < :now`) is a lease, and its TTL removes items lazily (typically within days), so every read must check `expires_at`; 100k heartbeats/s would be 100k billed writes/s, and there is no pub/sub for the pushes |
+
+**Pick:** Redis on ElastiCache (`cache.m7g.large`, 3 shards × primary + replica, section 15) for presence, locks and pub/sub, sharded by the `{entity}:{id}` hash tag so a record's hash, lock and channel share a node; PostgreSQL on RDS Multi-AZ (`db.r7g.xlarge`) for the records and their integer `version`. What decides it is the split of jobs: TTL + atomic `SET NX PX` + Lua + pub/sub for state that must disappear by itself, a durable transactional compare-and-set for the one thing that must never be wrong. Postgres is the system of record; Redis is derived and disposable (a restart empties the faces and loses nothing that matters).
+
+**If it were MySQL instead:** nothing material for the records database. The `version` column and its compare-and-set port as they are, and the integer version is the better choice anyway (9.5). One difference: the seed's trigger form `WHEN (OLD.assigned_to IS NOT DISTINCT FROM NEW.assigned_to)` has no equivalent, since MySQL triggers have no `WHEN` clause (put a `<=>` test in an `IF` inside the trigger body), another reason to bump `version` in the application's edit path. The small-scale `UNLOGGED` presence table would need the generated-column key above and would likely stop being "one fewer moving part" sooner, because each heartbeat is a logged write.
+
+**What would flip the choice:** the refresh traffic: at 10× (1M ops/s) the cluster needs ≈ 21 shards, or ≈ 5 with the node lease (section 15), which is a Redis tuning step, not a new store. Below ≈ 5k concurrent tabs the Postgres `UNLOGGED` table is the better answer (9.1). If the lock ever had to be a hard guarantee on the write path, which 9.3 rejects, move it to MemoryDB or a conditional-write store with a fencing token. Postgres compare-and-set at 11k/s passes gp3's 16k IOPS cap and then shards by tenant (section 15).

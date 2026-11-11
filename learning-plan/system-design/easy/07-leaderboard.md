@@ -301,3 +301,55 @@ Two details the formula hides:
 - **Time decay** for a "hot this week" board (combine with task 06's trending).
 - **Seasons** with rewards: snapshot the top 1,000 to Postgres at period end, atomically, and handle late-arriving match results.
 - **Anti-cheat signals:** points per minute per player, impossible deltas, device fingerprints.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption; the 15k reads/s and the 5k/s burst are treated as peaks that coincide)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Score API (Go, stateless: HMAC check, Postgres transaction, Lua call, JSON) | 5k score writes/s + 10k top-10/s + 5k my-rank/s = 20k req/s | CPU | writes 5k × 0.5 ms = 2.5 vCPU; top-10 (1 s cached JSON) 10k × 0.05 ms = 0.5; rank 5k × 0.3 ms = 1.5; total 4.5 vCPU. N = ceil(4.5 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.1) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | the work is JSON, a signature check and waiting on Redis and Postgres; memory is ~1 GiB of 8, so `c` not `m`. 37 % busy normally, 56 % with one zone down |
+| Redis (sorted sets `lb:global` + `lb:2026-10`) | 25M + 5M members = 2.5 + 0.5 = 3 GB (the 100 B per member already includes skip-list and hash overhead); ≈ 25k ops/s (10k Lua updates + 15k rank-path calls) | memory, then one core | 3 GB × 2 for the snapshot fork's copy-on-write under 5k writes/s (assumption) = 6 GB; `maxmemory` ≤ 70 % ⇒ ≥ 8.6 GiB RAM ⇒ next size is 16 GiB. Ops: 10k × ~30 µs (Lua) + 15k × ~10 µs ≈ 0.45 core | `r7g.large` (2 vCPU / 16 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory-bound, so the `r` family; commands run on one core, so only RAM matters, not vCPU. `m7g.large` (8 GiB) is too tight once fork headroom counts. The replica turns a node loss into a failover, not a ~1-minute rebuild (section 9.3) |
+| Postgres (players, match_results, monthly_scores) | 5k commits/s at burst (580/s average), each = 1 insert + 2 updates; ≈ 200 GB | write IOPS and CPU, not memory | players 25M × ~100 B = 2.5 GB; monthly 5M × ~60 B = 0.3 GB; match_results 50M rows/day × ~130 B = 6.5 GB/day, 30 days hot ≈ 200 GB (retention is an assumption; older partitions go to S3). IOPS ≈ 2 per commit (assumption) ⇒ 10k + ~1k misses ⇒ `gp3` at 12,000 IOPS. CPU 5k × 0.6 ms = 3 vCPU of 8. Hot set ≈ 3 GB + today's index tail ≪ 32 GiB | `db.m7g.2xlarge` (8 vCPU / 32 GiB), RDS Multi-AZ, 250 GB `gp3` | 1 primary + synchronous standby | reads never reach it, so the hot set is small and `m` is enough; 8 vCPU and 12k IOPS are there for the evening burst. Use `r` if `match_id` is random and kept 7+ days: its index (~50 B × 50M × 7 ≈ 17 GB) is then touched at random and wants RAM; time-ordered ids avoid that |
+
+Data out: 10k × ~1 KB (top-10 JSON + headers) + 5k × ~0.5 KB = 12.5 MB/s at peak ≈ 100 Mbit/s: no network bound on `c7g.xlarge`, but the bytes are a bill line (below). Nothing to size for the rebuild: `SELECT id, score FROM players` runs once on the standby.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Redis: 2 × `cache.r7g.large` (2 × ≈ $156) | $310 |
+| Postgres: `db.m7g.2xlarge` ≈ $480, Multi-AZ doubles | $960 |
+| gp3 250 GB + 9k extra IOPS: $20 + $45 = $65, ×2 for the standby | $130 |
+| ALB: $16 + ≈ 15 LCU on average × $0.008 × 730 | $100 |
+| Data out: average ⅓ of peak = 4.2 MB/s × 2.63M s ≈ 11 TB × $0.09 | $990 |
+| **Total** | **≈ $2,810** (≈ $2,250 with 1-year commitments on the $1,590 of servers) |
+
+- **Biggest line and why:** data out (35 %), narrowly ahead of the Postgres pair (34 %, 39 % with its disks): 15k small JSON responses a second to phones add up to ~11 TB, and the evening write burst needs a durable, Multi-AZ primary. The sorted set, the clever part of the design, is 11 % of the bill. Levers: gzip and a longer client poll interval for egress; writing ~10 results per commit would cut commits and IOPS about 10× and roughly halve the Postgres line.
+- **What changes at 10×:** API 45 vCPU ⇒ N = ceil(45 ÷ 2.13) = 22 → 24 × `c7g.xlarge`. Redis holds 25 + 5 = 30 GB (section 10) and takes ~250k ops/s, far past one core: shard ~6 ways (score-range, as in section 10; ~5 GB and ~42k ops/s each, so `r7g.large` still fits), each with a replica. Postgres at 50k commits/s and ~100k IOPS is past one primary and one `gp3`: batch score writes, then shard by player id or move to `io2` / NVMe (`i4i`). Data out ≈ 110 TB ≈ $10k a month, which becomes the first thing to cut.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two different jobs. The durable record is `match_results` (idempotent on `match_id`), `players.score` and `monthly_scores`: ~580 commits/s on average, 5k/s at the evening burst, each commit one insert and two updates, all by primary key (sections 4, 8, 15).
+- The ranking is 25M members read at 15k/s: "top 10" and "my rank". Rank means "how many scores are higher", an order-statistic question, not a point read or a range scan (section 9.1).
+- Scores must never be lost, but the board is derived: it is rebuilt from `players` in about a minute (section 9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen as the system of record, ✖ as the rank path | the `match_id` primary key makes a replayed match insert nothing, and a transaction keeps `match_results` and `players.score` in step. But `count(*) WHERE score > x` walks every index entry above the player (up to 25M) and no index returns a rank directly, so 5k rank queries/s would spend the whole budget on counting (section 9.1) |
+| MySQL (RDS / Aurora) | ✔ as the system of record, ✖ as the rank path | same verdict for the same reason: InnoDB has no rank index either. Everything the record needs (primary key, transactions, row locks) is portable |
+| Redis (ElastiCache) | ✅ chosen as the derived ranking index | `ZREVRANK`, `ZREVRANGE` and `ZINCRBY` are O(log N) on a skip list with spans; both boards are ~3 GB, one `cache.r7g.large` with a replica; the board can be rebuilt, so durability is not required |
+| MemoryDB | ✔ works if the board were the record | a durable sorted set would remove the rebuild, but the audit trail and the idempotent `match_id` still belong in a relational store, so you would pay for a second durable copy |
+| DynamoDB | ✖ poor fit | the score table is a fine key-value shape, but it has no rank operation: "my rank" would be a count that reads every item above the score |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.2xlarge` from section 15) as the system of record, plus Redis on ElastiCache as the derived ranking index. Two properties decide it: a rank must be O(log N), which only the sorted set gives, and a score must be durable and idempotent on `match_id`, which a relational primary key gives. Postgres is the record; Redis is rebuilt from `SELECT id, score FROM players` and batched `ZADD` (section 9.3).
+
+**If it were MySQL instead:** nothing material. The idempotent insert is `INSERT IGNORE` (or `ON DUPLICATE KEY UPDATE`) plus a rows-affected check instead of `ON CONFLICT DO NOTHING`, and InnoDB updates `players.score` in place, so there is no autovacuum to watch on a table updated ~5k times a second at the burst. One caution is the same in both: a random `match_id` splits pages (InnoDB's clustered table, Postgres's index; see task 04 and section 15), so use a time-ordered id.
+
+**What would flip the choice:** below ~100k players SQL rank takes a few ms (section 9.1) and Redis is not worth a second system. At 10× (250M members, ~25 GB, section 10) the sorted set is sharded by score range. The database side hits ~50k commits/s (section 15), past one primary: batch match results first, then shard by player id or move `match_results` to DynamoDB, where a conditional put on `match_id` keeps the idempotency.

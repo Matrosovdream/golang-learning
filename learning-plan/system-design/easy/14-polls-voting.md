@@ -282,3 +282,54 @@ enough, and we note the stronger design as an extension.
 - **Geographic/demographic breakdowns** without exposing individuals (k-anonymity thresholds).
 - **Fraud detection:** vote velocity per account age, IP clustering; where in the write path does a "shadow reject" go?
 - **Embedding polls in other products** (task 10 webhooks on close with final results).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Vote and results API (Go, stateless) | viral poll: 10k votes/s + 50k result reads/s | CPU | reads 50k × 0.15 ms = 7.5 vCPU (Redis `GET`, entitlement check, 300 B JSON); votes 10k × 0.5 ms = 5 vCPU (limiter call, Postgres upsert transaction, Redis pipeline); total 12.5 vCPU. N = ceil(12.5 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.93) = 3 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS or EKS | 3, one per zone | CPU work with almost no memory (a 300 B document, `singleflight` maps), so `c` not `m`. 52 % busy normally, 78 % with a zone down: that is the ceiling, so a fourth node is the first thing to add |
+| Redis (`counts`, `results`, `voters`, limiter) | on the viral poll ≈ 130k ops/s: results `GET` 50k + entitlement `SISMEMBER` 50k + ≈ 3 per vote (limiter, `HINCRBY`, `SADD`) = 30k | single-core CPU on hot keys (memory is tiny) | data: ~100k open polls × ~1.3 KB + a 1M-voter set ≈ 0.2 GB, far below any node; ops: 130k is over one core's ~100k, but no single key is: results 50k, voters 60k, counts 10k | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache cluster mode | 3 shards × (primary + replica) = 6 nodes | Not memory-bound, so not `r`. A hot key lives on one shard and one core, so scale by shards, not node size; `m` is the cheapest non-burstable 2-vCPU shape. Do not share a hash tag across the three hot keys, or 130k ops land on one core |
+| Postgres (`votes`, `polls`, `poll_options`) | 10k votes/s burst (upserts); 50M votes/day ≈ 580/s average; 2 GB/day ≈ 700 GB a year | CPU and write IOPS, not memory | CPU: 10k × 0.3 ms = 3 vCPU + ~0.5 for "have I voted" reads and the 5 s reconcile ≈ 3.5 of 8; IOPS: ≈ 1 per committed vote (group commit shares WAL flushes, ~200 rows share a page, assumption) = 10k + ~1k reads ⇒ `gp3` 12,000 (cap 16,000); hot set = last 2 days ≈ 4 GB rows + 4 GB PK index ⇒ fits 32 GiB; disk: 700 GB rows + ≈ 700 GB index ⇒ 1.5 TB | `db.m7g.2xlarge` (8 vCPU / 32 GiB), RDS Multi-AZ | 1 primary + synchronous standby | `m`, not `r`: the hot set is 8 GB, so extra RAM would be paid for and idle (`r7g.2xlarge` Multi-AZ costs $280 more); `xlarge` would be 88 % busy at the burst. Rows are the truth, so a standby is required. Partition `votes` by month (section 4) so old months can leave |
+
+Responses are tiny, so nothing is network-bound: (50k + 10k) × 0.5 KB = 30 MB/s (240 Mbit/s) at peak. Bill assumptions: 10 result reads per vote platform-wide and 0.5 KB per response; cross-zone traffic is under $100 here and left out.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.2xlarge` (3 × $212) | $640 |
+| Redis: 6 × `cache.m7g.large` (6 × $120, i.e. $60 EC2 × 2) | $720 |
+| Postgres: `db.m7g.2xlarge` ≈ $480 managed, Multi-AZ doubles | $960 |
+| gp3 1.5 TB + 9k extra IOPS: (1,500 × $0.08 + 9,000 × $0.005) × 2 = (120 + 45) × 2 | $330 |
+| ALB: $16 + ≈ 12 LCU-hours average (≈ 3 MB/s ≈ 11.5 GB/h) × $0.008 × 730 | $90 |
+| Egress: 550M responses a day × 0.5 KB = 275 GB/day ≈ 8.4 TB a month × $0.09 | $750 |
+| **Total** | **≈ $3,490** (≈ $2,680 with 1-year commitments on the three compute lines) |
+
+- **Biggest line and why:** the votes database with its disk (≈ 37 %): votes are the one thing that must never be lost, and a year of rows plus their index is 1.4 TB. The lever is retention: move closed polls to S3 after 90 days (≈ 360 GB with indexes) and the disk shrinks to about 400 GB. Redis (≈ 21 %) is six nodes only because of three hot keys, not because of data (0.2 GB).
+- **What changes at 10×:** 100k votes/s on one poll (section 10) ⇒ reads 500k × 0.15 ms = 75 + votes 100k × 0.5 ms = 50 = 125 vCPU ⇒ N = ceil(125 ÷ 4.27) = 30 × `c7g.2xlarge`. One Redis key cannot serve 500k `GET`/s: render results in-process for 1 to 2 s per node (the key then sees ≈ 30 reads/s) and carry "have I voted" in a signed cookie; section 10's local delta aggregation turns 100k `HINCRBY`/s into ≈ 150/s. Postgres: 100k commits/s ≈ 100k IOPS is past gp3 and past one primary, and partitioning alone does not add write capacity to one primary ⇒ shard by `hash(user_id)` into ~10 primaries, each at today's 10k votes/s.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- `votes` has one row per (poll, user): ~50M rows a day at ~40 B ≈ 2 GB/day, ≈ 700 GB a year. The primary key `(poll_id, user_id)` is the one-vote rule (sections 8 and 9.1).
+- A vote is one small upsert, bursting to 10k/s on a single poll. The counts concentrate on at most 10 `poll_options` rows, the hot-row problem, so live counts sit in Redis and the rows stay the truth (9.2).
+- Results (50k reads/s) come from a 2-second Redis cache. The database sees votes, "have I voted" lookups and a reconcile `GROUP BY option_id` every 5 s on a hot poll.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the primary key makes a second vote impossible, and `INSERT … ON CONFLICT (poll_id, user_id) DO UPDATE … WHERE votes.option_id <> EXCLUDED.option_id RETURNING` reports new, changed or retry in one statement, with the `closes_at` check in the same query; PostgreSQL has no gap locks, so a burst of first votes in one poll does not queue on a key range |
+| MySQL (RDS / Aurora) | ✔ works, with a different write | same primary key, but `ON DUPLICATE KEY UPDATE` has no `WHERE` and no `RETURNING`: the `IF(option_id <> VALUES(option_id), …)` test goes into each assignment and the outcome comes from the affected-row count (1 new, 2 changed, 0 same). The old option, needed to move the counters, needs a `SELECT … FOR UPDATE` first; at the default `REPEATABLE READ` that read of a missing row takes a gap lock, and concurrent first votes in one key range can deadlock, so run the vote at `READ COMMITTED` |
+| DynamoDB | ✔ for the votes, ✖ for the counts | a conditional put on `poll#user` enforces one vote, and 50M items a day is routine; but ten counter items taking 10k/s run into the ~1,000 writes/s per-partition limit (each counter must be sharded), and "exact at close" becomes a scan or a stream aggregation instead of a `GROUP BY` |
+| Redis (ElastiCache / MemoryDB) | ✅ chosen for live counts, results and the voter set; ✖ as the record | `HINCRBY` takes the burst and one `GET` serves 50k reads/s of one document; a Redis-only vote could be lost before it is persisted (9.2) |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.2xlarge`, section 15) holds the rows that are the truth; the deciding feature is the composite primary key with a one-statement upsert that returns the outcome. Redis (6 × `cache.m7g.large`) holds derived counts and cached results, all rebuilt by the reconcile `GROUP BY`.
+
+**If it were MySQL instead:** a rewritten vote statement and `READ COMMITTED` for that transaction (above); nothing else in the design moves. Two small points in its favour: the rows live in the primary-key tree, so one poll's votes sit together and the reconcile is one contiguous range scan (in Postgres give the key `INCLUDE (option_id)`, or each counted vote costs a heap fetch), and section 15's separate ≈ 700 GB key index is not a second structure (measure the real row width). In both engines, partitioning `votes` by month means carrying the partition column inside the primary key.
+
+**What would flip the choice:** 100k votes/s on one poll (the 10× case) is past one primary: shard `votes` by `hash(user_id)` into ~10 primaries (section 15). DynamoDB with sharded counters is the alternative only if you give up SQL recounts and ad-hoc queries; a provable-anonymity requirement changes the schema (9.4), not the engine.

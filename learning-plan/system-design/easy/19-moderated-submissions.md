@@ -299,3 +299,58 @@ Everything else follows from the promise:
 - **Video:** transcoding, per-frame moderation, bandwidth (medium track: video upload & streaming).
 - **Transparency report and notice-and-action flows** for regulated markets.
 - **Crowd moderation:** weighted flags from trusted users as an extra lane-0 input.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API (Go, stateless) | 290 submissions/s + ≈ 175 presigned-URL calls/s (one per photo) = ≈ 465 req/s | CPU, barely | 465 × 1 ms = 0.47 vCPU (JSON, HMAC, rate-limit lookup, one insert). N = ceil(0.47 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | for availability, not load: the 9 TB/day of bytes never pass through it (presigned PUT), and the rate-limit table (1M buckets × 50 B = 50 MB) fits in 4 GiB, so `c`, not `m` |
+| Image pipeline workers (Go: sniff, decode, re-encode, variants) | ≈ 35 photos/s average, ≈ 175/s at peak | CPU | 175 × 0.15 s = 26 vCPU, plus review text checks 116/s × 5 ms ≈ 0.6 ⇒ ≈ 27 vCPU. N = ceil(27 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(6.3) = 7 → 9 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS, Spot (managed alternative: Lambda per image) | 9, three per zone | decoding is pure CPU; memory is capped by the semaphore (8 parallel decodes × 12 MP × 4 B ≈ 0.4 GB of 16), so `c`; 38 % busy at peak, 56 % with a zone down, 7 % on average; Spot is safe because the outbox steps are idempotent and photos have a 24 h SLA |
+| Photo risk classifier (hash match + vision model) | ≈ 175 photos/s at peak | GPU | assume 5 ms of GPU per photo, batched: 175 × 5 ms = 0.88 GPU. N = ceil(0.88 ÷ (0.8 × 1 × ⅔ = 0.53)) = ceil(1.65) = 2 → 3 | `g6.xlarge` (1 × L4 GPU, x86) on ECS/EKS (managed: a SageMaker endpoint) | 3, one per zone | a vision model needs a GPU (Graviton has none); ≈ 29 % busy normally, 44 % with a zone down; if the model is MobileNet-sized, run it on the CPU workers (≈ +5 vCPU at ~30 ms per photo) and drop this row: measure first |
+| Postgres (submissions, media_objects, decisions, outbox, feedback) | 290 submissions/s × ~5 committed writes (insert, outbox, score, promote, decision) ≈ 1,450 writes/s; ≈ 5 GB/day of rows (≈ 1 KB each with indexes, assumed) ≈ 1.8 TB/year | memory, then IOPS | hot set ≈ 2 days of rows (10 GB) + hot reviews and queue ≈ 14 GB, fits in 64 GiB; IOPS ≈ 1,450 × 2 = 2,900 + ~500 miss reads ≈ 3,400 ⇒ gp3 at 6,000 (cap 16,000); CPU ≈ 1.5 of 8 vCPU | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ | 1 primary + synchronous standby | RAM keeps the hot set and the tiny queue index (`(lane, due_at) WHERE status = 'pending'`, ≈ 35k rows) cached; gp3 is enough below 16k IOPS; the outbox polls with `SKIP LOCKED` at < 300 rows/s, so no broker (SQS would be ≈ $180/month: 150M messages × 3 calls × $0.40 per million); pool connections (RDS Proxy or PgBouncer) from 12 app nodes |
+
+S3 (quarantine and public): nothing to size, 290 PUT/s at peak is far under ~3,500 per prefix and keys are random. Originals reach the workers at 104 MB/s on average (peak 4.2 Gbit/s ÷ 9 nodes ≈ 0.46 Gbit/s each), so network is not the bound, but read them through an S3 gateway VPC endpoint: 270 TB a month through a NAT Gateway would cost 270,000 GB × $0.045 ≈ $12k. Anonymous feedback (20,000/day = 0.23/s) runs on the API nodes. Not in the bill: viewer traffic (section 4 does not size reads; every 100 TB a month out through CloudFront ≈ $8,500), S3 request charges, one confirmation email per submission (5M a day), and the ten moderators.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.large` (3 × $53) | $160 |
+| Workers: 9 × `c7g.2xlarge` (9 × $212) | $1,910 |
+| Classifier: 3 × `g6.xlarge` (≈ $590 each; a GPU price is not in the sheet) | $1,770 |
+| Postgres: `db.r7g.2xlarge` ≈ $620, Multi-AZ doubles | $1,240 |
+| gp3 2 TB ($160) + 3,000 extra IOPS ($15), ×2 for the standby | $350 |
+| ALB: $16 + ~5 LCU × $0.008 × 730 | $50 |
+| S3 quarantine: ≈ 3 TB × $0.023 | $70 |
+| S3 public after one year: 520 TB × $23 per TB | $12,000 |
+| **Total** | **≈ $17,600** (≈ $15,800 with a 1-year Savings Plan on the $5,080 of compute) |
+
+- **Biggest line and why:** public photo storage, ≈ 68 % by the end of year one, growing by ≈ $970 every month (1.4 TB/day × 30 × $23); in month one compute dominates. The levers are bytes per approved photo (fewer variants, WebP) and tiering cold photos, not instances. Spot would cut the workers' $1,910 to ≈ $570.
+- **What changes at 10×:** 50M/day ⇒ decode ≈ 266 vCPU ⇒ N = ceil(266 ÷ 8.53) = 32 → 33 × `c7g.4xlarge` (≈ $13.9k, ≈ $4.2k on Spot); the classifier needs 8.8 GPU ⇒ 18 × `g6.xlarge`, so add a cheap first-stage model and send only uncertain photos to the big one; Postgres at 14.5k writes/s ≈ 29k IOPS passes gp3's 16k cap (`io2`, or shard by target); S3 passes 5 PB a year (≈ $120k/month at year-end); the ten moderators still see 0.086 %.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Small rows with one hot slice: ≈ 290 submissions/s at peak, ≈ 1,450 committed writes/s once the outbox, score, promote and decision rows are counted (section 15), ≈ 5 GB a day ≈ 1.8 TB a year. The slice humans work on is the ≈ 35k pending rows of lane 1 (sections 4, 9.2).
+- The access pattern is a claim queue: "the 20 oldest pending items in this lane that nobody holds", with a lease that returns abandoned batches (9.2). Beside it: point reads by `public_id` and review lists by target.
+- A verdict, its decision row and the outbox row must commit together (9.1, 9.4). The image bytes live in S3, and the anonymous rate-limit counter is deliberately never written to a database (9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the partial index `(lane, due_at) WHERE status = 'pending'` holds ≈ 35k live rows while the table grows by 5M a day; `FOR UPDATE SKIP LOCKED` gives ten moderators and the outbox poller disjoint rows without waiting; one `UPDATE … RETURNING` claims a batch and hands it back |
+| MySQL (RDS / Aurora) | ✔ works, with a workaround | `SKIP LOCKED` exists (8.0+), but there is no partial index and no `RETURNING` (see below) |
+| DynamoDB | ✖ poor fit for the claim queue | a sparse GSI on `(lane, due_at)` that only pending items enter is the partial index's twin, but a lease is one conditional write per item and there is no `SKIP LOCKED`: ten moderators racing for the head of a lane collide and retry. 1,450 writes/s is easy for it; the queue semantics are the problem |
+| Redis (ElastiCache) | ✖ as the record, ✔ for the rate limiter | the per-bucket counters (1M buckets × 50 B ≈ 50 MB, TTL of minutes) may vanish on restart by design; a submission, a decision or a takedown may not |
+| S3 | ✅ chosen for the bytes | the quarantine and public buckets, the bucket policy being the "never public" guarantee; `media_objects` holds only keys |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.2xlarge`, section 15) is the only system of record for `submissions`, `media_objects`, `moderation_decisions`, the outbox and `private_feedback`; S3 holds the bytes; the in-memory counters are derived and disposable. Three things decide it: the partial queue index with `SKIP LOCKED` leases (9.2), one transaction for verdict + decision + outbox row (9.1), and a hot set (≈ 14 GB) that fits in 64 GiB of RAM. CPU, GPU and S3 are the other lines of the bill and are not database questions.
+
+**If it were MySQL instead:** the same tables and lanes with three edits. (1) No partial index: index `(status, lane, due_at)` over every row (≈ 30 B an entry × 1.8B rows a year ≈ 55 GB, an assumption, though only the pending slice is hot), or keep pending items in a small `moderation_queue` table that is deleted from at decision time, which holds the queue index at ≈ 35k rows. (2) No `RETURNING`: select the ids with `FOR UPDATE SKIP LOCKED`, then update them by id in the same transaction. (3) Claim at `READ COMMITTED`: the default `REPEATABLE READ` takes next-key locks over the index range a locking scan walks, which brings surprising lock waits and deadlocks between claimers. The identity key is append-only, which suits InnoDB's clustered index; the random `public_id` unique index is the only random insert, as in Postgres. Outbox polling is unchanged.
+
+**What would flip the choice:** the database is not what breaks first here (the human queue is). Sustained writes past gp3's 16k IOPS (≈ 14.5k writes/s at 10×, section 15) call for `io2` or sharding by target, not another engine; keeping years of submissions online calls for monthly partitions and archiving; free-text search over reviews (task 39) adds OpenSearch as a derived index. A DynamoDB queue would only make sense if items were assigned to a moderator up front, so claims never contend.

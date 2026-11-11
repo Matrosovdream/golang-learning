@@ -353,3 +353,56 @@ purge their caches, so get `og:image` right the first time: absolute HTTPS, no r
 - **The migration trigger:** write down the metrics (render CPU, page kinds, drift incidents) at which you move to Nuxt, and what you'd keep (resolvers port as plain functions).
 - **Widget-heavy pages:** prerender with a headless browser for the 1% that can't be templated, cached as snapshots.
 - **Hreflang and canonical clusters** for 20 languages: the head's size and the cache key both grow.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Shell service (Go: resolver, L1 LRU, snapshot reads, L3 render) | ~29k req/s at the worst moment: ~9k normal (assume the CDN absorbs ~70 % of the 30k/s, §4) + the 20k/s cold crawl spike | CPU | spike: 95 % from snapshots 19k × 0.3 ms (S3 GET over TLS, copy 5 KB) = 5.7 vCPU; 5 % renders 1k × 3 ms (§4) = 3.0; normal: 90 % L1 8.1k × 0.1 ms = 0.81, 10 % L2 0.9k × 0.3 ms = 0.27; total ≈ 9.8 vCPU. N = ceil(9.8 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.3) = 3 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 3, one per zone | the spike is TLS and copying, not templates; memory is L1 5 GB (200k pages × 25 KB, §4) + ~2 GiB heap, +50 % GC headroom ≈ 10 GiB of 16, so `c` is enough; network peaks at ~1.2 Gbit/s for all nodes; 41 % busy, 61 % with a zone down; bots get their own pool |
+| Postgres read replicas (content for L3 renders, `page_snapshots`, `tombstones`) | ~3k qps (1k renders/s × 3 queries, §4); ~200 GB of source rows (assumption: 20M × ~10 KB) | IOPS, then memory | CPU 3k × ~0.5 ms = 1.5 vCPU, one replica alone 38 %; the spike reads a uniform tail, so with ~25 GiB of cache over 200 GB assume 80 % of reads miss RAM at ~1.5 page reads: 3k × 0.8 × 1.5 = 3.6k IOPS ⇒ `gp3` at 5,000 IOPS (+2,000 × $0.005) | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS read replicas | 2, one per zone | a uniform tail cannot be cached anyway, so buy IOPS (cheap) rather than RAM; `r` keeps the indexes and the hot head resident; the primary is the CMS database (lesson 32), not repeated here |
+
+Snapshot store: S3, nothing to size: 100 GB gz (§4), 16 prefixes (≈ 88k GET/s ceiling against 19k needed). Reach it through an S3 gateway endpoint (free); through NAT the spike's ~20 TB a month of snapshot reads would cost ≈ $900. A full re-render is 20M × 3 ms = 60,000 CPU-s (§4), but the replicas can spare only ~1k renders/s, so it is a capped backfill: 20M ÷ 1k = 20,000 s ≈ 5.6 h on ~3 vCPU of the shell nodes' headroom, not "100 cores for 10 minutes" (that would be 60k qps). S3 request prices are not in the sheet; the ones below are from memory: ≈ $0.0004 per 1,000 GET, ≈ $0.005 per 1,000 PUT.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Shell: 3 × `c7g.2xlarge` (3 × $212) | $640 |
+| 2 read replicas: `db.r7g.xlarge` (2 × $310 managed) | $620 |
+| gp3: 2 × 300 GB × $0.08 + 2 × 2,000 extra IOPS × $0.005 | $70 |
+| S3 storage: ~200 GB (snapshots plus a copy during a backfill) × $0.023 | $10 |
+| S3 GETs: ~137M a day in a 2-hour spike + ~16M otherwise = 153M × 30 = 4.6B × $0.0004 per 1,000 | $1,800 |
+| ALB: $16 + ~63 LCU (~3.5k req/s average × 5 KB ≈ 63 GB/h) × $0.008 × 730 | $380 |
+| CDN egress: ~78 TB normal + ~22 TB in spikes = ~99 TB × $0.085 (first tier) | $8,400 |
+| One full re-render a month: 20M PUTs × $0.005 per 1,000 (Spot compute is pennies) | $100 |
+| **Total** | **≈ $12,000** (≈ $11,600 with a 1-year plan on the $1,260 compute baseline) |
+
+- **Biggest line and why:** CDN egress, 70 %. The servers and databases together are about 10 %. The page is already 5 KB gzipped, so the levers are not size but count: answer revisits with `304` (~0.3 KB instead of 5 KB, about 15× fewer bytes for unchanged pages), shed bots first, and negotiate volume pricing. The S3 GET fee (15 %) shows that snapshots trade database load for request fees: a daily 2-hour spike is a $1.8k line, which a longer `s-maxage` on tail pages (more CDN hits) reduces.
+- **What changes at 10×:** a 200k req/s spike ⇒ CPU 98 vCPU ⇒ N = ceil(98 ÷ 4.27) = 23 → 24 × `c7g.2xlarge` (≈ $5,100); S3 prefixes ≥ 40 (§10). Renders would be 10k/s = 30k qps, beyond two replicas, so the answer is more snapshot coverage (99.5 % brings renders back to 1k/s), not more replicas. Egress ≈ $85k and S3 GETs ≈ $18k a month: shedding bots earlier is the cheapest hardware decision in the design.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Three kinds of data. The **content** an L3 render reads: 20M pages × ~10 KB ≈ 200 GB of source rows (section 15), fetched by primary key, ~3k queries/s from ~1k renders/s × 3 queries. The **snapshot bodies**: 20M × ~5 KB gzipped = 100 GB, read by key, up to ~19k/s in a crawl spike. And three small control tables: `page_snapshots` (a 20M-row index of the bodies), `tombstones` (301/410 decisions) and `bot_ip_verdicts` (a 24 h cache).
+- A crawl spike reads a **uniform cold tail**, which nothing caches, so the database is bound by IOPS (~3.6k, section 15), not CPU (1.5 vCPU of 4); the design's answer is that snapshots keep ~95 % of spike traffic away from it.
+- Staleness is acceptable (5-minute TTL, `stale-if-error`); a wrong status is not, so the status decision reads authoritative rows (`tombstones`, the slug tables) before any HTML.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen (the CMS database and its read replicas) | the source rows already live there (lesson 32); two `db.r7g.xlarge` replicas carry the ~3k qps of by-key reads; `page_snapshots_stale_idx (tmpl_version, rendered_at)` orders the backfill; `CHECK ((status = 410) = (location IS NULL))` keeps tombstones valid; `INET` is a native type for `bot_ip_verdicts` |
+| MySQL (RDS / Aurora) | ✔ works, interchangeable for these tables | InnoDB's clustered primary key returns a row by `page_id` in one tree walk, a slight edge for uniform-tail point reads (section 15 assumes ~1.5 page reads per query on a Postgres heap plus index); `INET` becomes `VARBINARY(16)` with `INET6_ATON`; `CHECK` is enforced from 8.0.16. The catch is that the source rows are lesson 32's, which use partial indexes and `LISTEN/NOTIFY`: choosing MySQL here means taking that lesson's workarounds too, or running two engines |
+| S3 | ✅ chosen for snapshot bodies (derived) | a body is an immutable object fetched by key: 100 GB gz, 16 key prefixes ≈ 88k GET/s of ceiling against 19k needed (section 15); keeping 100 GB of blobs in the replicas would compete with the hot index pages for RAM |
+| DynamoDB | ✔ works for the bodies and the small tables, no gain | a 5 KB body is far below the 400 KB limit and every read is by key, so it could replace both S3 and `page_snapshots` (~19k reads/s is spread over several partitions at ~3,000 reads/s each). It would trade S3's GET fees for read fees and add a second copy of the keying scheme; it is not an alternative for the content, which the CMS database owns |
+| Redis (ElastiCache) | ✔ for `bot_ip_verdicts` and as an L2 if wanted, ✖ as the record | native 24 h TTL fits the verdicts (the table notes "or Redis"); the hottest ~5 GB already sits in each node's L1 LRU, so a shared L2 adds a hop for little |
+
+**Pick:** the CMS PostgreSQL on RDS with two read replicas (`db.r7g.xlarge`, `gp3` at 5,000 IOPS, section 15) for content, `page_snapshots` and `tombstones`, plus S3 for snapshot bodies. The deciding properties are that by-key reads scale out on replicas and the cost of a uniform tail is bought as IOPS rather than RAM. System of record: the content rows and `tombstones` (authored decisions). Derived and rebuildable: `page_snapshots` and the S3 bodies (a re-render backfill, capped at ~1k renders/s), the CDN and L1 copies, and `bot_ip_verdicts`.
+
+**If it were MySQL instead:** nothing material in this lesson's tables: `BYTEA` becomes `VARBINARY`, `INET` becomes `VARBINARY(16)`, the clustered key trims a page read per point lookup, and replicas work the same way. The real cost is inherited from lesson 32's data model (partial indexes, `LISTEN/NOTIFY`), not from anything added here.
+
+**What would flip the choice:** the load, not the engine, moves first. At 10× (a 200k req/s spike) renders would be 10k/s ≈ 30k qps, beyond two replicas, and the answer is more snapshot coverage (99.5 % brings renders back to ~1k/s), not more replicas or another database (section 15). The S3 prefix ceiling arrives at ~40 prefixes (section 10). DynamoDB for the bodies and indexes becomes attractive only if the team wants no replicas or S3 prefixes to operate and the per-read bill is acceptable.

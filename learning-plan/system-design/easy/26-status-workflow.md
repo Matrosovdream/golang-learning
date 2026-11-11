@@ -338,3 +338,58 @@ func Move(ctx context.Context, tx pgx.Tx, m MoveCmd) error {
 - **SLA by stage** with business-hours calendars ([27](27-deadlines-escalation.md)).
 - **Cross-record workflows** (order → fulfilment → invoice) as a saga ([35 Sagas](../../35-sagas-distributed-transactions.md)).
 - **Per-status field requirements** (a form per status) validated at the same statement.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Workflow API (Go, stateless) | 3k moves/s peak (600 avg); reads assumed 3× the moves = 9k/s (section 4 sizes only writes) | CPU | moves 3k × 0.5 ms = 1.5 vCPU; reads 9k × 0.3 ms = 2.7 vCPU; total 4.2. N = ceil(4.2 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.97) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | JSON, auth, a guard check and one SQL statement; the 56 MB workflow config is the only state, so `c`, not `m`. 35 % busy at peak, 52 % with a zone down |
+| Postgres (tickets, status_history, outbox) | 3k moves/s = ~9k row writes/s (record + history + outbox); records 50 GB; history ≈ 3.1 TB (13 months × 240 GB) | memory, then IOPS | hot set = records 50 GB + their indexes ~15 GB + the recent-ticket tail of the history index ~12 GB (assumed) ≈ 77 GB ⇒ 128 GiB. IOPS ≈ 3 per move (WAL flush + record page + history-index page, assumed) = 9k + ~2k miss reads ≈ 11k ⇒ `gp3` 14,000 IOPS (cap 16,000) on 4 TB. CPU 3k × ~1.5 ms = 4.5 vCPU of 16 | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ (self-managed: `r7g.4xlarge`) | primary + sync standby; reads on 1 replica `db.r7g.2xlarge` | RAM keeps the whole hot set cached (`r7g.2xlarge` has 64 GiB, not enough); ~11k IOPS is within 70 % of gp3's 16k cap, beyond that `io2` or `i4i`. This is the lesson's "edge of one primary": 10× means shards |
+| Outbox relay + dwell rollups (Go workers) | 3k outbox rows/s peak | CPU | relay 3k × 0.2 ms + rollups 3k × 0.2 ms = 1.2 vCPU. N = ceil(1.2 ÷ 1.07) = 2 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3 | small CPU work; a stopped relay makes effects late, not lost |
+| Event broker (the lesson only says "outbox relay ─►"; assumed Kafka-compatible) | 3k events/s peak × ~300 B ≈ 0.9 MB/s (0.18 MB/s avg) | none: far below "tens of MB/s per partition" | 7-day retention = 0.18 MB/s × 604,800 s ≈ 110 GB × 3 replicas ≈ 330 GB | `kafka.m7g.large` (2 vCPU / 8 GiB), MSK | 3 brokers, one per zone | present for availability (replication 3), not load; `m`, since neither disk, network nor memory is stressed |
+
+The 56 MB workflow config sits in each API node's memory. History older than 13 months is detached and archived to S3: ~2.8 TB a year ≈ $65 a month per year kept.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Workers: 3 × `c7g.large` | $160 |
+| MSK: 3 × `kafka.m7g.large` (3 × ≈ $120) + ~330 GB storage ≈ $30 | $390 |
+| Postgres primary: `db.r7g.4xlarge` ≈ $1,240, Multi-AZ doubles | $2,480 |
+| Replica: `db.r7g.2xlarge` | $620 |
+| `gp3` 4 TB + 11k extra IOPS ($320 + $55 = $375) × 3 copies (primary, standby, replica) | $1,130 |
+| ALB ($16 + ~7 LCU) | $60 |
+| Egress: ≈ 5.2 TB × $0.09 (600 moves/s × 0.3 KB + 1.8k reads/s × 1 KB, assumed) | $470 |
+| **Total** | **≈ $5,600** (≈ $4,200 with a 1-year plan on compute) |
+
+- **Biggest line and why:** the database tier (~75 %: the primary alone ~44 %). The primary is sized by the 77 GB hot set and ~11k IOPS, and three 4 TB volumes cost $1,130 because 3.1 TB of the 3.2 TB is history. The cheap lever is the history window: keep 3 months hot, not 13, and the volumes drop to 1 TB (≈ $405), saving ≈ $650 net of S3.
+- **What changes at 10×:** 30k moves/s ⇒ API 15 + 27 = 42 vCPU ⇒ N = ceil(42 ÷ 4.27) = 10 → 12 × `c7g.2xlarge`. 90k row writes/s ≈ 90k IOPS is past one primary and gp3's cap, so shard by `tenant_id` into 8 shards of today's shape (3.75k moves/s, ~11k IOPS, ~4 TB each ≈ 8 × $3,230 ≈ $26k). The broker stays small (9 MB/s).
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The hot path is one move: a conditional write on one ticket row by primary key, plus a history row and an outbox row. At 3k moves/s that is ~9k row writes/s (section 4).
+- History is the bulk: ~19B rows a year (~2.8 TB), append-only, partitioned by month; the live records are only 50 GB and the workflow config 56 MB.
+- Rules the database itself must enforce: the status-and-version predicate, strict-mode transitions, "a status in use cannot be deleted" (composite foreign key), one initial status per workflow.
+- Reads: lists by stage and status, "stuck for 3 days", time in status.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the whole move is one statement: `UPDATE … RETURNING` feeds the history `INSERT` and the outbox `INSERT` through data-modifying CTEs, so three writes commit together in one round trip (9.3); partial indexes (`one_initial_status`, and `tickets_stuck` that skips archived and deleted rows); declarative monthly partitions for `status_history` |
+| MySQL (RDS / Aurora) | ✔ works, with a workaround | no `RETURNING`, and a CTE cannot hold an `UPDATE` or `INSERT`, so the move is a short transaction of separate statements; the `version` predicate still decides, so correctness is unchanged. Partial indexes need a generated column or a wider index. Range partitions exist, with the same rule that every unique key includes the partition key |
+| DynamoDB | ✖ poor fit | the move itself maps well (a conditional write on status and version; `TransactWriteItems` over record, history and outbox is 3 items, limit 100), but "stage = open and status = waiting" lists, "stuck" queries and bulk moves by filter need GSIs keyed by tenant, so one big tenant meets the ~1,000 writes/s per partition limit |
+| ClickHouse / Redshift / Athena | ✔ only as a derived store for history | 19B append-only rows aggregated by status and day is the shape it likes; the outbox rollups of 9.5 avoid needing it until ad-hoc dwell questions outgrow them; never the record |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.4xlarge` with a `db.r7g.2xlarge` replica for lists and reports (section 15). It wins on the one-statement move with `RETURNING` and CTEs (9.3), on the composite foreign keys plus trigger-protected system rows that make illegal states unrepresentable (9.1), and on partial indexes and monthly partitions that carry ~3 TB of history. Records, history and outbox share one system of record, which is what makes the outbox transactional; the MSK broker, the dwell rollups, notifications and any search index are derived from the outbox. History older than 13 months leaves for S3 (section 15).
+
+**If it were MySQL instead:** the move becomes `BEGIN`; conditional `UPDATE` (the strict-mode `EXISTS` subquery still works there); zero rows means the follow-up `SELECT` of the Go code; `INSERT` history; `INSERT` outbox; `COMMIT`. That is two more statements per move, ~6k more a second at the 3k/s peak, and SQL assembled in Go instead of one string. `one_initial_status` becomes a generated column that is `NULL` unless `is_initial`, with a unique index; `tickets_stuck` becomes a plain `(tenant_id, status, status_changed_at)` index that also holds archived rows. There is no vacuum to tune on the update-heavy `tickets` table. Workable, with more code on the hot path.
+
+**What would flip the choice:** at 10× (30k moves/s, ~90k row writes/s) section 15 shards Postgres by `tenant_id` into 8. That is also where DynamoDB for tickets and history becomes a real option (the cheat sheet's threshold is tens of thousands of sustained writes/s), paid for with the list and report queries (OpenSearch or GSIs for lists, Athena for history). The cheaper step before it is moving closed months of history to S3 and Parquet.

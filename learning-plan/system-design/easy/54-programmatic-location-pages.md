@@ -339,3 +339,55 @@ impressions with a watermark and backfill ([47](47-web-analytics.md) §9.4).
 - **Demand-first generation:** start from search-demand data and generate only candidates above a threshold; what that does to the matrix size.
 - **Multilingual and multi-country:** `hreflang` between place pages and the gate per market.
 - **Penalty drill:** rehearse the rollback of the newest wave and measure how long sitemap, CDN and redirects take to settle.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). Tiny hardware: the gate cuts 12M candidates to ~600k live pages, so serving, the duplicate check and the stats are all small. The interesting cost is the bytes the CDN sends.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Page servers (Go, server-rendered HTML + JSON-LD, behind the CDN) | ~1.2k views/s peak (230/s average); sized for a cold CDN, though ~10 % reach the origin if it hits 90 % (assumed) | CPU | 1.2k × 3 ms (render, assumption) = 3.6 vCPU. N = ceil(3.6 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.7) = 2 → 3. Memory: ~50 KB per in-flight render, well under 8 GiB | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS | 3, one per zone | even with no CDN at all the whole peak is 3.6 vCPU, so a few small instances for availability and a cold CDN; render is CPU, so `c`. A not-live page answers 404 without touching the database beyond one key read |
+| Batch workers (gate, assemble, simhash scan, stats rollup, sitemap build) | nightly pass 3.3k signal rows/s for an hour; 4.5 × 10⁸ popcounts after the gate | CPU, in bursts | gate ≈ 0.1 ms per pair incl. its DB share (assumption) × 3.3k/s = 0.33 vCPU. Scan: 1.8 × 10¹¹ × ~1 ns = 180 s on one core for all candidates, 4.5 × 10⁸ × 1 ns = 0.45 s after the gate; all 12M hashes = 96 MB. N = 1 | `c7g.large` (2 vCPU / 4 GiB) | 2 (one spare so a lease can fail over) | no cluster and no LSH: the scan fits in seconds and megabytes. A backlog only delays new pages (section 10), so these could even run on Spot |
+| Postgres (`location_pages`, `page_signals`, `page_stats_daily`) | 12M candidate rows 2.4 GB, signals ≈ 0.8 GB (12M × ~64 B), live pages 600k × ~3 KB = 1.8 GB, stats 9 GB a year | memory (hot set), then little | hot set ≈ 2.4 + 0.8 + 1.8 + ~1 index + ~1 recent stats = 7 GB: fits 16 GiB. IOPS: 3.3k signal updates/s in key order dirty ≈ 3.3k × 64 B ÷ 8 KB ≈ 26 pages/s; in random order up to 3.3k/s, so gp3 at 4,000 IOPS. CPU: 3.3k updates + 3.6k render reads/s (worst case, cold CDN) × 0.1 ms ≈ 0.7 of 2 vCPU | `db.r7g.large` (2 vCPU / 16 GiB), RDS Multi-AZ, gp3 100 GB | 1 primary + synchronous standby | the cheapest shape with 16 GiB for the hot set (`m7g.xlarge` has the same RAM and 2× the CPU we do not use: $120 vs $78); Multi-AZ because every CDN miss reads it |
+
+**CDN (CloudFront), S3 and the AI drafts:** nothing to size. The 12 sitemap files (600k URLs × ~100 B ≈ 60 MB) sit in S3. Egress is the bill: 20M views a day × ~100 KB (assumed average: ~15 KB of compressed HTML plus images, CSS and JS over first and repeat visits) = 2 TB/day ≈ 61 TB a month. The 590k tier-2 intros are ~0.5B tokens one-off (590k × ~900), spread over waves: a hosted model API priced per token (not in the sheet), not GPUs.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| CloudFront egress: 61 TB × $0.085/GB (first-tier price, an upper bound) | $5,200 |
+| Page servers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Batch workers: 2 × `c7g.large` (2 × $53) | $110 |
+| Postgres: `db.r7g.large` ≈ $156, Multi-AZ doubles | $310 |
+| gp3 100 GB × 2 (standby) × $0.08, plus 1,000 extra IOPS × 2 × $0.005 | $30 |
+| ALB for origin traffic | $20 |
+| **Total** | **≈ $6,000** (≈ $5,700 with a 1-year plan on the $740 of instances and RDS; egress and storage not discounted) |
+
+- **Biggest line and why:** CloudFront egress, ~87 % ($5,200 of $5,990): the hardware is only ≈ $790 a month. The lever is page weight, not servers: each 10 KB of average page weight is ≈ $520 a month (20M × 10 KB = 200 GB/day × 30.4 × $0.085), so lazy images and long-cached, shared CSS and JS are worth more than any instance change. The AI intro tokens are a one-off third-party cost outside this table.
+- **What changes at 10×:** 120M candidates, 6M live (section 10). The first thing to run out is the signal refresh: 120M ÷ 3,600 = 33k rows/s, which in random order is ~33k page writes/s, past gp3's 16,000 IOPS cap; keep key order (≈ 260 pages/s) and re-gate only dirty pairs from the outbox, as section 10 says. The hot set becomes ~70 GB (24 + 8 + 18 + ~10 + ~10), more than 64 GiB, so `db.r7g.4xlarge` (128 GiB, ≈ $620 × 2 managed × 2 Multi-AZ ≈ $2,480). The simhash scan grows with the square of pages per service: 4.5 × 10¹⁰ popcounts ≈ 45 s on one core, still no LSH, while all candidates would be 1.8 × 10¹³ ≈ 5 hours, which is why the gate runs first. Page servers stay at 3 behind a 90 % CDN hit rate; if views also grow 10×, egress becomes ≈ $52k and page weight becomes the project.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- A matrix of 12M candidate rows (~2.4 GB, key `(service_id, place_id)`), 12M `page_signals` rows (~0.8 GB) and ~600k live pages (~1.8 GB): a hot set of ~7 GB (sections 4, 15).
+- The gate joins signals to pages and runs on the dirty set (a nightly pass is at most ~3.3k row updates/s), under one hard invariant: nothing is `live` without `gate_passed_at` and a non-empty intro (`live_needs_gate`, section 8).
+- Reads are small: ~230 views/s (1.2k/s peak) behind a CDN, each a primary-key lookup, plus hubs and sitemaps that list live pages by state and wave. A wave rollback is one `UPDATE … WHERE wave_id = $1` (9.4).
+- Stats: 600k pages × 365 days ≈ 219M rows a year (~9 GB), read as cohort aggregates by `(wave, tier, service)`.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the `CHECK` refuses a `live` row that skipped the gate, from every writer (a script, an import); the partial index `WHERE state = 'live'` covers 600k rows instead of 12M; the gate's join, the cohort `GROUP BY`s and the rollback are plain SQL in one transaction. Cost: each nightly update leaves a dead row version, so autovacuum must keep up with `page_signals` |
+| MySQL (RDS / Aurora) | ✔ works, with one workaround | `CHECK` is enforced from 8.0.16 (`btrim` becomes `TRIM`); there is no partial index, so the live lookup is a full index over 12M rows, 20× the entries. InnoDB's clustered key `(service_id, place_id)` makes the nightly key-order pass sequential by construction, and there is no vacuum |
+| DynamoDB | ✖ poor fit | the gate is a join and ad-hoc counting ("which candidates fail only the demand gate?"), and there is no table-level constraint: "live implies gated" would hold only where each writer adds a condition, which a script can skip |
+| ClickHouse / Athena (stats only) | ✖ not yet | 219M rows a year is well below the billions where an analytics store pays; one cohort query reads 600k pages × 30 days = 18M rows |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.large`, gp3 100 GB, section 15), one database for the matrix, signals and stats. The decisive feature is the `CHECK` that turns "published implies passed the gate" into a database invariant (9.1), with the partial index keeping the live lookup small. Sitemap files (S3) and rendered pages (CDN) are derived from `state`; the simhash comparison runs in memory (96 MB of hashes, section 15), so nothing else needs a store.
+
+**If it were MySQL instead:** mostly portable. `jsonb` becomes `JSON`, the partial index becomes a full `(state, service_id, place_id)` index on 12M rows, and the `CHECK` works on 8.0.16 and later (earlier versions parse and ignore it, so check the engine version first). The monthly partition of `page_stats_daily` is fine because its key already contains `day`.
+
+**What would flip the choice:** at 10× (120M candidates, 6M live, hot set ~70 GB on a `db.r7g.4xlarge`, section 15) one primary still holds. The first part to leave is `page_stats_daily`, ~2.2B rows a year: move it to ClickHouse or Parquet in S3 with Athena. If the matrix itself outgrows one primary, shard by `service_id`: the key starts with it and the duplicate scan already works per service (9.2).

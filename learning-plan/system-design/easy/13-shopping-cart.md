@@ -283,3 +283,57 @@ After commit: emit `order.created` (outbox, task 10) for payment, email (task 12
 - **Multi-currency / tax**: price books per region, tax at checkout; what changes in the snapshot?
 - **Real-time stock warnings** on the cart page via SSE (lesson 58).
 - **Cart in multiple regions:** where is the truth for a user travelling between EU and US datacenters?
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Cart API (Go, stateless) | 50k reads/s + 5k writes/s | CPU | reads 50k × 0.15 ms = 7.5 vCPU; writes 5k × 0.4 ms = 2 vCPU; total 9.5 vCPU. N = ceil(9.5 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.2) = 3 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS or EKS | 3, one per zone | JSON, one Redis call and an occasional SQL statement is pure CPU work; memory use is about 2 GiB of 16, so `c` (2 GiB per vCPU), not `m`. 40 % busy normally, 59 % with a zone down |
+| Redis (hot carts, cache-aside, 1 h TTL) | 55k ops/s (50k reads + 5k rewrites); hot set = carts touched in the last hour | memory | assume 10 % of the 50M carts = 5M × 2 KB = 10 GB × ~1.7 overhead = 17 GB; `maxmemory` ≤ 70 % of RAM ⇒ ≥ 24 GB; 55k ops/s is under one core's ~100k | `cache.r7g.xlarge` (4 vCPU / 32 GiB), ElastiCache | 1 primary + 1 replica in another zone | Memory-bound, so the `r` family (8 GiB per vCPU; `m` would need 8 vCPU for 32 GiB, `c` 16). CPU sits at about half a core. Reads go to the primary: a replica read could miss the user's own write (section 3, read-your-writes). A second shard only when memory or ops double |
+| Postgres (carts, cart_items) | 100 GB (≈ 150 GB with indexes, assumption); 5k committed writes/s | memory, then IOPS | hot set ≈ 10 GB rows + 5 GB indexes fits in 64 GiB; ≈ 2 IOPS per committed write (WAL flush + dirty pages, assumption) = 10k, + ~1k miss reads ⇒ `gp3` 200 GB at 12,000 IOPS (cap 16,000); CPU: 5k × 0.5 ms + 2.5k Redis misses × 0.2 ms ≈ 3 of 8 vCPU | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ | 1 primary + synchronous standby | RAM holds the hot set, so misses stay rare; `r7g.xlarge` (4 vCPU) would sit at 75 % CPU. gp3 is enough below 16k IOPS; above that move to `io2` or NVMe (`i4i`) with replicas. Reads never reach it, because Redis answers them (95 % hit, assumption) |
+
+Product enrichment (500k lookups/s) runs in-process from a local cache of hot SKUs: ~1M SKUs × 500 B = 500 MB per node (assumption), about 0.1 vCPU at 0.2 µs a lookup, already inside the 0.15 ms per read. The catalogue service that feeds that cache is another system and is not sized here. Expiry and abandoned-cart jobs are batched scans of `carts_abandoned_idx`: a scheduled ECS task, no instance of their own.
+
+Network: assume ~0.5 KB per response on average (badge counts ≈ 0.3 KB, full carts ≈ 2 KB), so 55k × 0.5 KB = 27.5 MB/s (220 Mbit/s) at peak, about 9 MB/s per API node. Nothing is network-bound; the cost is the transfer itself (below).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.2xlarge` (3 × $212) | $640 |
+| Redis: 2 × `cache.r7g.xlarge` (2 × $310) | $620 |
+| Postgres: `db.r7g.2xlarge` ≈ $620 managed, Multi-AZ doubles | $1,240 |
+| gp3 200 GB + 9k extra IOPS: (200 × $0.08 + 9,000 × $0.005) × 2 for the standby | $120 |
+| ALB: $16 + ≈ 30 LCU-hours average (8 MB/s ≈ 30 GB/h, 1 GB/h per LCU) × $0.008 × 730 | $190 |
+| Internet egress: 27.5 MB/s peak, ~30 % average ≈ 8.25 MB/s ≈ 21.7 TB a month × $0.09 | $1,950 |
+| Cross-zone calls: ⅔ of Redis (≈ 13 TB) and Postgres (≈ 3 TB) traffic, ≈ 16 TB × $0.02 | $310 |
+| **Total** | **≈ $5,100** (≈ $4,200 with 1-year commitments on the three compute lines) |
+
+- **Biggest line and why:** data transfer (≈ 45 %: egress $1,950 + cross-zone $310), not servers: 55k small responses a second add up to ≈ 22 TB a month. The database is next (≈ 27 % with its disk) because a cart becomes an order and must survive a zone loss. The lever is fewer and smaller responses (derive the badge from the last cart response instead of polling it, compress), not a smaller instance.
+- **What changes at 10×:** 550k req/s ⇒ 75 + 20 = 95 vCPU ⇒ N = ceil(95 ÷ 4.27) = 23 → 24 × `c7g.2xlarge`. Enrichment at 5M lookups/s (section 10's first break) stays in-process, ≈ 1 vCPU, if the local cache is fed by a change feed instead of per-node refreshes. Redis at 550k ops/s is 5.5 cores ⇒ cluster mode, 6 shards (8 if carts also grow 10×: ≈ 240 GB of RAM). 50k writes/s ≈ 100k IOPS is past gp3 and past one primary ⇒ shard carts by user id, ~10 shards each at today's 5k writes/s: the first real architecture change. Egress scales to ≈ $19.5k a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two small relational tables, `carts` and `cart_items` (primary key `(cart_id, sku)`): 50M live carts ≈ 100 GB, ~5k writes/s and ~50k reads/s at peak (section 4). Redis answers the reads, so the database sees the writes and the cache misses.
+- One invariant must hold under races: one active cart per user (section 8). Merge and checkout are multi-row transactions with `FOR UPDATE` (9.3, 9.6), and checkout also decrements stock and inserts the order.
+- The owner needs read-your-writes; marketing needs SQL over carts ("active and untouched for 24 h").
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the partial unique index `carts_one_active_per_user … WHERE status = 'active' AND user_id IS NOT NULL` makes a second active cart impossible, `carts_abandoned_idx` covers only active carts, `INSERT … ON CONFLICT` merges lines, and cart, stock and order commit in one transaction |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | no partial indexes: a generated column `IF(status = 'active', user_id, NULL)` with a unique index enforces the same rule (NULLs never collide), the abandoned-cart index has to cover every status, and `ON DUPLICATE KEY UPDATE` replaces `ON CONFLICT`. The real change is the `UUID` primary key: a random value as InnoDB's clustered key splits pages across 50M carts. In its favour: key `(cart_id, sku)` keeps a cart's ≤ 100 lines together on disk |
+| DynamoDB | ✔ for the cart alone, ✖ for checkout | one item per cart (2 KB, far under 400 KB), native TTL for guest expiry, and 5k writes/s is easy; but "one active cart per user" needs a second lock item written in a transaction, abandoned-cart analytics need a GSI or an export, and a full 100-line checkout touches ≥ 102 items (100 stock rows, the order, the cart) against the 100-item transaction limit |
+| Redis (ElastiCache / MemoryDB) | ✖ as the record, ✅ chosen as the cache | a Redis incident would lose every cart and there is no SQL for analytics (9.1); as the cache-aside copy of the hot ~5M carts it answers the 50k reads/s. MemoryDB would make it durable, but not queryable or transactional with the order |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (the `db.r7g.2xlarge` of section 15) as the system of record, because the partial unique index turns "one active cart per user" into a database guarantee and checkout is one ordinary transaction across cart, stock and order. ElastiCache Redis (`cache.r7g.xlarge`) holds derived, rebuildable cart copies.
+
+**If it were MySQL instead:** the same two tables on the same instance shape, with three edits: a generated column plus unique index for the one-active-cart rule; a `BIGINT` auto-increment primary key, with the random 128-bit cart id (the guest cookie, section 10) as a unique `BINARY(16)` key so inserts append; and an abandoned-cart index over all 50M rows instead of the active ones only (still small next to 100 GB). The guarantees do not change, only three schema workarounds to document.
+
+**What would flip the choice:** ~50k cart writes/s (the 10× case in section 15) outgrows one primary, and the answer is sharding carts by user id, not another engine. DynamoDB becomes attractive only if checkout stops needing one transaction with stock (a saga instead) and the abandoned-cart queries move to an export.

@@ -317,3 +317,54 @@ The seed labels its zone next to time fields (`ZoneLabel`) and shows `3:42:07 PM
 - **Live tzdata updates:** deploy new zone data without a rebuild, and a shadow comparison of Go vs Postgres windows on canary dates.
 - **Multi-zone tenants:** a chain of stores in five zones that wants "yesterday, per store, in the store's zone" and one company total; what is the company's day?
 - **Historical zone correctness:** tenants who migrated from another system with local-time-only timestamps; reconstructing instants from ambiguous local times (the fall-back hour).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-event figure is an assumption). The time-zone logic needs no hardware of its own: a day window is microseconds of CPU, and the day-close herd is ~3 closes a second. What costs money is the event volume the lesson inherits (175k events/s at peak, a 690 GB grid), so these rows size that pipeline, and the last paragraph prices what the 15-minute grid adds.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Ingest + pre-aggregator (Go: decode, bucket by tenant and 15 minutes, count in memory, flush rows, append raw events) | ~175k events/s at peak, 58k/s average (§4); ~100 B each = 17.5 MB/s in | CPU | batched by the SDKs, ~20 µs per event (decode, bucket, counter) = 3.5 vCPU. N = ceil(3.5 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.6) = 2 → 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | CPU only: counters are ~100k tenants × 20 series × ~24 B ≈ 50 MB per open bucket, far under 8 GiB, so `c`. 29 % busy, 44 % with a zone down. If every event were its own HTTP request the sheet's 3–10k requests/s per vCPU would mean 18–58 vCPU: batching is a hardware decision |
+| Postgres (`events_15m`, `daily_rollups`, tenants, statements) | grid writes ~2.2k rows/s average, ~6.7k at 3× peak (192M rows/day, §4); day-close ~10k jobs/hour × 1,920 rows read; 690 GB for 90 days + 29 GB/year of daily rows | memory (today's partition), then write IOPS and disk | hot set = today + yesterday (late events recompute) = 2 × 7.7 GB ≈ 15.4 GB ⇒ 32 GiB. IOPS: ~1 per upserted row at peak (`tenant_id` leads the key, so the leaf pages are scattered; assumption) = 6.7k ⇒ `gp3` at 8,000 IOPS; average 2.2k fits the 3,000 included. Disk 720 GB ⇒ 1 TB. CPU: 6.7k × 20 µs = 0.13 vCPU + closes 2.8/s × 1,920 rows ≈ 0.1; under 0.5 of 4 vCPU | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ, 1 TB `gp3` at 8,000 IOPS | 1 primary + synchronous standby | the grid is the source of truth (the raw events are short-lived), so Multi-AZ. `r` because the hot set must stay in RAM and `m7g.xlarge` (16 GiB) is too tight; CPU sits near 10 %. A 30-day chart reads ~600 daily rows, so reports barely touch it |
+| Report API + day-close workers (Go) | report requests are not in §4: assume 1k/s at peak; closes ~10k/hour ≈ 2.8/s | CPU, barely | reports 1k × 0.5 ms (window maths, ≤ 600 rows of JSON) = 0.5 vCPU; closes 2.8 × ~3 ms = 0.01. N = ceil(0.5 ÷ 1.07) = 1 → 3 | `c7g.large` | 3 | three for the zones, not the load; ~8 % busy at peak |
+
+Raw events are not on the report path (§4: short retention): 500 GB a day in S3, assuming 7 days kept = 3.5 TB, expired by lifecycle rule. The ingest edge is an ALB, and it bills by bytes: 58k events/s × 100 B = 20.9 GB an hour = 21 LCU × $0.008 × 730 ≈ $120, plus $16. The price of correctness in half-hour zones is small: the 15-minute grid holds 690 GB where hourly buckets would hold ~173 GB (1.9 GB a day × 90), so 517 GB more disk ≈ $83 a month with the standby copy.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Ingest: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Report API + close workers: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.xlarge` ≈ $310 managed, Multi-AZ doubles | $620 |
+| gp3 1 TB ($80) + 5,000 extra IOPS ($25), × 2 for the standby | $210 |
+| S3: raw events, 3.5 TB × $0.023 | $80 |
+| ALB: $16 + 21 LCU × $0.008 × 730 | $140 |
+| **Total** | **≈ $1,530** (≈ $1,140 with a 1-year plan on the $1,100 of steady compute) |
+
+- **Biggest line and why:** Postgres plus its disks (≈ $830, 54 %), because the grid is the only copy of the facts that every daily and monthly number is rebuilt from. The zone logic is $0; the ALB's per-byte charge ($140) costs more than the 15-minute grid's extra disk ($83). Lever: a shorter online grid than 90 days.
+- **What changes at 10×:** 1.75M events/s at peak (§10): 35 vCPU ⇒ N = ceil(35 ÷ 2.13) = 17 → 18 × `c7g.xlarge` (≈ $1,890). Grid writes reach ~22k rows/s on average, ~66k at peak, past one `gp3` (16k IOPS): flush less often so each row is touched once per bucket, or shard by tenant hash. The grid grows to ~6.9 TB and the hot set to ~154 GB, which suggests shards of `db.r7g.xlarge` rather than one 256 GiB node. The ALB's byte charge rises to ≈ $1,240.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Mostly instants and counters: 5B events a day roll up into 192M 15-minute rows a day (~7.7 GB, ~2.2k rows/s average, ~6.7k at peak), 690 GB for the 90 days kept, and ~29 GB a year of daily rows (sections 4 and 15).
+- Tiny reads: a 30-day chart is ~600 daily rows; a day close reads 96 × 20 grid rows per tenant (~10k closes an hour); the reconcile job sums the grid.
+- The data is about time, so the types matter: instants, calendar dates, zone-less local times plus an IANA id for future events, and a `zones` table with foreign keys (9.1). The lesson computes day windows in Go and hands SQL plain instants (9.2, 9.5); two queries still name a zone in SQL: the `generate_series` window query (9.2) and the `AT TIME ZONE $1` re-bucket (9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `timestamptz` (an instant: stored as UTC, shown in the session `TimeZone`), zone-less `timestamp` and `date` are three distinct types, so the five kinds of 9.1 map onto types; `AT TIME ZONE` converts in both directions (instant to local and local to instant); `generate_series(timestamp, timestamp, interval)` yields the local-day windows; day partitions and an upsert for the replace-style close |
+| MySQL (RDS / Aurora) | ✔ works, with care: time is where the engines differ most | `DATETIME` has no zone and is stored as written; `TIMESTAMP` is UTC internally but converted through the session `time_zone` on write and read, and ends at 2038-01-19; no `generate_series` (a recursive CTE or a calendar table); no two-way `AT TIME ZONE`, `CONVERT_TZ(value, from, to)` instead, which returns `NULL` for a named zone unless the server's time zone tables are loaded |
+| ClickHouse | ✔ works, not needed yet: the 10× home of the grid | `DateTime('UTC')` columns, functions that take a zone argument (`toStartOfDay(ts, 'America/New_York')`), and a summing table engine suit an append-and-aggregate grid; tenants, zones and statements (foreign keys, money documents) stay in a relational database |
+| DynamoDB | ✖ poor fit as the whole store | the grid fits as a key (tenant and series, `bucket_start` as sort key) with atomic `ADD` counters, but there is no `GROUP BY` or zone conversion: every re-slice, day close and reconcile is application code summing items, and the `zones` foreign key and `CHECK` guards disappear |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, the `db.r7g.xlarge` with 1 TB `gp3` at 8,000 IOPS from section 15: today's and yesterday's partitions (~15 GB) sit in 32 GiB, the grid is partitioned by day so retention is a drop, and the time types and `AT TIME ZONE` say what each column means. The grid is the source of truth; `daily_rollups` are derived and replaced on every close; `statements` freeze their own `tz`, `starts_at` and `ends_at`. Postgres carries its own tzdata, one of the "two tzdatas" of 9.5, so keep the canary-date check against Go.
+
+**If it were MySQL instead:** the tables port, but each time column is a decision. `local_start` is a `DATETIME` (zone-less is exactly what it means). Instants (`bucket_start`, `starts_at`, `tz_since`, `effective_from`) are either UTC `DATETIME` by convention (no conversion can touch them) or `TIMESTAMP` with every connection pinned to `time_zone = '+00:00'` (and `loc=UTC` in the Go driver): a pool where sessions disagree shifts values silently, the same hidden-input trap as `timestamptz + interval` in 9.2, and a `TIMESTAMP` `starts_at` cannot hold a date after 2038. Daily partitions use `RANGE COLUMNS` on the `DATETIME`. The window query becomes a recursive CTE or a calendar table, or, better, the Go function's windows passed in as instants. The re-bucket query needs `CONVERT_TZ` with loaded zone tables, which are one more copy of tzdata next to Go's; the lesson's own rule (windows from one function, SQL compares instants) avoids that dependency in either engine.
+
+**What would flip the choice:** at 10× the grid is ~22k rows/s on average, above the ~10k durable writes/s the cheat sheet gives one primary, and ~6.9 TB: section 15's first remedy is fewer, larger flushes (each row touched once per bucket), then sharding by tenant hash or moving the grid to ClickHouse, with tenants, zones and statements staying in Postgres. Nothing about time zones itself would change the engine.

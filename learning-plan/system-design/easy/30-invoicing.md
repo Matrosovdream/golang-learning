@@ -348,3 +348,56 @@ func taxMinor(amountMinor, ratePPM int64) int64 {
 - **Double-entry ledger export:** every invoice, payment and credit note as balanced entries (see the blockchain track's ledger project and the medium backlog's payment service).
 - **Multi-entity sellers:** several legal entities per tenant, each with its own series and rates.
 - **Statements:** a customer's open invoices and balance, sent through [12](12-notification-service.md).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Invoice API + billing-run workers + payment sync (Go, stateless) | run ~350 invoices/s over 4 h (58/s over 24 h); payments ~23/s avg, assumed 5× = 115/s at peak; portal reads ~300/s (assumed) | CPU, tiny | run 350 × 1 ms (totals, tax, snapshots) = 0.35 vCPU; payments 115 × 1.5 ms (verify, inbox, re-read PSP, apply) = 0.17; reads 300 × 0.3 ms = 0.09; total ≈ 0.6. N = ceil(0.6 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | the run is limited by 5 ms of Postgres per invoice and one counter lane per tenant, not by Go; memory is small, so `c` |
+| PDF renderers (headless browser or a Go library) | ~10 % of 5M opened on a run day = 0.5M PDFs × 0.2 s = 28 CPU-hours (eager would be 278) | CPU (+ ~0.5 GB RAM per concurrent browser) | opens cluster in ~8 h: 0.5M ÷ 28,800 s = 17/s × 0.2 s = 3.5 vCPU, peak ~2× = 7. N = ceil(7 ÷ (0.8 × 8 × ⅔ = 4.27)) = 2 → 3 | `c7g.2xlarge` (8 vCPU / 16 GiB), on Spot | 3, scaled by queue depth | CPU-bound, so `c`; 8 concurrent renders × 0.5 GB = 4 GB of 16. Rendering is deterministic and content-addressed, so a Spot reclaim only repeats a job. Graviton if the renderer has an arm64 build, else x86. Eager rendering would need 1M CPU-s ÷ 14,400 s ≈ 70 vCPU for 4 h a day |
+| Postgres (invoices, lines, payments, credit notes) | run ≈ 350 × ~14 rows ≈ 4.9k row writes/s in batches of ~500; ~600 GB/yr, 3 years kept ≈ 1.8 TB | memory, then CPU during the run | hot set = recent invoice headers (45 days ≈ 30M × 0.5 KB = 15 GB) + payments (90M × ~100 B = 9 GB) + their indexes ~12 GB ≈ 36 GB (assumed) ⇒ 64 GiB. CPU 350 × 5 ms = 1.75 vCPU of 8 (22 %). IOPS ≈ 4 index pages per invoice × 350 = 1.4k + payments ~0.3k ≈ 1.7k, inside the 3,000 included | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ, `gp3` 2 TB (self-managed: `r7g.2xlarge`) | primary + sync standby; no replica yet | RAM decides (headers and payments cached), CPU and IOPS stay small, so `r`; the lesson's "one primary handles 350/s" holds with room. Multi-AZ because this is the book of record |
+
+S3 holds the PDFs (nothing to size): 10 % of 20M = 2M a month × 60 KB = 120 GB a month ≈ 1.4 TB after a year. Email (20M a month) goes through the notification service ([12](12-notification-service.md)); at an SES-like ≈ $0.10 per 1,000 (outside the cheat sheet, re-check) that is ≈ $2,000 a month, not in the total.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API / run / payments: 3 × `c7g.large` (3 × $53) | $160 |
+| PDF renderers: 3 × `c7g.2xlarge` (3 × $212), ≈ $190 on Spot | $640 |
+| Postgres: `db.r7g.2xlarge` ≈ $620, Multi-AZ doubles | $1,240 |
+| `gp3` 2 TB ($160) × 2 for the standby (3,000 included IOPS is enough) | $320 |
+| S3: ~1.4 TB × $0.023 (after year one, +$33 each year kept) | $35 |
+| ALB + egress (PDF downloads ~120 GB, portal) | $50 |
+| **Total** | **≈ $2,450** (≈ $1,950 with a 1-year plan on API and database; ≈ $1,500 with the renderers on Spot too) |
+
+- **Biggest line and why:** the database tier (~64 %, volumes included), because the invoice is the system of record: two copies of 1.8 TB and a Multi-AZ memory node, for a load the CPU barely feels (1.75 vCPU). The real money is outside this bill: email (~$2k) and the payment provider's fee on every payment. The AWS lever is to detach partitions older than the audit window to S3 (`$0.023` against `$0.08` per GB-month, and out of the standby's copy).
+- **What changes at 10×:** 3.5k invoices/s ⇒ 17.5 vCPU of database time and ~49k row writes/s, past one `r7g.2xlarge`, so shard by tenant (the lesson's issuer lanes already run per tenant) into 4 × `db.r7g.2xlarge` Multi-AZ (≈ $5k, ~55 % busy each). PDFs: 70 vCPU peak ⇒ N = ceil(70 ÷ 4.27) = 17 → 18 × `c7g.2xlarge` on Spot (≈ $1.1k at ~30 % of on-demand). Email becomes ≈ $20k.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- We are the system of record for money: 240M invoices a year, ~600 GB a year and ~1.8 TB over 3 years kept, each invoice a header plus ~10 lines written in one transaction (section 4).
+- The run writes ~4.9k rows/s for 4 hours in batches of ~500; the hot set (recent headers, payments, indexes) is ~36 GB (section 15).
+- Invariants the data must hold: numbers unique per tenant, `billing_run_key` and payment `external_id` unique, lines frozen after issue, no two tax rates for one jurisdiction on one day.
+- Payments are applied under a row lock with a recomputed sum; auditors ask questions like "every invoice that used rate X" (section 10).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | transactions, `CHECK`s, unique keys and `FOR UPDATE` carry the invariants; `ON CONFLICT DO NOTHING` makes runs and payments idempotent; the exclusion constraint on `tax_rates` stops overlapping dated rates; `jsonb` snapshots, a stored generated `amount_due`, and the freeze trigger |
+| MySQL (RDS / Aurora) | ✔ works, small workarounds | the invoice path is portable. Only the rate-overlap constraint has no equivalent, and `tax_rates` is tiny and written a few times a year (check under a lock, audit nightly). The `WHERE number IS NOT NULL` partial uniques become plain `UNIQUE` indexes, because a unique index accepts many `NULL`s. InnoDB clusters `invoice_lines (invoice_id, line_no)`, so an invoice's lines are contiguous |
+| DynamoDB | ✖ poor fit as the record | issue and payment idempotency map to conditional writes (a header plus 10 lines is 11 items, under the 100 limit), but audits and reconciliation are ad-hoc queries and joins over years of rows: "invoices with rate X" would be a scan or an export |
+| S3 | ✅ for the PDFs, ✖ for invoice data | `pdf/{tenant}/{input-hash}.pdf` is a key per object (9.4); the database keeps only `pdf_key` |
+| Athena / Redshift over exports | ✔ only as a derived store for audit and finance reports | an append-only copy of closed invoices and payments, rebuildable from Postgres; not an OLTP store |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.2xlarge` with `gp3` 2 TB and no replica yet (section 15), plus S3 for PDFs. The properties that decide it are the ACID transaction that issues a numbered, frozen invoice with its lines (9.2), the unique keys plus `ON CONFLICT DO NOTHING` that make runs, webhooks and payments safe to repeat (9.3, 9.5), and exact types (`BIGINT`, `NUMERIC`) with `CHECK`s. Postgres is the record; PDFs, email and accounting export are derived from frozen snapshots and can be regenerated.
+
+**If it were MySQL instead:** nothing material for the invoice path, which is why either engine is a sound choice here. Rewrites: `INSERT … ON DUPLICATE KEY UPDATE` as a no-op for `ON CONFLICT DO NOTHING`; the freeze trigger in MySQL's trigger syntax with `SIGNAL`; `invoices_open_idx` as a generated column or a `(status, due_on)` index; snapshots as `JSON` with a functional index for the rate query; the counter read back inside the transaction after the row lock (no `RETURNING`). Mind isolation: Postgres' default `READ COMMITTED` makes the post-lock `SUM(amount)` see every committed payment, while under MySQL's `REPEATABLE READ` a plain read made before the lock can leave the sum on an older snapshot, so run it as a locking read or use `READ COMMITTED`.
+
+**What would flip the choice:** 10× is 3.5k invoices/s, ~49k row writes/s, so section 15 shards by tenant into 4 nodes of the same engine (issuer lanes already run per tenant). Past a few TB per shard, closed partitions older than the audit window move to S3 and are queried with Athena rather than changing the record store. A requirement for multi-region active-active books, with no single primary per tenant, is the point to rethink the store.

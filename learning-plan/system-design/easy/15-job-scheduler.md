@@ -322,3 +322,53 @@ Temporal when jobs become multi-step workflows.
 - **`LISTEN/NOTIFY`** wake-ups for sub-second one-off jobs; measure the latency gain over polling.
 - **Durable execution** (Temporal-style): timers, retries and long sleeps as code; when does it beat this design?
 - **Observability dashboard:** scheduled-vs-actual lag histogram, dead-letter browser, manual re-run.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Dispatcher nodes (Go, identical, `SKIP LOCKED` loop; the job API runs in the same binary) | 1k dispatches/s average, 20k burst at :00; poll every 500 ms, batch 500 | drain rate set by the poll cadence, not CPU | CPU: 6,000/s × 0.4 ms (HMAC, JSON, one outbound call) = 2.4 vCPU, N = ceil(2.4 ÷ (0.8 × 2 × ⅔ = 1.07)) = 3. Drain: 2 polls × 500 = 1,000/s per node, so the lesson's 4 nodes empty 20k in 5 s; they must survive a zone loss ⇒ 6 nodes (4 left = 4,000/s = 5 s). Memory: ~1,200 calls in flight × ~10 KiB ≈ 12 MB | `c7g.large` (2 vCPU / 4 GiB) on ECS or EKS | 6, two per zone | Mostly waiting on targets with a little CPU, so the smallest `c`; memory is nowhere near 4 GiB. 20 % busy while draining at full cadence. The count buys availability and drain speed, not capacity |
+| Postgres (`jobs`, `runs`) | burst drain 6,000 dispatches/s (≈ 1k average); 10M jobs ≈ 3 GB; runs 17 GB/day kept 7 days | CPU and write IOPS (the hot set is small) | CPU: 6,000 × 0.5 ms (lease update, `runs` insert, outcome update, two indexes) = 3 of 8 vCPU; IOPS: ≈ 2 per dispatch (heap + `jobs_due_idx` churn + WAL with grouped commits, assumption) = 12k + ~1k other ⇒ `gp3` 14,000 (cap 16,000); hot set: `jobs` ≈ 3 GB × 2 (update bloat) + the day's `runs` tail < 16 GB; disk: runs ≈ 17 GB + ≈ 12 GB of indexes = 29 GB/day × 7 ≈ 200 GB + jobs ≈ 10 GB ⇒ 300 GB | `db.m7g.2xlarge` (8 vCPU / 32 GiB), RDS Multi-AZ | 1 primary + synchronous standby | Section 10 calls the database the scheduler's ceiling and its one availability bound, so it alone gets a standby. `m`, not `r`: the hot set is a few GB, so CPU and IOPS decide (38 % CPU at the burst). Drop the day's `runs` partition instead of `DELETE`, or the IOPS double. Above ~16k IOPS gp3 is the first limit (the 10× case) |
+
+Targets own their capacity: dispatch is publish-or-POST only. Assume half of the dispatches go to SQS and half to HTTP endpoints; 1k/s is 2.63 B a month (1,000 × 2,628,000 s). Job API traffic (`POST /jobs`, run history) is far below the dispatch rate (assume ≤ 500/s ≈ 0.5 vCPU) and needs no nodes of its own. Dispatchers sit in private subnets, so HTTP calls leave through NAT gateways.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Dispatchers: 6 × `c7g.large` (6 × $53) | $320 |
+| Postgres: `db.m7g.2xlarge` ≈ $480 managed, Multi-AZ doubles | $960 |
+| gp3 300 GB + 11k extra IOPS: (300 × $0.08 + 11,000 × $0.005) × 2 = (24 + 55) × 2 | $160 |
+| SQS: 1.31 B sends in batches of 10 ⇒ 131M requests × $0.40 per million (sent one by one: ≈ $530) | $50 |
+| HTTP targets: 1.31 B × ~1 KB ≈ 1.3 TB out × ($0.09 egress + $0.045 NAT) + 3 NAT gateways × $33 | $280 |
+| ALB for the job API: $16 + a few LCUs | $30 |
+| **Total** | **≈ $1,800** (≈ $1,350 with 1-year commitments on dispatchers and database) |
+
+- **Biggest line and why:** the database and its disk (≈ 62 %: $960 + $160 of $1,800): it is the throughput ceiling and the only stateful part, while the six nodes that do the dispatching cost a third of it. The per-dispatch lines are the surprise: SQS and NAT-routed HTTP together ($330) cost as much as all the dispatchers ($320), and 2.63 B dispatches a month is why batching the SQS sends (10× cheaper) matters.
+- **What changes at 10×:** 10k dispatches/s average and 200k jobs due in one second (section 10). Draining them in ~5 s needs 40k/s ⇒ ~42 dispatcher nodes (or batches of 2,500), and 40k/s is ≈ 20 vCPU and ≈ 80k IOPS of database work, past one primary and past gp3 ⇒ partition `jobs` by `hash(id)` over ~10 primaries (each at today's 4 to 6k/s) and jitter recurring jobs so the burst is ~3k/s over a minute instead. Run history grows to 170 GB/day: move it out of Postgres (batched writes to S3 or a columnar store). SQS and NAT/egress lines scale linearly to ≈ $3.3k a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- `jobs`: 10M rows ≈ 3 GB with one hot access path, "the next 500 due rows, never the same row on two nodes" (section 6). Every dispatch rewrites a row at least twice (lease, outcome): ~1k/s on average, ~6k/s while a :00 burst drains (section 15).
+- `runs`: 86M rows a day ≈ 17 GB/day, kept 7 days, with a deterministic `run_id` and `UNIQUE (job_id, scheduled_for)` as the dedupe handle.
+- Correctness over throughput (section 4): no due job lost across a crash, so durable commits and a standby. The database's availability bounds the scheduler's (section 10).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `FOR UPDATE SKIP LOCKED` hands each node a disjoint batch; the partial index `jobs_due_idx … WHERE status = 'scheduled'` holds only waiting rows, so the poll walks a short index; `JSONB` holds target, payload and policy; `LISTEN/NOTIFY` can wake pollers for one-offs; a retried occurrence re-inserting its `run_id` is `INSERT … ON CONFLICT DO NOTHING`. Cost: every status change leaves a dead row version and, because indexed columns change, is never heap-only, so autovacuum must keep up (section 15 budgets 2×) |
+| MySQL (RDS / Aurora) | ✔ works, with changes | `SKIP LOCKED` exists since 8.0, so the dispatch SQL is the same. Differences: no partial index, so `(status, next_run_at)` also indexes `done` and `dead` rows; the default `REPEATABLE READ` takes next-key locks on the index range the due-scan walks, so inserts into it (new jobs, the reaper returning leased rows) can wait or deadlock: run the dispatcher at `READ COMMITTED`; the `runs` insert becomes `ON DUPLICATE KEY UPDATE run_id = run_id`, and InnoDB's duplicate-key check locks the existing entry, so concurrent inserts of one `run_id` can deadlock (retry on error 1213); no `LISTEN/NOTIFY`, so polling only, which is the design's baseline anyway. In its favour: rows update in place, so no vacuum for this churning table |
+| Redis sorted set | ✔ as a later, derived due-index; ✖ as the record | score = `run_at` plus a Lua pop does 100k+/s, but leases, retries, history and cancellation must be rebuilt, and a Redis loss would forget jobs (9.5) |
+| DynamoDB | ✖ poor fit | a conditional update can take a lease, but the due-scan needs a time-bucket key, and a :00 burst of 20k/s lands on one bucket against the ~1,000 writes/s per-partition limit; lag and run-history queries are ad hoc |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.2xlarge`, section 15): `SKIP LOCKED` plus the partial due-index plus transactional lease and outcome updates give multi-node dispatch with no leader, and one durable store holds definitions, schedule, leases and history (9.5). Redis is not part of the design yet.
+
+**If it were MySQL instead:** the dispatch loop is unchanged apart from `READ COMMITTED` and a `(status, next_run_at)` index. For `runs`, partitioned by day (section 8): both engines need the partition column in every unique key, and InnoDB also rejects foreign keys on partitioned tables, so `REFERENCES jobs(id)` goes. A long text `run_id` as InnoDB's clustered key is copied into every secondary index, so give `runs` a small surrogate key and keep `run_id` as a unique key beside it.
+
+**What would flip the choice:** ~16k IOPS or ~6k dispatches/s is where one primary on `gp3` ends (the 10× case in section 15): partition `jobs` by `hash(id)` over ~10 primaries, still Postgres. A Redis due-index in front only if the dispatch rate outgrows the database (task 08 scale); run history leaves the database (S3 or a columnar store) at 170 GB/day; Temporal once jobs become multi-step workflows.

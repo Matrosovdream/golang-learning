@@ -252,3 +252,52 @@ high insert rates; it is rarely the first bottleneck.
 - **Obfuscated public IDs**: a bijective mix (Feistel or multiply-by-odd-constant) so public URLs don't leak volume; compare with hashids.
 - **Range leasing** implementation against Postgres (`UPDATE … RETURNING`), and what happens to ordering.
 - Write the base62 wrapper and connect it back to task 01.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Snowflake generator (library, chosen) | 100k IDs/s peak (10k/s today); one node's ceiling is 4.1M/s | CPU, negligible | `Next()` = mutex + `time.Now()` + shifts; assume 0.2 µs ⇒ 100k × 0.2 µs = 0.02 vCPU | no instances: it runs inside the services that already exist | 0 extra | nothing to buy: no network call on the request path (section 3) and one node is ~40× over the 100k/s target. Choosing a library over a service is what makes the hardware line zero |
+| Node-ID lease store | one write at start-up and one renewal per node every ~10 s (assumed): 50 nodes ≈ 5 writes/s, worst case 1,024 nodes ≈ 100/s | none | trivial row updates on `idgen_nodes` | a table in the existing Postgres/RDS (alternatives: DynamoDB conditional write; self-run etcd, 3 × `m7g.large` ≈ $180) | 0 new | a start-up and renewal dependency only (section 10), so a table in a database that already exists is enough; three etcd nodes for 5 writes/s would be the dearest part of this lesson |
+| ID service (Option B only) | 100k IDs/s in batches of 100 = 1k calls/s | CPU, tiny | 1k × 0.2 ms (HTTP + JSON of 100 numbers) = 0.2 vCPU. N = ceil(0.2 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS | 3, one per zone, each with its own node ID | availability, not load: one node could serve ~5× this. `c`, since memory use is ~100 MiB of 4 GiB. Needed only if clients can't be trusted to hold a unique node ID |
+
+Where the cost really sits: in the keys, not the generator. Every ID becomes a key in each index it appears in. At 10k IDs/s ≈ 315B IDs a year, storing 8 B (Snowflake) instead of 16 B (UUID) saves 8 B × 315B ≈ 2.5 TB per index per year, ≈ $200 a month of `gp3` per index at the end of year 1 (× 2 with a Multi-AZ standby). Random UUID v4 also splits pages and bloats the index (section 9.5).
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| ID generation: in-process library (~0.02 vCPU inside existing services) | $0 |
+| Node-ID leases: one table in the existing database | $0 |
+| ID service, Option B only: 3 × `c7g.large` (3 × $53) | $160 |
+| **Total** | **≈ $0** for the chosen design (≈ $160 with Option B, ≈ $100 with a 1-year commitment) |
+
+- **Biggest line and why:** there is none. This lesson needs no dedicated hardware; the spend that depends on it is key width in the databases that store the IDs (above). If you do run Option B, its three nodes are bought for availability: a single `c7g.large` would carry the load 5× over.
+- **What changes at 10×:** 1M IDs/s is 1M × 0.2 µs = 0.2 vCPU in-process, spread over the services, or 10k calls/s × 0.2 ms = 2 vCPU for Option B ⇒ N = ceil(2 ÷ 1.07) = 2 → 3, still 3 × `c7g.large`. Nothing runs out in hardware. The first limit is the 1,024-node ID space (section 10), fixed by re-splitting the bits; the lease store still sees ≤ 100 writes/s.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- No database on the request path: IDs are generated in-process at 10k/s, up to 100k/s, against a 4.1M/s ceiling per node (section 4), so the generator needs no store for the IDs themselves.
+- The only persistent state is node-ID assignment: `idgen_nodes`, at most 1,024 rows, written once at start-up and renewed about every 10 s per node, so ~5 writes/s for 50 nodes and ~100/s in the worst case (section 15).
+- The real database effect is on the databases that store the IDs: an 8-byte time-ordered key appends to the right of a B-tree; a 16-byte random UUID lands on random pages and is repeated in every index (sections 4, 9.5).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for the lease table | the table goes into the database the services already run (no new instance, section 15); a lease claim is one conditional `UPDATE … WHERE lease_until < now() … RETURNING node_id`, with `FOR UPDATE SKIP LOCKED` so two nodes starting together take different rows. `BIGSERIAL` is also the right ID source when one database is the only place IDs are needed (9.1) |
+| MySQL (RDS / Aurora) | ✔ works, interchangeable | the same table and conditional `UPDATE` (no `RETURNING`: read the row back by `owner`). Its Flickr-style ticket server, a one-row `REPLACE INTO`, is the option 9.1 rejects for putting a network call on every ID. As the store of the IDs the engine matters a little more: the row is the primary-key tree, so a random UUID v4 key scatters inserts across the whole table, and every secondary index carries a copy of the key |
+| DynamoDB | ✔ works (section 15's alternative) | a conditional put (`node_id` absent, or `lease_until` in the past) is the lease; ~100 writes/s worst case is far under ~1,000 per partition. Not worth a second database just for 5 writes/s if a relational one exists |
+| etcd / ZooKeeper | ✔ works, dear for the job | native leases with keep-alive and expiry are 9.3's first option, but three `m7g.large` nodes (≈ $180 a month, section 15) for ~5 writes/s is the priciest part of this lesson |
+| Redis (ElastiCache) | ✖ poor fit as the lease authority | `SET NX EX` is a lease, but replication is asynchronous (task 03 accepts that for rate limits): a failover can forget a held lease and hand the same node ID to a second generator, i.e. duplicate IDs, which 9.3 calls far worse than a `503` |
+
+**Pick:** no database generates the IDs: a Snowflake library in each service (zero extra instances, section 15), and the lease table in the existing PostgreSQL on RDS Multi-AZ. The lease table is the record of which node IDs are live; the IDs themselves are stored wherever they are used. The engine does not matter for a 1,024-row table: use whatever the services already run. What matters is the key you hand the other databases: 8 bytes and time-ordered.
+
+**If it were MySQL instead:** nothing material for the lease table (claim with `UPDATE … ORDER BY node_id LIMIT 1`, then read back by `owner`). Snowflake `BIGINT` keys work unchanged. If you chose UUIDs, store them as `BINARY(16)` and prefer v7: a random v4 primary key hurts InnoDB at least as much as Postgres, since the table itself is ordered by it.
+
+**What would flip the choice:** IDs that must be strictly increasing and gap-free (invoice numbers, task 20) need a database sequence or counter row, not Snowflake. With no relational database in the platform, lease through a DynamoDB conditional write, or derive the node ID from a StatefulSet ordinal and drop the store. More than 1,024 generators means re-splitting the bits (section 10), not another store.

@@ -316,3 +316,56 @@ If the evaluator stops, *no* rule fires and the dashboard is green. Layers, chea
 - **Anomaly detection** rules (seasonal baselines) alongside static thresholds; how to keep them explainable.
 - **Auto-mute suggestions** for rules that fire often and are never acted on; a monthly alert-quality report per tenant.
 - **Live inbox and push** for in-app alerts ([45](45-live-notifications.md)), with the seed's one-minute folding of repeats.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). The engine itself is small; the memory-hungry part is the TSDB it queries.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Evaluators (Go; leased shards, state machines in memory) | ~1,670 evals/s (100k/min); state ≈ 40 MB | TSDB query latency (concurrency); CPU is low | CPU: 1,670 × 0.3 ms (decode ~100 series, step the state machines) = 0.5 vCPU ⇒ N = ceil(0.5 ÷ 1.07) = 1 → 3 for zones. The real limit is waiting: 5 ms per query, 4 in flight = 800 evals/s each, so 1,670 ÷ 800 = 2.1 → 3, ×2 for HA = 6 (section 4). Memory: rules + state ≈ 150 MB | `c7g.large` (2 vCPU / 4 GiB) on ECS | 6, 2 per zone | the process mostly waits on the network, so many small nodes; `c` because RAM use is ~4 %. The 6 is the lesson's concurrency choice, not a CPU need: with 16 queries in flight per process, 3 nodes would carry it (≈ $160 less) |
+| Notifier (Go; group timers, silences, inhibition, `SKIP LOCKED` outbox) | ~0.6 transitions/s; storm: 5,000 instances in a minute ≈ 83/s, 800 notifications | none (idle) | ~1 ms of route and silence matching per transition (assumption): 83 × 1 ms = 0.08 vCPU ⇒ N = 1 → 3 | `c7g.large` on ECS | 3, one per zone | a few small instances, for availability not load. Stateless (the outbox row and `dedupe_key` hold the truth), so a dead node costs seconds. Provider fees per message are the other cost and are outside the sheet |
+| Postgres (`alert_state`, events, outbox, silences, leases) | 83 transitions/s in a storm, each = state + outbox + event row; whole data set < 20 GB | none; memory only for headroom | rows: 200k × ~300 B ≈ 60 MB; history ≈ 50k/day × 300 B ≈ 15 MB/day (5.5 GB a year). IOPS ≈ 2 per commit (assumption): 83 × 2 = 166, plus leases and notifier updates, say ≤ 500 vs gp3's 3,000 included | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ, gp3 100 GB | 1 primary + synchronous standby | everything fits in RAM many times over, so no `r`; `m.large` is the smallest production shape (`t` is not for sustained load). It is on the critical path of "no lost alert", hence Multi-AZ |
+| TSDB the engine queries (out of scope in section 3, but this is where the load lands) | 10M active series; 333k samples/s in; ~1.7M samples/s read | memory (active series), then disk | assume ~4 KiB per active series: 10M × 4 KiB ≈ 38 GiB per copy, 3 copies, one full copy per node ⇒ 38 ÷ 64 = 60 % of RAM (rest for compaction and queries). CPU: ingest 333k × 3 ≈ 1M appends/s ≈ 1 vCPU, reads 1,670 × ~1 ms ≈ 1.7 vCPU = ~3 of 24 vCPU. Disk: 333k × ~1.5 B ≈ 43 GB/day per copy, assume 15 days ⇒ 650 GB | `r7g.2xlarge` (8 vCPU / 64 GiB) + gp3 650 GB each (Amazon Managed Service for Prometheus is the managed route, priced per sample: not priced here) | 3, one per zone | memory-bound, so `r` (8 GiB per vCPU; CPU sits near 12 %): `c7g.2xlarge` has 16 GiB and 38 GiB would not fit. Disk is sequential (WAL, compaction), so gp3 is enough |
+
+Each evaluator queries the TSDB node in its own zone, so the 1,670 results/s cross no zone line; if they did, 1,670 × 10 KB (assumed) = 16.7 MB/s ≈ 44 TB a month, ⅔ of it crossing × $0.02/GB ≈ $590. The watchdog's external checker is near-idle: a `t`-family instance in another region (the one place `t` fits) or a hosted dead man's switch: a few dollars, left out.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Evaluators: 6 × `c7g.large` (6 × $53) | $320 |
+| Notifier: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.m7g.large` ≈ $120, Multi-AZ doubles | $240 |
+| gp3 100 GB × 2 (standby) × $0.08 | $20 |
+| TSDB: 3 × `r7g.2xlarge` (3 × $310) | $930 |
+| TSDB disk: 3 × 650 GB × $0.08 | $160 |
+| ALB for the rules, silences and alerts API | $20 |
+| **Total** | **≈ $1,850** (≈ $1,270 with a 1-year plan on the $1,650 of instances; storage and ALB not discounted) |
+
+- **Biggest line and why:** the TSDB, ~59 % ($1,090 of $1,850), because 10M series live in RAM three times over; the engine proper (evaluators, notifier, Postgres) is only ≈ $740 for 5,000 tenants. The levers are on the TSDB side: recording rules (so ten rules do not each re-read the same series), the per-tenant active-series cap, and longer intervals for low-priority rules; a smaller evaluator saves nothing.
+- **What changes at 10×:** 16.7k evals/s is only 16.7k × 0.3 ms = 5 vCPU, but concurrency: 16.7k ÷ 800 = 20.9 → 21 → 24 evaluators, ×2 for HA = 48, so raise in-flight queries to 16 per process (3,200 evals/s each: 16.7k ÷ 3,200 = 5.2 → 6, ×2 = 12 `c7g.large`, ≈ $640). The TSDB runs out first: reads need ~17 vCPU (16.7k × 1 ms) and, if tenants grow too (100M series = 381 GiB per copy, ×3 = 1,144 GiB ÷ (128 × 0.6) = 14.9), about 15 × `r7g.4xlarge` (5 per zone, 15 × $620 ≈ $9,300): shard it. Postgres: a storm becomes 830 transitions/s ≈ 1,700 IOPS, still inside gp3's 3,000; raise provisioned IOPS before the next 10×.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Two very different stores. The engine's own data is small and relational: 50k `alert_rules`, ~200k `alert_state` rows (~60 MB), an outbox, silences and leases; state is written on transitions only, ~0.6/s and ~83/s in a storm, and the whole set stays under 20 GB (sections 4, 8, 15).
+- The metrics it queries are 10M active series, ~333k samples/s in, and 1,670 queries a second reading ~1.7M samples/s: pick series by label matchers, then aggregate the last few minutes. The rules are stored as `expr text` in that store's query language (sections 4, 8).
+- Delivery needs one atomic step: the state change and its outbox row in one transaction, with a unique `dedupe_key` (9.4).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for rules, alert state, outbox and silences; ✖ for the 10M-series samples | the state update and the `alert_notifications` row commit together, `dedupe_key UNIQUE` and `SKIP LOCKED` claims, labels and matchers as `jsonb`. For samples: 333k inserts/s is ~33× the ~10k durable writes/s of one primary; at an assumed ~40 B per row with its index (a rule of thumb) 28.8B samples a day is ~1.2 TB a day against ~43 GB in a TSDB; and 1,670 queries × ~100 series = ~167k indexed range reads/s, ~17× the ~10k+ of a decent node |
+| MySQL (RDS / Aurora) | ✔ for the rules database (nothing material), ✖ for samples for the same reasons | everything in section 8 maps over (below); a row store pays the same per-sample overhead, and neither engine speaks the language the rules are written in |
+| Prometheus-style TSDB (self-managed on EC2; Amazon Managed Service for Prometheus) | ✅ chosen for the metrics | ~1.5 B per compressed sample (section 15), a label index, and the query language `expr` is written in; one full copy per node, ~38 GiB of active-series data each, held in RAM |
+| ClickHouse / Timestream | ✔ works if the rule language becomes SQL | cheaper per stored sample over long retention, but `expr` would be SQL and each of the 1,670 evaluations/s must stay near the lesson's 5 ms; Timestream is not sized in section 15 |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.large`, gp3 100 GB) for the engine's record, and a Prometheus-style TSDB (3 × `r7g.2xlarge`, gp3 650 GB each, section 15) for the samples it reads. A time-series store is not Postgres at 10M series for three measured reasons: the write rate (~33× one primary), the bytes per sample (~27×) and a query that is "find series by labels, then aggregate" rather than a key lookup. Postgres is the system of record for alert state, history and outbox; the TSDB is an upstream input the engine only reads (out of scope in section 3). The rules database needs no Postgres-only feature, so choosing it is a team-skill call.
+
+**If it were MySQL instead:** nothing material for the rules database. `jsonb` becomes `JSON` (matchers and labels are matched in the notifier's memory, never queried in SQL), `ON CONFLICT` becomes `ON DUPLICATE KEY UPDATE`, and the partial index `alert_state_live_idx` is dropped: it is an optimisation only (a rule has ~4 instances and the primary key `(rule_id, fingerprint)` already keeps them together; a restart reloads 60 MB). The outbox claim is a range scan with `SKIP LOCKED` (MySQL 8.0+), so run that session at `READ COMMITTED` to avoid gap-lock waits against inserts.
+
+**What would flip the choice:** the rules database never, in this lesson: a storm at 10× is ~830 transitions/s ≈ 1,700 IOPS, inside gp3's 3,000 (section 15). The metrics store flips at 10× tenants: 100M series is ~381 GiB per copy and ~15 × `r7g.4xlarge` (section 15), the point to shard the TSDB or buy the managed service instead of running that fleet.

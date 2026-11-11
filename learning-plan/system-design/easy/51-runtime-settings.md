@@ -334,3 +334,53 @@ Not every setting is the same kind of dangerous, and the seed's permissions foll
 - **Dead-setting cleanup:** record the last time each key was read, as flag services do, and retire keys nobody reads.
 - **Multi-region:** read-your-writes across regions (version tokens carried between regions), and where the source of truth for a travelling tenant lives.
 - **Generated typed SDK** from the registry so application code cannot read an unknown key or the wrong type.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). This is a tiny-hardware design on purpose: 1M reads/s never leave the pods' memory, so the instances that exist only for settings are a small database and a small service.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Settings client in the 200 API pods (immutable in-process snapshot) | 1M reads/s fleet-wide, 5k/s per pod | memory, trivially; CPU ≈ 0 | CPU: 5,000 × 100 ns = 0.5 ms per second = 0.05 % of a core. Memory: 5,000 tenants × 30 KB = 150 MB per pod (30 GB across 200 pods) | no new instances: it rides on the API tier (sized by its own lesson, `c7g` family) | 0 | 150 MB is ~1 % of a 16 GiB `c7g.2xlarge`, so the compute family stays `c`; the price of this design is a little RAM in boxes that exist anyway |
+| Settings service (admin API, write path, change-feed endpoint) | ~0.12 writes/s (a bulk change = 5,000 rows at once); 40 feed polls/s (200 pods ÷ 5 s) | none (idle); availability | 40 × 0.5 ms + 0.12 × 5 ms ≈ 0.02 vCPU; a bulk write of 5,000 rows × 1 ms = 5 vCPU-s, spread over 5 s = 1 vCPU on one node. N = ceil(0.02 ÷ 1.07) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS | 3, one per zone | a few small instances, for availability not load; stateless. It could live inside the API deployment (the seed does); kept apart so the write path and its permissions deploy on their own |
+| Postgres (`setting_values`, `settings_changes`, `settings_audit`) | ~0.12 writes/s, 40 feed queries/s, 200 `LISTEN` sessions; table ~30 MB, audit ~5 MB/day (3.7 GB over 2 years) | none; connection memory | IOPS ≈ 2 per commit (assumption): ≈ 1 at 0.12 writes/s. Memory: 200 `LISTEN` sessions (they cannot go through a transaction pooler) × ~10 MiB = 2 GiB, ~20 pooled backends = 0.2 GiB, data under 4 GiB in all. Worst-case bulk reload: 200 pods × 150k rows = 30M rows ≈ 6 GB (≈ $0.08 of cross-zone traffic); at ~2 µs a row (assumption) = 60 vCPU-s, jittered over 60 s = 1 vCPU of 2 | `db.m7g.large` (2 vCPU / 8 GiB), RDS Multi-AZ, gp3 50 GB | 1 primary + synchronous standby | nothing is memory-bound (all data fits in RAM many times), so `m` not `r`; not `t`, it runs 24/7. Multi-AZ because this database is the boot path: a pod that restarts while it is down starts from registry defaults, which silently reverts every tenant's limits and `site.closed` |
+
+What this design saves: serving 1M reads/s from Redis at ~100k ops/s per core needs 10 shards, each with a replica, 20 × `cache.m7g.large` (≈ $120 each) ≈ $2,400 a month (more at a sane 70 % busy), and a network hop on every request. In-process snapshots replace that fleet with 150 MB of RAM per pod.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Postgres: `db.m7g.large` ≈ $120, Multi-AZ doubles | $240 |
+| gp3 50 GB × 2 (standby) × $0.08 | $10 |
+| Settings service: 3 × `c7g.large` (3 × $53) | $160 |
+| Internal ALB (admin API, feed poll) | $20 |
+| API pods: 150 MB each, inside nodes that already exist | $0 extra |
+| **Total** | **≈ $430** (≈ $290 with a 1-year plan on the $400 of instances and RDS) |
+
+- **Biggest line and why:** the database, ~58 % with its disk ($250 of $430), and it does almost nothing (0.12 writes/s). It is paid for availability, not load: Multi-AZ is the whole $120 difference. The honest lever is not a smaller node, it is that the 20-node Redis fleet is not there at all.
+- **What changes at 10×:** 50,000 tenants and 2,000 pods. The first thing to run out is connections, not CPU: 2,000 `LISTEN` sessions × ~10 MiB = 20 GiB, more than the 8 GiB node. Fix as section 10 says: a regional settings edge (3 × `c7g.large`, ≈ $160 per region) holds the one `LISTEN` session and fans out to pods over SSE (2,000 streams × ~10 KiB = 20 MB), so Postgres sees a handful of sessions and stays on `db.m7g.large`. Per pod, a fully resident snapshot is 50,000 × 30 KB = 1.5 GB (~10 % of a 16 GiB node, still `c`), so load active tenants only (LRU). The feed poll is 400 req/s ≈ 0.2 vCPU: the same 3 nodes. A bulk reload of every tenant by every pod would be 2,000 × 1.5M rows = 3B rows ≈ 600 GB: impossible, so coalescing, jitter, one platform-layer row and the edge's shared snapshot are requirements, not polish.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Tiny relational config: ~150k override rows (~30 MB) of `(tenant_id, key) → jsonb`, ~0.12 writes/s on average, a bulk platform change touching 5,000 rows at once, and an audit table of ~5 MB/day partitioned by month (sections 4, 8).
+- The 1M reads/s never reach a database: they are served from an immutable snapshot in each of the 200 pods (9.2). The database sees ~40 feed polls/s and 200 long-lived `LISTEN` sessions.
+- One write is three rows and a wake-up: the value, an audit row, a change-feed row, then a notification that must fire only if the transaction commits.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `pg_notify` inside the write transaction is delivered only on commit, so pods hear of a change in tens of ms; `INSERT … ON CONFLICT … WHERE value IS DISTINCT FROM EXCLUDED.value` makes an unchanged save write nothing; `jsonb` values and monthly range partitions for the audit. Cost: 200 session connections that cannot sit behind a transaction pooler (~2 GiB, section 15) |
+| MySQL (RDS / Aurora) | ✔ works, with one workaround | no `LISTEN/NOTIFY`: pods learn of changes by polling the `seq` feed, or a binlog consumer pushes them (one more service to run). Polling every 1 s is 200 tiny indexed queries/s for 200 pods (against 40/s at 5 s), so a change lands in ≤ ~1 s, 0.5 s on average, instead of tens of ms. There are no long-lived sessions, so the 2 GiB of `LISTEN` connections disappears |
+| Redis (ElastiCache) | ✖ as the store or the read path, ✔ at most as a push channel | 1M reads/s would need ~10 shards plus replicas, ≈ $2,400 a month (section 15), and a network hop per request; pub/sub is lossy, so the feed poll stays as the net anyway (9.2) |
+| DynamoDB | ✔ works, buys nothing here | `(tenant_id, key)` items of ~200 B suit it, but the data is 30 MB at 0.12 writes/s, so scale and "no servers" are not needed, and value + audit + feed is three items per change: ≤ 33 changes per 100-item transaction, so a 5,000-row bulk change is ~150 transactions instead of one |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.large`, gp3 50 GB, section 15), the system of record for settings; every pod snapshot is derived and can be rebuilt from the table or, with the database down, from the registry compiled into the binary. Two properties decide it: transactional `NOTIFY` as the fast path, and the one-transaction value + audit + feed write with the `IS DISTINCT FROM` guard (section 8). Neither is needed for correctness (the 5 s feed poll and the 1-minute TTL are the net, 9.2), which is why MySQL is a close second.
+
+**If it were MySQL instead:** drop the `pg_notify` call, poll the feed every 1-2 s (or run a binlog consumer) and keep the snapshot, the generation counter and the TTL unchanged. The conditional upsert becomes `INSERT … ON DUPLICATE KEY UPDATE` with the unchanged-save check done by the service, which already reads the old value for the audit row's `before`. The `seq` trap of 9.2 is identical, since `AUTO_INCREMENT` is also assigned at insert and commits land in any order; keep the overlapping poll.
+
+**What would flip the choice:** no size does: 150k rows and 0.12 writes/s never outgrow one primary. At 10× (2,000 pods) the pressure is 20 GiB of `LISTEN` sessions, solved by the regional settings edge of section 15 and still on Postgres. Accepting settings writes in several regions at once (section 14) is the point to look at a replicated store such as DynamoDB global tables, and to decide who wins a conflict.

@@ -311,3 +311,57 @@ Compare the provider's own `updated_at` or version, never our arrival time.
 - **Hot-account isolation:** weighted fair consumption so one customer cannot starve the rest.
 - **Provider-side queues** (SQS, Pub/Sub) instead of webhooks: pull-based ingestion, no endpoint to defend.
 - **mTLS or provider IP allowlists** as an extra gate, and how to keep them current.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Receiver pods (Go, stateless, no database on the path) | 50,000/s = 50 MB/s (400 Mbit/s) at ~1 KB; 5,000/s average | CPU | 50,000 × 0.1 ms (section 4's 10k/s per core) = 5 vCPU. N = ceil(5 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.3) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS or EKS | 3, one per zone | HTTP, TLS and the wait for the log's ack are the work (50,000 × 5 ms ≈ 250 requests in flight, a few MB); HMAC-SHA256 over 1 KB is microseconds on Graviton. `c`, not `m`: no memory to speak of. 42 % busy at peak, 63 % with a zone down. Section 4's "4 pods × 4 cores" becomes 3 so each zone holds one |
+| Durable log (replicated stream, `200` only after the quorum ack) | 50 MB/s in at peak, written 3 times; backlog 30 GB (10 min at peak) | disk fsync, then network | per broker (every broker stores everything): 50 MB/s of disk writes; ≈ 50 MB/s in (17 from senders + 33 replication) and ≈ 40 MB/s out (33 replication + drain reads) ≈ 0.7 Gbit/s; backlog 30 GB (18 GB for 1 h at average) against 937 GB of NVMe; duplicate window: 1 h × 5,000/s = 18M ids × ~80 B ≈ 1.5 GB of RAM (≈ 14 GB at the peak rate) | `i4i.xlarge` (4 vCPU / 32 GiB / 937 GB NVMe), self-run NATS JetStream on EC2 (managed alternative: MSK, Kafka) | 3, one per zone | "Acknowledged" must mean durable, so every ack waits for a group-committed fsync: local NVMe has far more IOPS than gp3 and no network hop to EBS. The NVMe dies with the instance, which is fine because 3 nodes hold each message before the ack. 32 GiB fits the duplicate window at peak. Check the node's baseline bandwidth, not its "up to" figure |
+| Drain and pull workers (Go) | drain 15,000 rows/s (3× arrival, section 4's recovery rate: 9M backlog in 900 s); pulls 20,000 ÷ 60 = 333 requests/s | CPU, tiny | drain 15,000 × 0.03 ms = 0.45 vCPU; pulls 333 × 0.5 ms = 0.17; total 0.6 vCPU. N = ceil(0.6 ÷ 1.07) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) | 3, one per zone | A fraction of a core of work; three for availability, not load. `Fetch(500)` batches keep the database at 30 commits/s |
+| Postgres (inbox, `provider_sync_state`) | drain 15k rows/s (peaks above that wait in the log); inbox 3 days = 1.3B rows ≈ 130 GB | memory (the unique index), then IOPS | `UNIQUE (provider, account, event_id)` is probed at random: assume about half of the 130 GB ≈ 65 GB is hot, 64 GiB of RAM holds ≈ 70 % of it, so 15k × 30 % = 4.5k read IOPS + ≈ 3k dirty-page writes ≈ 7.5k ⇒ `gp3` 10,000; CPU 15k × 0.1 ms = 1.5 of 8 vCPU; disk 130 GB × ~3 for real row widths ⇒ 400 GB | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ | 1 primary + synchronous standby | `r`: the random index probes are the whole load, so the index must live in RAM; CPU stays under 20 %. 50k rows/s would be 5 vCPU and 15k+ read IOPS, past this node, so peaks queue in the log instead: a 10-minute peak leaves ≈ 21 GB and clears in ≈ 35 min. The log is what lets the database be small |
+
+Network and the rest: replies are `200 {}` ≈ 0.3 KB, so 5,000/s ≈ 1.5 MB/s ≈ 3.9 TB a month out. Pulls: 333 requests/s to provider APIs, ~5 KB per reply (assumption) ≈ 4.4 TB a month, through NAT. Data in from the internet is free. If every delivery opened a new TLS connection, the ALB's new-connections dimension (25/s per LCU) would be ≈ 200 LCU ⇒ ≈ $1.2k a month instead of the $120 below.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Receivers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Log: 3 × `i4i.xlarge` (3 × $250) | $750 |
+| Workers: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.2xlarge` ≈ $620 managed, Multi-AZ doubles | $1,240 |
+| gp3 400 GB + 7k extra IOPS: (400 × $0.08 + 7,000 × $0.005) × 2 = (32 + 35) × 2 | $130 |
+| ALB: $16 + ≈ 18 LCU-hours average on bytes (5 MB/s ≈ 18 GB/h), keep-alive assumed | $120 |
+| Egress: 3.9 TB of replies × $0.09 | $350 |
+| Pull traffic: 3 NAT gateways × $33 + 4.4 TB × $0.045 | $300 |
+| **Total** | **≈ $3,370** (≈ $2,500 with 1-year commitments on the four compute lines) |
+
+- **Biggest line and why:** the inbox database (≈ 41 %: $1,240 + $130 of $3,370), which exists for dedupe and audit; the whole receive path (receivers, log, ALB) is $1,190, ≈ 35 %. The log is the part that earns its cost: it is why the database can be one 8-vCPU node instead of something that must absorb 50k writes a second.
+- **What changes at 10×:** 500k/s peak = 500 MB/s (4 Gbit/s) ⇒ receivers 50 vCPU ⇒ N = ceil(50 ÷ 4.27) = 12 × `c7g.2xlarge`. The log writes 1.5 GB/s replicated: on 6 brokers ≈ 250 MB/s of disk and ≈ 2 Gbit/s each way per broker, which is sustained multi-Gbit, so `i4i.8xlarge` class (≈ $2,000 each, 7.5 TB NVMe) or a network family; 10 minutes of backlog is 300 GB. Postgres: 150k rows/s recovery and 13B inbox ids ≈ 1.3 TB ⇒ shard the inbox by account hash (section 10) into ~10 `db.r7g.2xlarge`, and give a hot account (40 % of events) its own subject, consumer and shard. Replies cost ≈ $3.5k a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The inbox is write-heavy: 432M events a day (≈ 5,000/s). The drain inserts 500-row batches at up to 15,000 rows/s; the 50,000/s peak is absorbed by the log, not the database (sections 4, 6 and 15).
+- Every insert is a dedupe probe: `UNIQUE (provider, account, event_id)` over 3 days ≈ 1.3B rows ≈ 130 GB, probed at random, so the index has to sit in RAM. A row is inserted, marked processed, and deleted after 3 days.
+- Effects are upserts "only if newer" into business tables. The provider's API is the final truth (9.3), and the log is the record of an accepted event until it is acked (9.1).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | one statement per batch, `INSERT … SELECT FROM unnest(…) ON CONFLICT (provider, account, event_id) DO NOTHING`; `ON CONFLICT … DO UPDATE … WHERE invoices.provider_updated_at < EXCLUDED.provider_updated_at` is "never move backwards" in one statement (9.5); the partial index `… WHERE processed_at IS NULL` stays tiny while the table holds 1.3B rows; `jsonb` for the envelope. Cost: inserting, updating and deleting 432M rows a day is the churn case for autovacuum |
+| MySQL (RDS / Aurora) | ✔ works, same shape | `INSERT … ON DUPLICATE KEY UPDATE event_id = event_id` replaces `DO NOTHING` (`INSERT IGNORE` also hides unrelated errors); a 500-row multi-row `VALUES` replaces `unnest` (~4,000 placeholders, under the 65,535 limit); the "only if newer" upsert needs an `IF(…)` in every assignment, with the timestamp assigned last. The unique-index probes cost the same as in Postgres: random pages that must be in RAM. No partial index: `(processed_at, received_at)` covers all 1.3B rows and moves an entry on every `processed_at` update, so accept that or keep pending ids in a small side table. In its favour: rows update in place, so no dead rows from the `processed_at` flip |
+| DynamoDB | ✔ for the inbox alone, ✖ for the effects | a conditional `PutItem` on `provider#account#event_id` is the dedupe in one call, a TTL attribute expires ids after 3 days with no delete job, and hashed keys spread 15k writes/s over partitions (~1,000 writes/s each). But the effect tables join business data and "show me what Wave sent at 14:02" needs a GSI by time, so it would sit beside Postgres, not replace it |
+| NATS JetStream or Kafka (MSK) | ✅ chosen as the front log, ✖ as a query store | "acknowledged" means replicated and flushed, with work-queue retention (9.1); self-run JetStream on `i4i.xlarge`, MSK as the managed alternative; it holds events until they are acked and cannot answer ad-hoc questions |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.2xlarge`, section 15; `r` because the index probes must stay in RAM) for the inbox, sync state and effect tables. The log (3 × `i4i.xlarge`) is the record of an accepted event until it is acked; the inbox is a dedupe and audit copy (3 days, prunable) and the provider's API is ground truth. The batch insert with a unique key and the "only if newer" upsert as single statements decide it, and the log is why the database can be one node at 15k rows/s.
+
+**If it were MySQL instead:** the same node class, still memory-bound by the same index, and the edits above, with no change to the design. In both engines a partition column must be part of every unique key, so pruning by dropping day partitions keeps the dedupe only if the column is something a redelivery repeats (the provider's event time), not `received_at`, which differs on every delivery.
+
+**What would flip the choice:** ~15k sustained rows/s is the range of one primary (a 10× recovery is 150k): shard the inbox by `hash(provider, account)` into ~10 nodes (section 15), still relational. Or move the dedupe-only inbox to DynamoDB (conditional put plus TTL) and keep Postgres for effects and audit. Several services reading the same events, or a wish for managed operations, is the point to use MSK instead of self-run NATS.

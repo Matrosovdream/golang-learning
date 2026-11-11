@@ -349,3 +349,60 @@ must sort by a mutable column, accept that a moved row may be missed and say so 
 - **Virtualised infinite scroll** in the UI over keyset pages, with prefetch of the next cursor.
 - **Search results paging** (similarity-ranked): keyset on `(score, id)` with a frozen scoring snapshot ([task 39](39-global-search.md)).
 - **A columnar store** (ClickHouse) for analytics-style lists where users sort and filter on anything.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| List API (Go, stateless) | 20k list requests/s at peak, each a page query + a capped count; ≈ 15 KB responses | CPU (JSON + gzip) | assume 0.7 ms per request (cursor check, scan 26 rows, JSON ≈ 0.1 ms, gzip ≈ 0.4 ms): 20k × 0.7 ms = 14 vCPU. N = ceil(14 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(3.3) = 4 → 6 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 6, two per zone | CPU-bound, and gzip is the biggest slice, worth it because it cuts egress ~5×; memory ≈ 3 GiB (a 2–5 s first-page cache plus connections) of 16, so `c`; 29 % busy at peak, 44 % with a zone down; 6 nodes × 10 connections per shard = 60 per replica, so no pooler |
+| Postgres shards (`requests` + four list indexes), lists read from replicas | 32 shards, ≈ 625 list requests/s each at peak; ≈ 31M rows and ≈ 44 GB per shard (1 TB + 400 GB ÷ 32) | memory, then CPU | DB CPU per request ≤ 1.5 ms (keyset page ≤ 0.5 ms + capped count ≤ 1 ms): 625 × 1.5 ms = 0.94 of 4 vCPU; the 12.5 GB of indexes and the newest rows stay cached in 32 GiB; deep pages miss: ≈ 625 × 3 pages × 15 % ≈ 280 IOPS, far under gp3's 3,000 | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS | 32 shards × (primary + read replica in another zone) = 64 nodes | memory-bound, so `r` not `m` (16 GiB would not hold the indexes); the data is small, and `r7g.2xlarge` would hold a whole shard in RAM at double the price, which is not needed; the replica is also the failover target. The primaries' write rate is the app's and is not in section 4 |
+
+Export workers and the counter refresher: 3 × `c7g.large` for availability. A 40M-row export is 8,000 batches of 5,000 rows with pauses, under 30 minutes at ~0.2 s a batch, and a ≈ 24 GB file in S3 (40M × 600 B): nothing to size there. `list_counters` is tiny.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 6 × `c7g.2xlarge` (6 × $212) | $1,270 |
+| Workers: 3 × `c7g.large` (3 × $53) | $160 |
+| ALB: $16 + ~54 LCU × $0.008 × 730 (≈ 54 GB/h gzipped at the average) | $330 |
+| Postgres: 64 × `db.r7g.xlarge` (64 × $310) | $19,800 |
+| gp3: 64 × 100 GB × $0.08 | $510 |
+| Data out: ≈ 39.4 TB × $0.09 (assumed average 5k req/s, gzipped ≈ 5×) | $3,550 |
+| **Total** | **≈ $25,600** (≈ $18,200 with 1-year commitments on the $21,230 of compute) |
+
+- **Biggest line and why:** the 64 database nodes, ≈ 77 %. By this lesson's own loads the list side is small (20k × 1.5 ms = 30 vCPU of DB work over 1.4 TB), so a handful of `r7g.4xlarge` replicas would carry it; the 32 × 2 comes from section 4's tenant sharding, so check whether lists need that before buying it. Next is egress: gzip saves ≈ $14k (75 MB/s raw ≈ 197 TB ≈ $17.7k a month); the API tier is only ≈ 5 %.
+- **What changes at 10×:** 200k req/s ⇒ 140 vCPU ⇒ N = ceil(140 ÷ 8.53) = 17 → 18 × `c7g.4xlarge` (≈ $7.6k); each replica takes 6,250 req/s × 1.5 ms ≈ 9.4 vCPU, and 10× rows (440 GB per shard) no longer fit RAM, so `db.r7g.4xlarge` (16 vCPU / 128 GiB), 64 × $1,240 ≈ $79k; egress ≈ 394 TB ≈ $35k. First cache the first page 2–5 s with singleflight and move whale tenants' free-form filters to a search engine (task 39), as section 10 says.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 1B mutable rows (status, assignee and soft delete change) on 32 shards: ≈ 31M rows and ≈ 44 GB a shard (≈ 1 KB a row plus its indexes), and one tenant with 50M rows (section 4).
+- 20k list requests/s at peak (≈ 625 a shard), each a keyset page of 26 rows plus a capped count of at most 1,001 index entries, on read replicas that may lag 1–2 s (sections 6, 15).
+- Lists are reached through filters, not by key: ≈ 8 filters in any combination, 3 allowed sorts, hot screens served by partial composite indexes (8, 9.3).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora), sharded by tenant | ✅ chosen | partial composite indexes keep dead rows out (`WHERE deleted_at IS NULL`, and `WHERE is_spam AND deleted_at IS NULL` for the tiny Spam chip); `INCLUDE (request_type)` lets the badges read the index only; the row-value cursor `(created_at, id) < ($3, $4)` is one range start; `force_custom_plan` and `EXPLAIN` tests fix the plan trap the seed measured |
+| MySQL (RDS / Aurora), sharded by hand or with Vitess | ✔ works, with workarounds | the secondary index carries the primary key, so the `id` tiebreak is free and keyset paging is natural; but no partial indexes, no `INCLUDE`, and the row-value cursor needs checking (below) |
+| DynamoDB / Cassandra | ✖ poor fit | every list needs its own key: a GSI per (filter, sort) pair, and eight filters in any combination cannot be a set of GSIs (the default quota is 20 per table); a `FilterExpression` runs after the read and you pay for what was read, so a selective filter reads the tenant; there is no cheap count (`Select=COUNT` still reads the items). Keyset is native (`LastEvaluatedKey`): the one part that fits |
+| OpenSearch | ✔ as a derived index for whale tenants | free-form filter + sort + search over 50M+ rows (section 10, task 39), paged with `search_after`; fed by the events, never the record |
+| Redis (ElastiCache) | ✔ as a cache | the first page cached 2–5 s per (tenant, filters) behind singleflight, and optionally the badge counters; rebuildable, not the record |
+
+**Pick:** PostgreSQL on RDS, 32 shards of `db.r7g.xlarge`, each a primary plus a read replica in another zone, with lists served from the replica (section 15). Three things decide it: partial composite indexes that make the hot screens read a handful of entries, the row-value keyset comparison, and an index-only (`INCLUDE`) path for badges and the capped count (9.1–9.3). OpenSearch and Redis are derived; Postgres is the only system of record.
+
+**Sharded relational, or something else?** For the list workload alone, sharding is not what the numbers ask for: 1.4 TB in all and 20k × 1.5 ms = 30 vCPU of database work is the size of one Aurora cluster (storage grows to 128 TiB, up to 15 low-lag readers) with a few `r7g.4xlarge` readers, which is what section 15 says too ("check whether lists need that before buying it"). The 32 × 2 nodes come from the platform's tenant sharding in section 4, and it costs nothing in query shape because every list is `tenant_id`-scoped, so no query ever fans out across shards. Shard when one primary cannot take the writes or the data, by the key you query by; replicas fix a read-bound list. Under Vitess a MySQL fleet would use the same `tenant_id` key, with online resharding, if you run it. DynamoDB or Cassandra would only fit if the screens shrank to "newest first per tenant and tab", one GSI each.
+
+**If it were MySQL instead:**
+- No partial indexes: each list index covers all ≈ 31M rows a shard (≈ 1.25 GB each at the lesson's ≈ 40 B an entry) instead of only live ones, the Spam index stops being tiny, and all four list indexes are written on every insert (≈ 5 index writes, no longer "fewer for partial ones"). To seek past dead rows, lead with a generated `is_live` column that is `1` for live rows and `NULL` otherwise: `(tenant_id, is_live, status, created_at, id)`.
+- No `INCLUDE`: put `request_type` last in the key to make the index covering. `DESC` indexes exist from 8.0, and keeping every sort key in one direction keeps backward scans cheap anyway.
+- The row-value cursor is accepted syntax, but verify with `EXPLAIN` that it becomes an index range; the expanded form `created_at < ? OR (created_at = ? AND id < ?)` is the safe one on MySQL. List reads are non-locking, so gap locks do not touch the read path.
+- The identity key is append-only and clustered, so "choose 25 ids from an index, then fetch the rows" stays the same two-step (a deferred join).
+
+**What would flip the choice:** whale tenants with arbitrary filter + sort + search over 50M+ rows (section 10) go to OpenSearch fed by the same events, not to more indexes or another primary database. An analytics-style list where users sort and filter on any column points to ClickHouse (14). At 10× (200k req/s, 440 GB a shard that no longer fits RAM) the step is `db.r7g.4xlarge` replicas and a first-page cache, as section 15 says.

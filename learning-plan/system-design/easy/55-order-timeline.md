@@ -344,3 +344,60 @@ func newTrackingToken() (token string, hash []byte, err error) {
 - **A PDF job report** assembled from published steps and photos, as a lazy idempotent job ([30](30-invoicing.md)).
 - **Analytics:** time from "arrived" to "completed", on-site rate from `on_site`.
 - **Per-tenant retention and legal holds** on photos ([24](24-data-lifecycle.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). This lesson is about bytes, not requests: phones upload straight to S3, so the servers stay small and the cost sits in photo processing, photo storage and thumbnail egress.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API (Go, stateless: steps, photo registration, tracking reads) | 55 step writes/s + 64 photo registrations/s + 190 tracking views/s (+ ~120 staff reads/s, assumed) | CPU, barely | writes 55 × 1 ms = 0.06 vCPU; registrations 64 × 2 ms (presigning multipart URLs) = 0.13; tracking 190 × 1 ms (JSON, ~6 signed thumbnail URLs) = 0.19; staff 120 × 1 ms = 0.12; total ≈ 0.5 vCPU. N = ceil(0.5 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | three for the zones, not for the load: ~8 % busy at peak, 13 % with a zone down. The photo bytes (0.4 Gbit/s at peak) go phone → S3 and never touch it; ~1 GiB of memory, so `c` |
+| SSE doorbell (Go, one connection per open tracking page) | 100k open pages (§2, §9.4) | memory (connections), not CPU | 100k × ~16 KiB (10 KiB buffers + ~6 KiB goroutine stack) = 1.6 GB; × 1.5 GC headroom = 2.4 GB; 0.8 GB per node, 1.2 GB with a zone down. Heartbeat every 25 s = 4k writes/s × 20 µs = 0.08 vCPU | `c7g.large` | 3 | 4 GiB holds it with room; raise the file-descriptor limit above 50k per node. After a zone loss the survivors take ~50k reconnects at once, so the client retry needs jitter |
+| Live bus (NATS) + outbox relay | 55 + 64 ≈ 120 version bumps/s, sent to 3 SSE nodes = 360 deliveries/s | nothing (far below one core) | a message is `{order, version}`, a few bytes; one NATS core does well over 100k msg/s (assumption) | `c7g.large` NATS cluster (managed: SNS, or ElastiCache pub/sub) | 3, one per zone | a lost doorbell is harmless (the page falls back to ETag polling, §10), so no JetStream disk; three for quorum and zones |
+| Photo processors (sniff, decode, re-encode ≤ 2,400 px, thumbnail, EXIF) | 64 photos/s × ~0.5 CPU-s = 32 vCPU (§4) | CPU | queue-fed, so a lost zone may slow it: 32 ÷ 0.8 = 40 vCPU = 5 × 8 → 6 nodes, 67 % busy at peak (100 % with a zone down: the queue grows, page at 15 minutes as in §10). The strict stateless rule would give ceil(32 ÷ 4.27) = 8 → 9 | `c7g.2xlarge` (8 vCPU / 16 GiB) on Spot, autoscaled on queue age | 6 at peak | pure CPU work; ~1 GiB of decode buffers in 16 GiB, so `c`. Jobs are idempotent and retried, so a 2-minute Spot reclaim costs nothing. Measure the 0.5 CPU-s on Graviton before trusting it |
+| Postgres (order_steps, photos, timeline state, audit entries) | 55 + 64 + 64 ≈ 185 commits/s at peak (step add, photo registered, photo ready); 141 GB/year (§4) | memory, then IOPS | hot set: ~1M open jobs (assumed ~3 weeks open) × ~7 KB (8 steps × 0.7 KB + ~10 photo rows × 150 B) = 7 GB, + indexes ≈ 10 GB. IOPS ≈ 185 × ~2 = 370 (assumption) vs 3,000 included in `gp3`. CPU 185 × 4 rows × 0.25 ms = 0.2 of 4 vCPU. Disk: 141 GB × 1.5 for indexes ≈ 210 GB/year | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ, 500 GB `gp3` | 1 primary + synchronous standby | the hot set should sit in RAM with ~2× room, so `r`; 55 step writes/s is trivial, and ~100 connections need no pooler. `m7g.xlarge` (16 GiB) is the cheaper fallback. 500 GB lasts ~2 years and grows online |
+| Read replica (tracking pages) | 190 views/s at peak if the edge cache missed every time (§9.4) | memory | 190 × ~0.5 ms = 0.1 vCPU; only jobs someone is watching are hot, far less than 10 GB | `db.r7g.large` (2 vCPU / 16 GiB), RDS read replica | 1 | not needed for load (the sheet's primary does 10k+ reads/s): it is the lesson's isolation of a public, spiky endpoint from the write path. Dropping it saves ≈ $200 a month |
+
+S3 (quarantine + library, 121 TB/year): nothing to size; 64 PUTs/s is far below ~3,500 per prefix. Processors reach S3 through a **gateway VPC endpoint** (free); through a NAT Gateway the ≈ 23 TB a month they move (12.8 TB of raw uploads down, 10.1 TB of results up) would cost ≈ $1,030 in processing fees. Thumbnails (108 TB/year) leave through CloudFront.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API, SSE and NATS: 9 × `c7g.large` (9 × $53) | $480 |
+| Photo processors: 6 × `c7g.2xlarge` (6 × $212), all month | $1,270 |
+| Postgres: `db.r7g.xlarge` ≈ $310, Multi-AZ doubles | $620 |
+| Read replica: `db.r7g.large` | $160 |
+| gp3 500 GB × 3 copies (primary, standby, replica) at $0.08 | $120 |
+| S3 Standard: 121 TB after year one × $0.023 | $2,780 |
+| CloudFront: 9 TB/month of thumbnails × $0.085 | $770 |
+| SQS (photo events: 16M a month × 3 requests × $0.40 per M) and ALB ($16 + LCUs, SSE connections dominate) | $80 |
+| **Total** | **≈ $6,300** (≈ $5,800 with a 1-year plan on the $1,260 of steady compute; Spot on the processors would take off up to ≈ $900 more) |
+
+- **Biggest line and why:** photos at rest, S3 (44 %), then compute (40 %), then thumbnail egress (12 %). Storage is the only line that keeps growing: +≈ $2.8k a month for every year of photos, so the real lever is lifecycle to cold storage after two years ([24](24-data-lifecycle.md)) and smaller re-encodes, not instance size. The database and its replica are 12 % of the bill.
+- **What changes at 10×:** processing runs out first: 640 photos/s × 0.5 = 320 vCPU ⇒ 400 at 80 % ⇒ 50 → 51 × `c7g.2xlarge` (≈ $10,800 on-demand, up to ~70 % less on Spot). S3 grows to ≈ 1.2 PB a year (≈ $27,800 a month after year one) and thumbnail egress to 90 TB a month (≈ $7,650 at the first-tier price). Postgres stays one primary: ~1,850 commits/s ≈ 3,700 IOPS (raise `gp3` to 5,000), ~2 of 4 vCPU; its real change is size (1.4 TB a year: partition by order hash, §10). API ≈ 5 vCPU ⇒ 3 × `c7g.xlarge`; 1M open pages ≈ 24 GB of connections ⇒ 6 × `c7g.xlarge`, behind an NLB rather than ALB LCUs.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Small relational rows: 160M steps a year at ~0.7 KB plus 192M photo-state rows at ~150 B ≈ 141 GB a year; the hot set (about 1M open jobs) is ~10 GB with indexes (sections 4 and 15). The photo bytes, 121 TB a year, are not database data.
+- Light writes: ~55 step writes/s and ~185 commits/s at peak. Each change is a short transaction: the step row, its audit entry, an outbox row and a version bump (sections 6 and 9.1).
+- Reads are keyset pages of one order's steps (`order_id, happened_at DESC, id DESC`) and ~190 tracking views/s behind an edge cache.
+- Correctness comes from constraints: `UNIQUE (order_id, uid)` makes a phone's retries harmless, `If-Match` on `version` catches stale edits, and a step and its audit entry commit together or not at all.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | one transaction covers step, audit entry, outbox row and the `order_timeline_state` bump (9.1, 9.4); `INSERT … ON CONFLICT (order_id, uid) … RETURNING` is the replay-safe insert in one statement (section 13); the two partial indexes (`WHERE deleted_at IS NULL`, `WHERE customer_visible AND deleted_at IS NULL`) keep the staff list and the customer list ordered and free of soft-deleted rows; the ~10 GB hot set sits in 32 GiB, so reads cost no IOPS |
+| MySQL (RDS / Aurora) | ✔ works, small workarounds | the access is primary-key and secondary-index lookups plus transactions, which InnoDB does well; no partial indexes, no `RETURNING`, no `xmax` trick (see below); nothing in sections 8 or 9 needs a Postgres-only index type |
+| DynamoDB | ✔ works, no gain | the timeline is key-shaped (partition key `order_id`, sort key `happened_at` plus id) and 185 writes/s is trivial for it, but step, audit entry, outbox row and version bump would need `TransactWriteItems` (≤ 100 items) or an audit log in another store, `If-Match` becomes a condition expression, and "unpublished steps from today" or "steps that meet this deadline" need extra indexes: more work than a relational database, with no load benefit |
+| S3 | ✅ for the photo bytes, ✖ for the rows | originals and thumbnails are objects keyed by file id; the `order_step_photos` row holds their state, and S3 cannot change a photo's state atomically with its step |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, the `db.r7g.xlarge` of section 15 (plus the `db.r7g.large` replica that isolates the public tracking page), because a step, its audit entry and its outbox row are one transaction, the partial indexes keep both lists clean, and `ON CONFLICT … RETURNING` turns a phone's retry into a one-statement no-op. Postgres is the system of record for steps and photo state; S3 holds the photo bytes (originals are the truth, thumbnails can be rebuilt, [40](40-media-reprocessing.md)); the edge-cached tracking JSON and the SSE doorbell are derived.
+
+**If it were MySQL instead:** the same tables on the same size of instance, with three small changes: plain `(order_id, happened_at DESC, id DESC)` indexes instead of the two partial ones (MySQL 8 has descending index columns; `deleted_at` and `customer_visible` are filtered on the row, and with ~8 steps per job, 25 per page, the extra rows read are few); `ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)` with the affected-row count (1 = inserted) and one read for `version` in place of `RETURNING … (xmax = 0)`; and `BINARY(16)` for the `uid` columns. InnoDB's clustered key suits `order_step_photos (step_id, uid)`: one step's ≤ 20 photos sit together and the random `uid` only orders within a step. Nothing else is material; a team that already runs MySQL can choose it.
+
+**What would flip the choice:** nothing at 10×: ~1,850 commits/s is still one primary (section 15) and the real growth is size, 1.4 TB a year, handled by partitioning on order hash or archiving closed orders (section 10). Aurora instead of plain RDS if viral tracking links need several read replicas or faster failover. Only a multi-region active-active requirement, or sustained writes beyond one primary (~10k durable commits/s), would move the rows to per-key ownership in DynamoDB; the photos stay in S3 either way.

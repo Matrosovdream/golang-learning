@@ -311,3 +311,54 @@ The subtle one: **the "filled in under 2 s" trap must count from when the draft 
 - **Per-tenant form schemas** with versioned fields and a migration story for old leads.
 - **Funnel analytics:** how many forms are opened, drafted, abandoned, sent? (events, not the lead table).
 - **Exactly-once CRM sync:** the outbox gives at-least-once; make the CRM call idempotent with its own key ([10](10-webhook-delivery.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Intake API (Go, stateless; the outbox worker runs in the same pods) | campaign spike 1,000 leads/s (× 1.75 with partial-outage retries) + 900 photo presigns/s (300 leads × 3) | CPU | leads 1,750/s × 1 ms (JSON, rules check, `sha256`, key lookup, 4-statement transaction) = 1.75 vCPU; presigns 900 × 0.5 ms = 0.45; total 2.2 vCPU. N = ceil(2.2 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.03) = 2 → 3. Worker: 900k outbox rows from the spike (3 per lead) at ~2,000/s × 0.5 ms ≈ 1 vCPU, after the spike | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS or EKS | 3, one per zone | 3 is the floor for three zones. `xlarge`, not `large`, because the worst case (3 attempts each: 3,000/s ⇒ 3.5 vCPU) must still fit with a zone down: 44 % of 8 vCPU, against 87 % of 4 on `large`. CPU work with tiny memory (512 in-flight cap × a few KB), so `c`. Outbound mail, SMS and CRM calls are waiting, not CPU |
+| Postgres (`submissions`, `outbox`, photo rows) | spike: 1,000 lead transactions/s + 900 photo-row transactions/s; 1.5 GB/day ≈ 550 GB a year; key index ≈ 15 GB a year | write IOPS and CPU (the hot set is small) | CPU: leads 1,000 × 1 ms + photos 900 × 0.3 ms + replays 750 × 0.1 ms + outbox claim and ack ≈ 0.4 ⇒ ≈ 1.75 of 4 vCPU; IOPS: ≈ 3 per lead (row + 3 outbox rows + 4 indexes, assumption) = 3k, photos ≈ 1 each = 0.9k, outbox updates ≈ 3k ⇒ ≈ 7k ⇒ `gp3` 8,000 (cap 16,000); hot set: today's leads, today's outbox, recent keys ≈ 5 GB < 16 GiB; disk: 550 GB rows + ≈ 50 GB indexes ⇒ 1 TB | `db.m7g.xlarge` (4 vCPU / 16 GiB), RDS Multi-AZ | 1 primary + synchronous standby | Sized for a 5-minute spike (the average is 12 leads/s) and for "no lead lost after a `201`", hence the synchronous standby. `m`, not `r`: the hot set is a few GB. 44 % CPU at the spike leaves room for the ×3 retry case; a 30 s failover is handled as in section 10 (`503` + `Retry-After`, drafts and keys kept, nothing lost) |
+| S3 (photos, direct presigned `PUT`) | spike 300 leads/s × 3 × 2 MB = 1.8 GB/s (14 Gbit/s), 900 `PUT`/s; day 1.8 TB (21 MB/s average) | request rate per prefix | 900 `PUT`/s is under ~3,500 per prefix | S3 Standard | nothing to size | Carrying 14 Gbit/s through the API would need network-family nodes and pay for every byte twice; the presigned `PUT` costs no compute. Spread keys over a few prefixes to stay under the per-prefix rate at 10× |
+
+Retention is not in the lesson: assume photos are kept 90 days (each further month kept adds ≈ $1,260). S3 request fees (~27M `PUT` a month) are small and left out; thumbnails and re-encoding belong to task 11 and are not sized here. Replies are tiny (`201 {id}`), so ALB and egress are small.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API: 3 × `c7g.xlarge` (3 × $105; also runs the outbox worker) | $320 |
+| Postgres: `db.m7g.xlarge` ≈ $240 managed, Multi-AZ doubles | $480 |
+| gp3 1 TB + 5k extra IOPS: (1,000 × $0.08 + 5,000 × $0.005) × 2 = (80 + 25) × 2 | $210 |
+| ALB (small requests; photos bypass it) | $20 |
+| S3 photos, 90 days: 90 × 1.8 TB = 162 TB × $0.023 per GB | $3,700 |
+| **Total** | **≈ $4,730** (≈ $4,450 with 1-year commitments on API and database) |
+
+- **Biggest line and why:** the photos (≈ 78 %), not the lead: a lead is 1.5 KB, three photos are 6 MB, and 30 % of leads carry them. The servers are ≈ $1,000 and are sized for a 5-minute spike while the average is 12 leads/s. The levers are retention and storage tiers, and resizing on upload (task 11), not instance size.
+- **What changes at 10×:** 10k leads/s spikes ⇒ leads 10k × 1.75 × 1 ms = 17.5 + presigns 9k × 0.5 ms = 4.5 ⇒ 22 vCPU ⇒ N = ceil(22 ÷ 4.27) = 6 × `c7g.2xlarge`. Postgres: ≈ 19k commits/s ≈ 70k IOPS is past gp3 and one primary ⇒ shard leads by `form_id` or tenant (section 10) into ~6 nodes (≈ 12k IOPS each) and partition and drop `outbox` by day. S3: 18 GB/s (144 Gbit/s) and 9k `PUT`/s ⇒ spread over at least 3 prefixes; photo storage at 90 days is ≈ $37k a month, the line to engineer.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 1M leads a day (≈ 12/s average, 1,000/s for a 5-minute campaign spike), each ≈ 1.5 KB with a `fields` document: ≈ 550 GB a year, plus a key index of ≈ 15 GB a year (section 4).
+- Each submit is one small transaction: the lead row plus about three outbox rows, and a retry with the same key must find the first answer (sections 6 and 9.1). The database has to settle "did this key already win?" atomically.
+- Reads are light: the staff inbox by `(form_id, created_at DESC)`, one lead by id, the outbox claimed with `SKIP LOCKED`. No joins that matter, and nothing may be lost once `201` has gone out.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the unique index on `submission_key` plus `INSERT … ON CONFLICT … DO NOTHING RETURNING public_id` is the whole idempotency guarantee, in the same row and transaction as the lead and outbox rows; the outbox's partial unique index `(dedupe_key) WHERE dedupe_key IS NOT NULL AND status IN ('pending','failed')` stops a retried fan-out queuing a recipient twice yet lets a finished message's key be reused; `jsonb` for `fields`; `pg_notify` commits with the row and wakes the worker |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | a unique index on a nullable `BINARY(16)` already allows many NULLs, so `submission_key` needs no predicate. `ON CONFLICT … RETURNING` becomes `INSERT … ON DUPLICATE KEY UPDATE id = id` plus the affected-row count (1 new, 0 replay), with `public_id` generated in Go instead of by a SQL default (no `RETURNING` to read it back). The outbox's partial unique index becomes a generated column `IF(status IN ('pending','failed'), dedupe_key, NULL)` with a unique index. No `LISTEN/NOTIFY`, so the worker polls (the 1 s fallback of 9.3). `JSON` is enough, since `fields` is stored and returned, not searched |
+| DynamoDB | ✔ works, gains little here | a conditional `PutItem` on the key rejects a replay, `TransactWriteItems` writes lead and outbox items together, Streams can replace the outbox worker, and 1.5 KB items with random UUID keys are comfortable at 1,000/s. But the staff inbox by form and date, search by phone or email and reporting then need GSIs or a second store, and the average is 12 leads/s: nothing here outgrows one primary |
+| Redis (ElastiCache) | ✖ as the home of the key | a `SETNX` key with a TTL can exist without a lead after a crash between the claim and the insert, so the retry is told "done" and the lead is lost (9.1); fine for the limiter ([17](17-abuse-protection.md)) |
+| S3 | ✅ chosen for photos (not a database) | 1.8 TB a day by presigned `PUT` straight from the phone; the database keeps only the photo row and its key |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.xlarge`, section 15) for leads, keys and the outbox; S3 for photo bytes. Two properties decide it: the unique key lives in the same row and transaction as the lead, so a key cannot exist without a lead, and the partial unique index on the outbox gives per-recipient dedupe while a message is waiting.
+
+**If it were MySQL instead:** four statement-level changes (the idempotent insert, `public_id` made in Go, a generated-column outbox key, a polling worker) and no change to the design: the guarantee, a unique index inside the transaction, is portable. The outbox churns (insert, claim, update, delete): Postgres leaves dead rows for autovacuum, InnoDB updates in place.
+
+**What would flip the choice:** spikes of ~10k leads/s (the 10× case in section 10) are past one primary: shard leads by `form_id` or tenant, still relational. A broker (MSK) becomes right when several services consume the same events or thousands per second are sustained, and it is fed from the outbox, so the form does not change (9.3). DynamoDB only if writes stay above one primary and the inbox and reporting queries have moved to a derived store.

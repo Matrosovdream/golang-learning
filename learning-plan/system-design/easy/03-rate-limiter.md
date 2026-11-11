@@ -270,3 +270,53 @@ limit *is* the control.
 - Shadow mode: compute the decision, log it, don't enforce; use it to tune new rules safely.
 - Distinguish limits (reject) from load shedding (reject because *we* are overloaded, lesson 48).
 - Multi-region: a client hitting two regions. Local limits per region with a global cap (hard track).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Redis (token buckets, one Lua script per check) | 50k scripts/s peak (10k/s avg); 100k clients × 100 B = 10 MB | one core (single thread), not memory | memory: 10 MB × ~1.7 overhead = 17 MB, 0.2 % of 8 GiB. CPU: assume 15 µs per script (HMGET + HSET + EXPIRE + TIME inside Lua) ⇒ 50k × 15 µs = 0.75 core, too hot for one primary (keep ≤ 50 %), so 2 shards by client key ⇒ 0.375 core each | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache cluster mode (self-run: `m7g.large`) | 2 shards × (primary + replica in the other zone) = 4 nodes | Redis runs commands on one thread, so the bound is a core, not RAM; the smallest node still gives a second vCPU for I/O and the OS. `r` would pay for memory we never use (17 MB of 16 GiB). One shard is enough if the measured script cost is ≤ 10 µs (50 % of a core at 50k/s). Replicas are asynchronous: a failover loses a few tokens, which section 10 accepts |
+
+The middleware has no instances of its own: 50k checks/s × ~0.05 ms of client-side CPU (assumption) = 2.5 vCPU at peak across the existing 20 servers (~0.13 each). The 0.5 ms Redis round trip is waiting, not CPU, and costs about 200 connections in total (20 servers × a pool of ~10).
+
+Network: 50k checks/s × ~200 B (key + arguments out, a few numbers back) = 10 MB/s ≈ 80 Mbit/s, far below any node's limit, so the network is not a bound. The only network cost is crossing zones (see the bill). The rules table (polled every 30 s by 20 servers, under 1 read/s) lives in the existing database or a config file: nothing to size.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Redis: 4 × `cache.m7g.large` (4 × $120) | $480 |
+| Limiter's share of API CPU: 2.5 vCPU × $26.50 (half a `c7g.large`) | $70 |
+| Cross-zone checks: 10k/s × ⅔ × ~200 B ≈ 3.5 TB × $0.02 (out + in) | $70 |
+| **Total** | **≈ $620** (≈ $430 with a 1-year commitment on the ~$550 of compute lines) |
+
+- **Biggest line and why:** the Redis nodes (~77 %), bought for availability and one core of headroom, not for data (17 MB). If the measured script cost is ≤ 10 µs, one primary + replica ($240) is enough. In hardware terms a rate limiter is a tiny dataset behind one very hot thread.
+- **What changes at 10×:** 500k checks/s × 15 µs = 7.5 cores; at ≤ 50 % per shard that is 15 → 16 shards × 2 = 32 nodes ≈ $3,840. This is why section 10's token leasing matters: leasing 5 tokens at a time cuts Redis to 100k scripts/s ⇒ 1.5 cores ⇒ 4 shards × 2 = 8 nodes ≈ $960. Memory still does not matter (even 1M clients is ~170 MB); the Redis main thread is what runs out first.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Hot state: one token bucket per (client, endpoint group), two numbers (`tokens`, `ts`), ~100 B each, 100k active clients ≈ 10 MB (section 4). Every API request is one read-modify-write on it: 10k/s on average, 50k/s at peak, from 20 servers, inside a 2 ms budget.
+- One client can be one hot key: maybe 50k/s on a single bucket (section 10).
+- The state is disposable: idle buckets expire on their own, and after a failover a few extra requests get through (section 10). If every bucket were lost, every client would start with a full one.
+- Cold data: `rate_limit_rules`, a handful of rows keyed `(tier, endpoint_group)`, read every 30 s by each server and kept in memory (section 8).
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✔ for the rules table, ✖ as the bucket store | each check would be a transaction: a durable WAL commit for state we can throw away, at 50k/s against the ~10k durable writes/s a relational primary is good for; every `UPDATE` leaves a dead row version for vacuum, and a hot client's single row is a lock queue. An `UNLOGGED` table drops the WAL, not the dead rows or the lock. The rules table (3 tiers × 3 groups, polled twice a minute per server) fits perfectly and lives in the database the app already has |
+| MySQL (RDS / Aurora) | ✔ for the rules table, ✖ as the bucket store | the same verdict for the same reasons: InnoDB updates in place (no vacuum), but each check still takes a row lock and a durable commit, and 50k/s is over the same ceiling. An `UPDATE` that refills and takes a token, checked by rows affected, can express the bucket atomically; it just cannot do it at this rate |
+| Redis (ElastiCache) | ✅ chosen for the buckets | one Lua script is an atomic read-modify-write on a single thread, so 20 servers cannot race (9.3); `EXPIRE` removes idle clients; ~15 µs per script × 50k/s = 0.75 core, hence 2 shards (section 15); the state is disposable, so asynchronous replicas are enough |
+| DynamoDB | ✖ poor fit as the hot path | a conditional `UpdateItem` is an atomic bucket, but one partition tops out near ~1,000 writes/s while one big client is up to ~50k/s on one key, and every check would be a billed write |
+| In-process (`x/time/rate`) | ✔ as the fallback only | no network and no dependency, but 20 servers make the real limit 20 × N and uneven balancing makes it unpredictable (9.2); it is the degraded mode, not the design |
+
+**Pick:** Redis on ElastiCache cluster mode (2 shards × primary + replica of `cache.m7g.large`, section 15) for the buckets; the rules stay in the application's existing PostgreSQL (or a YAML file) and are polled into memory every 30 s; `x/time/rate` is the fallback when Redis is down. The rules table is the record; the buckets are derived and disposable. What decides it: an atomic server-side read-modify-write, one very hot thread (~100k simple ops/s), and key expiry.
+
+**If it were MySQL instead:** nothing material. The rules table needs a composite primary key and `DECIMAL` for `NUMERIC`, and nothing else; the bucket path is Redis either way, and a MySQL team has no reason to move buckets into InnoDB.
+
+**What would flip the choice:** quotas that must never lose a count (billing and monthly caps, out of scope in section 3) need a durable store: MemoryDB for the short windows, or a relational or DynamoDB counter updated in batches (task 06's pattern) behind the Redis gate. At 10× (500k checks/s, ~32 nodes, section 15) the answer is token leasing (section 10) before more shards, still on Redis. A multi-region global cap becomes per-region limits plus a global budget (hard track).

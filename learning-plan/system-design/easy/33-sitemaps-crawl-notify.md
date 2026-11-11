@@ -336,3 +336,53 @@ earn "submitted URL has crawl issue" reports. Rules, all derived from the one `l
 - **Search Console API:** automate "submitted vs indexed" reports and alert on drops per shard.
 - **Priority hints:** put revenue-heavy URLs in files that always carry fresh `lastmod`.
 - **Sitemap for removed content:** a short-lived list of 410s to speed de-indexing; compare with a plain `removed` ping.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| SEO workers (Go: projector, pinger, verifier, nightly shard builder) | ~115 change events/s; ~120 IndexNow batches/day; verifier 0.6 fetches/s; a nightly build of 50M rows | CPU (the nightly burst), otherwise idle | steady: projector 115 × ~1 ms (hash ~5 KB, two upserts) = 0.12 vCPU + pinger and verifier ≈ 0.05 ⇒ 0.2 vCPU; N = ceil(0.2 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 (one per zone). Build: 50M ÷ 200k rows/s per worker = 250 vCPU-s (§4), so 6 workers on the 6 vCPU ≈ 42 s | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | formatting and gzip are CPU; memory is tiny because shards stream (~50 MB per worker), so `c` not `m`; the burst is a minute a night, so a bigger or Spot fleet would save pennies |
+| Postgres (seo_urls, seo_shards, crawl_queue) | 115 upserts/s into seo_urls + 115 into crawl_queue + 115 deletes at peak; 50M rows | memory (IOPS are tiny) | rows 50M × ~200 B = 10 GB + indexes (path ~5 GB, shard + changed + PK ~4 GB) ≈ 20 GB (assumption); writes 115 × (4 + 4 + 3 IOPS; an indexed `changed_at` defeats HOT updates) ≈ 1,300 IOPS < gp3's 3,000 included; the nightly scan reads 10 GB: ~80 s even cold at gp3's 125 MiB/s, less from RAM | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 + synchronous standby | ~1.2M changed URLs a day touch most of the 1.25M heap pages and the scan touches all, so RAM ≥ 20 GB keeps both off the disk; `m7g.xlarge` (16 GiB) would also run at ~1k IOPS, so `r` buys headroom, not necessity; no replica: the build is 6 streams for ~40 s a night |
+
+S3: nothing to size. ~1,050 gzip files ≈ 1.6 GB per build (§4: 1–2 MB each), 7 builds kept ≈ 11 GB; the CDN serves them straight from S3, so crawlers never reach the workers. No Redis or Kafka: the queue is the `crawl_queue` table. Outbound: IndexNow ≈ 120 MB/day, verifier ≈ 50k GETs × ~100 KB ≈ 5 GB/day.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Workers: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.xlarge` ≈ $310 managed, Multi-AZ doubles | $620 |
+| gp3: 2 volumes × 100 GB (primary, standby) | $20 |
+| S3 (≈ 11 GB) + CDN egress for sitemap fetches (1.6 GB × 3 full fetches a day × 30 ≈ 144 GB × $0.085) | $10 |
+| NAT: 1 gateway ($33) + ~150 GB of verifier traffic × $0.045 | $40 |
+| ALB for `robots.txt`, status and the key file: $16 + ~1 LCU | $20 |
+| **Total** | **≈ $870** (≈ $600 with a 1-year plan on the $780 compute baseline) |
+
+- **Biggest line and why:** the database, 71 %, for a 20 GB table that one node's RAM can hold. This is honest tiny hardware: the workers run at 0.2 vCPU all day and the only real work is a 40-second burst. `seo_urls` is derived data (it can be rebuilt from the content tables), so the lever is single-AZ `db.r7g.xlarge` with backups, which halves the line to $310; I keep Multi-AZ because a 50M-row rebuild takes hours, and a stale projector means a lying sitemap.
+- **What changes at 10×:** 500M URLs, 20M changes a day. `seo_urls` ≈ 200 GB no longer fits 32 GiB: either `db.r7g.4xlarge` (128 GiB, ≈ $2,480 Multi-AZ) or let the scan read gp3 (100 GB heap ÷ 1,000 MiB/s ≈ 100 s) and run builds on a replica. Writes ≈ 1.2k events/s × ~11 IOPS ≈ 13k IOPS, still `gp3` (cap 16,000, +$50 for the extra IOPS). The builder is 2,500 vCPU-s ⇒ 3 × `c7g.2xlarge` ≈ 104 s. The projector (1.2 vCPU) and the pinger (1,200 batches a day) still fit on the same nodes.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- `seo_urls` is one narrow row per URL: 50M rows × ~200 B ≈ 10 GB, ≈ 20 GB with indexes (section 15). One projector writes it (~115 upserts/s at peak); readers are **ordered range scans**: a shard build is 50,000 consecutive `url_id`s, 1,000 of them a night, plus the `changed_at` scan for the fresh files.
+- `crawl_queue` is one row per changed path: an edit burst must collapse into one row by upsert, and a pinger drains up to 10,000 due rows at a time. Rows live for minutes.
+- All of it is **derived**. The record is the content tables (the CMS of lesson 32); `seo_urls` can be re-projected from them, which takes hours for 50M rows, and the sitemap files in S3 (~1.6 GB per build) are derived again from `seo_urls`.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | an upsert on the primary key (`INSERT … ON CONFLICT (path) DO UPDATE`) is the coalescing step; `FOR UPDATE SKIP LOCKED` drains the queue; keyset scans by `(shard, url_id)` build a file in one ordered pass; it is the same engine as the CMS whose events feed the projector |
+| MySQL (RDS / Aurora) | ✔ works, nearly interchangeable | `ON DUPLICATE KEY UPDATE` and `SKIP LOCKED` (8.0+) cover the queue. InnoDB's clustered key makes a shard (`url_id / 50000`) a contiguous primary-key range, so a build reads sequentially with no heap fetches, slightly better than an index scan plus heap. The `WHERE listed` partial indexes become plain indexes, which costs little if most of the 50M URLs are listed (an assumption). `path TEXT UNIQUE` must become a bounded `VARCHAR`/`VARBINARY` |
+| DynamoDB | ✔ works, no gain | an item per `url_id` (~200 B) and a `PutItem` per path coalesce edits, and 115 writes/s is trivial. But the shard build becomes a `Query` on a GSI by shard (a second copy of 50M items), the fresh files need another GSI on `changed_at`, and the queue needs one on `next_attempt_at`; nothing here approaches a write rate that needs it |
+| Redis (ElastiCache / MemoryDB) | ✔ for the queue only, ✖ for `seo_urls` | a sorted set of `changed_at` plus a hash would coalesce bursts in memory; a restart loses pending pings, which the nightly reconcile (9.4) repairs. Holding 20 GB of rows read once a night in RAM (≈ 34 GB with overhead) is the wrong memory use. The lesson chose no Redis: 115 upserts/s is not worth a component |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.xlarge` from section 15, no replica), with S3 for the generated files. The properties that decide it are the primary-key upsert that coalesces a burst into one row, `SKIP LOCKED` for the pinger, and ordered keyset scans for the builder; all three also exist in MySQL, so the honest tie-breaker is the CMS already being Postgres. System of record: the content tables (lesson 32). Derived and rebuildable: `seo_urls`, `seo_shards`, `crawl_queue` (the nightly reconcile covers a lost queue) and the S3 files. Multi-AZ is kept because a re-projection of 50M rows takes hours and a stale projector means a lying sitemap (section 15).
+
+**If it were MySQL instead:** nothing material. `ON DUPLICATE KEY UPDATE` replaces `ON CONFLICT` (with `VALUES()` or a row alias for the new `kind`), `BYTEA` becomes `VARBINARY(32)`, `TIMESTAMPTZ` becomes a UTC `TIMESTAMP`, the two partial indexes lose their `WHERE`, and `path` becomes `VARCHAR(512)` with a binary collation (InnoDB cannot index an unbounded `TEXT` without a prefix length, and the default collation is case- and accent-insensitive, which a path is not). The shard build gets a little cheaper.
+
+**What would flip the choice:** nothing in the write rate (115/s) leaves an RDS primary; at 10× (500M URLs ≈ 200 GB) it is a bigger node or builds on a replica (section 15), not another engine. Beyond a few billion URLs (the index limit also binds at ~2.5B, section 10) the nightly full scan of an OLTP table stops being the right shape: build from a columnar export in S3 (Parquet, read by a batch job or Athena) instead.

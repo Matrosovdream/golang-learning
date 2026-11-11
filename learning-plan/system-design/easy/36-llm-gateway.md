@@ -312,3 +312,59 @@ type Provider interface {
 - **Prompt registry:** versioned prompts, each call logging `prompt_version`.
 - **Data residency:** route EU tenants only to EU endpoints; the switch scopes already give the hook.
 - **Showback:** a per-tenant cost report and a "you used 80 %" email, built from `llm_usage_daily`.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Gateway (Go, stateless: switches, budget, route, stream, settle, emit) | 2,000 calls/s peak (§4) ⇒ ~6,000 streams in flight (2,000 × ~3 s, Little's law) | CPU (TLS on both legs, JSON, SSE relay); network and memory are small | 2,000 × ~2 ms (TLS to the provider, decode an ~8 KB prompt, ~100 SSE events, token count, 3 Redis round trips) = 4 vCPU; log writer, rollup and reaper ride along ≈ 0.2; N = ceil(4.2 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(1.97) = 2 → 3. Memory: 6,000 × ~64 KiB (two sockets, buffers, a 10 KB body) ≈ 0.4 GiB + switch snapshot + heap ≈ 1 GiB of 8; network 2,000 × 9 KB = 18 MB/s ≈ 0.15 Gbit/s | `c7g.xlarge` (4 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | a proxy that waits on a 2 s model call is mostly idle sockets, so it is CPU for the crypto and parsing, then nothing; 35 % busy, 53 % with a zone down; it is not an `n` (network) case at 0.15 Gbit/s |
+| Redis (budgets, reservations, exact-match cache) | meter ~4,000 ops/s (§4; ~8,000 if the month key doubles it, §9.3) + ~2,000 cache GETs/s; meter ≈ 1M live keys, cache ≈ 2M entries × ~1.5 KB (assumption) | memory | meter 1M × ~150 B = 0.15 GB; cache 2M × 1.5 KB = 3 GB; total 3.15 GB × ~1.7 = 5.4 GB ⇒ ÷ 0.7 ≈ 7.7 GiB; ~10k ops/s (Lua ≈ 10 µs each) ≈ 10 % of one core; a hot (tenant, feature) key is serialised on one core, ~100k ops/s, far above one tenant's rate | `cache.r7g.large` (2 vCPU / 16 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory-bound, so `r`: `m7g.large` (8 GiB) is smaller than the 7.7 GiB it needs plus headroom; CPU idles; the replica matters more than the size, because Redis down is the fail-open/fail-closed event of §10 |
+| Postgres (llm_calls partitions, llm_usage_daily, budgets, switches, prices) | ~2,000 row inserts/s at peak, in batches; 15 GB/day (§4: 50M × ~300 B); 14 days hot | storage size and sequential throughput; CPU and IOPS are tiny | 15 GB/day + ~3 GB/day indexes (assumption, ~20 %) = 18 GB/day × 14 ≈ 250 GB ⇒ 500 GB `gp3`; writes ≈ 1 MB/s of rows, ~2 MB/s with WAL, in batches of thousands ⇒ a few hundred IOPS vs 3,000 included; CPU 2,000 × ~30 µs ≈ 0.06 vCPU; the nightly re-sum of one day (15 GB) ≈ 1–2 min on 2 vCPU | `db.m7g.xlarge` (4 vCPU / 16 GiB), RDS Multi-AZ | 1 + synchronous standby | an append-only log is neither memory- nor IOPS-bound, so not `r` or `i`; `m` leaves room for the nightly scan and admin queries; Multi-AZ because the log is the truth for the spend; older partitions go to S3, not to a bigger disk |
+
+Queue: SQS between the gateway and the log writer, 100 events per message (~30 KB): 500k messages/day. GPU: none, the models run at the providers; self-hosting ~1.3M tokens/s (115B tokens ÷ 86,400) is a different lesson and the sheet has no GPU prices. S3: detail older than 14 days as columnar files (5.5 TB/year raw ≈ 1.1 TB at an assumed 5× compression) plus ~450 GB of sampled bodies (15 GB/day × 30 days). The traffic to the providers is the infrastructure's real cost: 50M calls × ~8 KB prompt = 400 GB/day out ≈ 12 TB a month, all through NAT.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Gateway: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Redis: 2 × `cache.r7g.large` (2 × ≈ $156) | $310 |
+| Postgres: `db.m7g.xlarge` ≈ $240 managed, Multi-AZ doubles | $480 |
+| gp3: 2 volumes × 500 GB (primary, standby) | $80 |
+| S3: ~1.1 TB columnar detail + ~450 GB sampled bodies × $0.023 | $40 |
+| SQS: 1.5M requests/day × 30 × $0.40 per million | $20 |
+| Internal ALB: $16 + ~19 LCU (580 calls/s × 9 KB ≈ 19 GB/h) × $0.008 × 730 | $130 |
+| Data out to the providers: 12 TB × $0.09 | $1,080 |
+| NAT: 3 gateways ($99) + ~13.8 TB processed × $0.045 | $720 |
+| Model tokens, routed and prompt-cached (§4): $97k/day × 30 | $2,910,000 |
+| **Total** | **≈ $2,913,200** (≈ $2,912,800 with a 1-year plan on the ≈ $1,110 compute baseline) |
+
+- **Biggest line and why:** the model tokens, 99.9 %. Hardware is ≈ $3.2k a month, and even inside that, moving bytes to the providers (egress + NAT ≈ $1.8k) costs more than all the compute ($1.1k). This is honest tiny hardware: three small proxies, a small cache and one database, because the gateway only forwards. The lever is §4's: routing and prompt caching take the same traffic from ≈ $16M to $2.9M a month; no instance choice comes close.
+- **What changes at 10×:** 20k calls/s, ~60,000 streams in flight, CPU 40 + 2 = 42 vCPU ⇒ on `c7g.4xlarge` N = ceil(42 ÷ 8.53) = 5 → 6 nodes (≈ $2,520). Redis ops ≈ 100k/s is one core's limit, so 3 shards of `cache.r7g.xlarge` (cache 54 GB ÷ 0.7 ≈ 77 GiB) with replicas, and hot (tenant, feature) counters split across keys (§10). Postgres at 150 GB/day keeps a 2–3 day window (≈ 360–540 GB) and sends detail to a columnar store. NAT breaks: ~60k connections to the same provider addresses pass its ~55k-per-destination limit, so use public subnets or several NAT addresses; egress ≈ $10.8k a month. Tokens ≈ $29M a month, and the providers' rate limits come first.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- **The call log** (`llm_calls`) is append-only, one ~300 B row per provider call: 50M a day, ~580/s average and ~2,000/s at peak, 15 GB a day, ~18B rows and ~5.5 TB a year (section 4). Rows are never updated. Reads are admin filters (tenant, feature, outcome, time range, sort by cost or slowest), a nightly re-sum of one day (15 GB), and a 365-day retention promise.
+- **Control-plane config** (switches, budgets, prices): a few thousand rows, changed rarely, loaded into every pod's memory; it needs transactions, `CHECK`s and an audit trail, not speed.
+- **The meter**: ~4,000 atomic reserve/settle operations/s (~8,000 with the month key) over ~1M live keys, with a hot key per (tenant, feature) and reservations that must expire after a crash (9.3). It is a counter cache that the log can rebuild.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for config and the 14-day hot log | daily range partitions (`PARTITION BY RANGE (created_at)`, key `(created_at, id)`) turn retention into a metadata `DROP`/detach instead of deleting ~700M rows; the log writer inserts thousands of rows per statement (~2 MB/s with WAL, a few hundred IOPS); 14 days ≈ 250 GB on `gp3`; `CHECK`s guard `kind` and `outcome` |
+| MySQL (RDS / Aurora) | ✔ works, interchangeable for the hot window | `RANGE` partitioning with `DROP PARTITION` exists (the partition column must be in every unique key, as it already is here), and InnoDB's clustered `(created_at, id)` key stores rows in time order, so appends are sequential. `uuid` becomes `BINARY(16)`, `bytea` becomes `VARBINARY`, `timestamptz` a UTC `TIMESTAMP`; descending and `CHECK` support is there in 8.0.16+ |
+| ClickHouse / Athena over Parquet in S3 | ✅ Athena over S3 columnar for days 15–365 (as section 15 sizes it); ✔ ClickHouse if that history must be interactive | ~18B rows a year of append-only metadata is the cheat sheet's "analytics over billions of rows"; Parquet at an assumed 5× compression is ~1.1 TB a year. Neither can hold the switches and budgets (no cheap single-row updates), so they are the second tier, not a replacement |
+| OpenSearch | ✖ poor fit | the log is structured metadata filtered and aggregated, not searched as text: bodies are sampled to S3 and `error` is ≤ 500 chars. An inverted index over 5.5 TB a year costs heap and SSD for a query nobody runs, and it could only ever be a derived copy |
+| Redis (ElastiCache / MemoryDB) | ✅ for the meter and the exact-match cache (derived), ✖ as the record | one Lua script makes check-and-reserve atomic and keys expire on their own; ~10k ops/s is ~10 % of one core (section 15). Postgres could hold the meter with a conditional `UPDATE` (`RETURNING` there, `ROW_COUNT()` on MySQL), but every call would wait on a synchronous Multi-AZ commit and a hot (tenant, feature) row would serialise on its lock. The log is the truth; the counters are re-summed from it nightly |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.m7g.xlarge`, 500 GB `gp3`, section 15) for the config tables and the 14-day hot window of `llm_calls`; Redis (`cache.r7g.large`, primary plus replica) for the meter and cache; S3 columnar files for days 15–365 and sampled bodies. Deciding properties: declarative daily partitions plus batch inserts for an append-only log, and ordinary relational constraints for the few tables that guard money. System of record: `llm_calls` (cost truth), `llm_budgets`, `llm_switches`, `llm_prices`. Derived and rebuildable: `llm_usage_daily` (re-summed nightly), the Redis counters and cache, and each pod's switch snapshot.
+
+**If it were MySQL instead:** nothing material. The same partitioned log (`PARTITION BY RANGE (UNIX_TIMESTAMP(created_at))` on a `TIMESTAMP`, partition column in the primary key), `BINARY(16)` for `call_id`, `VARBINARY` for `prompt_sha256`, and an `id` that is either `AUTO_INCREMENT` with its own index (InnoDB wants that column first in some index, and it is second in the primary key) or generated by the application. Partition creation is manual in both engines, so the "create tomorrow's partition ahead of time" job is needed either way. The log's size and its shape, not the engine, are the real decisions here.
+
+**What would flip the choice:** at 10× (150 GB/day, section 10) the log's *size* breaks first, not its write rate (20k rows/s is still only a few batched statements a second): keep a 2–3 day hot window and push detail to columnar storage sooner. If admins need interactive slicing over the whole year (~18B rows), put ClickHouse (or Redshift) behind the log writer; if one primary's ceiling of ~10k durable writes/s were ever the limit, the log moves to a stream (Kafka or Kinesis) feeding a columnar store, and Postgres keeps only the config.

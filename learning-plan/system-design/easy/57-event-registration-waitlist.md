@@ -329,3 +329,55 @@ func (r *Repo) Hold(ctx context.Context, in HoldInput) (Registration, error) {
 - **Check-in:** signed QR codes, offline scanning, and a replay-safe "used" flag.
 - **Reviews and verified attendees:** the seed's `docs/ideas.md` badge, derived from `confirmed` registrations and the event end time ([19](19-moderated-submissions.md)).
 - **Sponsorship tiers** as inventory with their own counters (`event_sponsorship_tiers` in the repo's plan).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). Small in hardware terms: the normal load is 3.9 registrations/s. The capacity is for ten minutes on one viral event, and the opening time is known in advance, so it is scheduled, not kept running. What limits throughput is one counter row, and a bigger instance does not move that.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Waiting-room + registration API (Go, stateless) | viral event: 4,200 queue entries/s; 500k waiting (§4) polling every 10 s (assumed) = 50k polls/s; ≤ 600 registrations/s reach the database | CPU | entries 4.2k × 0.3 ms = 1.3 vCPU; polls 50k × 0.1 ms = 5.0; registrations 600 × 2 ms (token HMAC, `SET NX`, `DECRBY`, one transaction) = 1.2; total 7.5 vCPU. N = ceil(7.5 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(7.03) = 8 → 9 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3 normally, 9 for each opening window (scheduled scale-out) | per-request CPU, trivial memory, so `c`; 42 % busy on 9 nodes, 62 % with a zone down. The reaper, promoter and outbox relay run as goroutines inside these nodes (`SKIP LOCKED` makes that safe), so they need no instances |
+| Redis (waiting-room sorted set, gate counters, token `jti`) | `ZADD` 4.2k/s + `ZRANK` 50k/s + `DECRBY`/`SET NX` ~1.2k/s ≈ 55k ops/s; 500k entries × ~100 B = 50 MB (§4) | one core (ops/s), not memory | 55k × ~10 µs = 0.55 of the one core a node can use (the sheet: ~100k simple ops/s); memory 50 MB × 2 for the fork ≪ 8 GiB | `cache.m7g.large` (2 vCPU / 8 GiB), ElastiCache | 1 primary + 1 replica (other zone) | memory is nowhere near a limit, so not `r`; commands run on one core, so extra vCPU buys nothing: size by ops/s and stay under ~60 %. The replica turns a node loss into a failover instead of 500k people re-queuing (§10). Two viral events on one node would pass 100 %: cluster mode by event id |
+| Postgres (ticket-type counter rows, registrations, waitlist) | ~100 attempts/s, ≤ 600/s if all arrive within 10 s (§4); ~5,000 confirmations over ~10 min; ~3 GB/month, 36 GB/year | the hot row's commit latency, then memory | 600 commits/s × ~2 IOPS = 1.2k vs 3,000 included in `gp3`; CPU 600 × ~1 ms = 0.6 of 2 vCPU. Hot set = this month's rows + indexes ≈ 3 GB × 1.7 ≈ 5 GB, plus connections ⇒ 16 GiB, not 8. The counter row serialises at ~500–1,000 updates/s (§4, ~1 ms commit); a Multi-AZ commit near 2 ms would halve that to ~500/s (assumption) | `db.r7g.large` (2 vCPU / 16 GiB), RDS Multi-AZ, 200 GB `gp3` | 1 primary + synchronous standby | neither CPU nor IOPS is the limit, the single row is; a larger instance does not raise it, which is why the gate admits only ~1.2 × seats (≈ 6,000 attempts). `r` rather than `m` only for RAM (5 GB hot set in 8 GiB is too tight). 36 GB/year means 200 GB lasts 3+ years |
+
+Event pages (cached 1–2 s) and static assets sit on the CDN; their bytes are not in section 4 (≈ $850 per 10 TB at the first-tier price). The queue traffic itself is small: 50k polls/s × ~0.5 KB for 10 minutes ≈ 15 GB out ≈ $1.4 per viral event. Confirmation emails go through [12](12-notification-service.md); the payment provider is outside AWS.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API baseline: 3 × `c7g.large` (3 × $53) | $160 |
+| Opening windows: 6 extra `c7g.large` × ~30 hours (assumed ~30 big openings) × $0.073/h | $10 |
+| Redis: 2 × `cache.m7g.large` (2 × ≈ $120) | $240 |
+| Postgres: `db.r7g.large` ≈ $156, Multi-AZ doubles | $310 |
+| gp3 200 GB (× 2 for the standby) | $30 |
+| ALB: $16 + ~170 LCU (4.2k new connections/s ÷ 25) × $0.008 × ~30 spike hours + baseline | $60 |
+| **Total** | **≈ $810** (≈ $560 with 1-year commitments on the $710 of steady compute) |
+
+- **Biggest line and why:** the database pair (≈ $340 with its disks, 42 %): seats are money and must survive a zone loss. The spike itself costs ≈ $10 of compute because it is scheduled. There is no useful lever: a smaller Postgres saves little, and the hot row does not care about instance size.
+- **What changes at 10×:** 50k seats and ~100k attempts/s (§10). The room holds 5M entries (500 MB, still tiny) but the polls become 500k/s: CPU ≈ 50 + 30 + 12 = 92 vCPU ⇒ N = ceil(92 ÷ 4.27) = 22 → 24 × `c7g.2xlarge` for the window (≈ $7 an hour). Redis needs ~600k ops/s ⇒ ~9 shards at ≤ 70 % of a core, or one shared "now serving" number cached at the edge instead of per-user polls, which brings it back to ~2. The counter row gets ~6k attempts/s against a ~1k budget, so split it into ~8 buckets (§10); Postgres moves to `db.r7g.2xlarge` for the CPU.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Tiny on average, violent for ten minutes: ~10M registrations a month (≈ 3.9/s, ~36 GB a year), but one viral event brings ~4,200 attempts/s, of which 99% must be refused before they reach the database (section 4).
+- The one hard rule is an aggregate, `held + sold <= capacity` per ticket type, enforced by a counter row and a conditional `UPDATE` that serialises at ~500–1,000 updates/s (sections 4, 9.1). Raw load is not the problem; one row's lock is.
+- Conditional uniqueness: one active registration per person and ticket type, one waiting entry per person (partial unique indexes), and one registration per `idempotency_key`.
+- Queue-like workers: the reaper (expired holds) and the promoter (waiting entries in `seq` order) claim rows with `FOR UPDATE SKIP LOCKED`.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | the counter row is portable, but Postgres adds the pieces around it: partial unique indexes for "one active registration per person" (`WHERE status IN ('pending','confirmed')`) and one waiting entry per person; partial indexes for the reaper and promoter (`WHERE status = 'pending'`, `WHERE status = 'waiting'`); `INSERT … ON CONFLICT (ticket_type_id, idempotency_key) DO NOTHING RETURNING id` tells a replay from a new row in one statement; at the default `READ COMMITTED` a waiting `UPDATE` re-checks its `WHERE` against the winner's committed row |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | the conditional `UPDATE` and the `CHECK` work the same (`CHECK` is enforced from 8.0.16) and the row-lock ceiling is the same; what is missing is partial indexes and `RETURNING`, and the default `REPEATABLE READ` needs care for the workers (below) |
+| DynamoDB | ✔ works, no gain | a conditional `UpdateItem` on a counter item and a `TransactWriteItems` (≤ 100 items) for registration + counter + a uniqueness marker item would work, but one counter item is one partition key with the same ~1,000 writes/s ceiling, so the spike is not solved; the reaper and promoter need extra indexes and TTL, and there are no ad-hoc queries |
+| Redis (ElastiCache / MemoryDB) | ✔ as the derived gate and waiting room, ✖ as the record | `DECRBY` on `seats_in_play`, the waiting-room sorted set and the token `SET NX` refuse the 99% in microseconds; it can lose state, and a decrement with no row leaks a seat (9.1), so Postgres reconciles it every few seconds |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, the `db.r7g.large` of section 15, for events, ticket types, registrations and the waitlist: a counter row guarded by a `CHECK`, partial unique indexes that make "one active registration per person" a database rule, and `ON CONFLICT … RETURNING` for idempotent holds. A bigger instance would not raise the hot-row ceiling, which is why the Redis gate and the waiting room admit only ~1.2 × the seats. Postgres is the record; Redis (`cache.m7g.large` plus a replica) is derived and rebuilt from it when it restarts.
+
+**If it were MySQL instead:** the same four tables, the same counter row and the same budget (InnoDB locks that one record, because a primary-key equality `UPDATE` takes a record lock and no gap lock, holds it to commit and re-reads the current row). Changes: each partial unique index becomes a generated column that is `NULL` unless the status is active, plus a unique index on it; the worker indexes become `(status, hold_expires_at)` and `(ticket_type_id, status, seq)`. `INSERT IGNORE` and `ON DUPLICATE KEY UPDATE` fire on either unique key, so a replay would look like `already_registered`: use a plain insert and read which key error 1062 names, then fetch the first row (no `RETURNING`). `SKIP LOCKED` exists since 8.0, but a range-scanning locking read at `REPEATABLE READ` takes next-key locks that can block inserts into the scanned range, so run the reaper and promoter at `READ COMMITTED`.
+
+**What would flip the choice:** not the engine and not the load. At 10× (~100k attempts/s) the answer is ~8 counter buckets in the same database (section 10). A durable queue for mega events (people must not rejoin after a node loss) would move the waiting room to MemoryDB. Only thousands of viral events at once, with aggregate writes beyond one primary (~10k durable writes/s), would justify sharding by event.

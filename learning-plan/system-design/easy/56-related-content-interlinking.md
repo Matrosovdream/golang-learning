@@ -307,3 +307,59 @@ func depths(off []uint64, out []uint32, roots []uint32) []int8 {
 - **A/B tests** of builder versions measured by click-through and by pages-per-session.
 - **Multilingual sites:** `hreflang` siblings as their own edge kind, never mixed into related.
 - **PageRank-style authority** from the in-memory graph, to pick which pages deserve hub slots.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). The 95 % of views that hit the CDN need nothing here: the work is the 5 % miss path, one memory-hungry database, one in-memory vector index and a weekly batch. The real money is bytes out, below.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Renderer / reader (Go, stateless: page + related block on a cache miss) | 5k misses/s (5 % of 100k views/s, §4), each with one ranked 8-row read | CPU | 5k × ~2 ms (render, JSON, state filter, dedupe) = 10 vCPU. N = ceil(10 ÷ (0.8 × 8 × ⅔ = 4.27)) = ceil(2.3) = 3 | `c7g.2xlarge` (8 vCPU / 16 GiB) on ECS/EKS | 3, one per zone | render and serialise: CPU, with ~2 GiB of memory (an in-process title cache), so `c`. 42 % busy at peak, 63 % with a zone down |
+| Postgres (edges, pages, text refs, link_health) | 5k ranked reads/s on misses; ~560 edge-row writes/s (23 pages/s × 12 own + ~280 reverse updates/s); a weekly 600M-row build; ~80 GB (§4: 55 GB edges + 25 GB refs) + ~13 GB of page rows (assumed) | memory, then IOPS | the read path touches edges 55 GB + pages ~13 GB ≈ 68 GB at random (misses are the long tail). Not in RAM, each miss is ~10 random reads: 5k × 10 = 50k IOPS, past `gp3`'s 16k cap. So RAM ≥ 68 GB plus a buffer split ⇒ 128 GiB. CPU: 5k × 0.3 ms = 1.5 vCPU + writes ≈ 3 of 16. Writes ~560 IOPS, the build throttled over 3 days = 2.3k rows/s: inside `gp3`'s 3,000 | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ, 300 GB `gp3` | 1 primary + synchronous standby | memory-bound, so `r`: fully cached, reads cost no IOPS and the box idles at ~20 % CPU. `r7g.2xlarge` (64 GiB) is cheaper but ~30 % of reads then miss: 5k × 30 % × 10 = 15k IOPS (≈ $60 of provisioned IOPS), at `gp3`'s ceiling with EBS-latency tails: not chosen. Add a read replica only if the weekly build disturbs reads |
+| ANN index (HNSW, per tenant) | 50M × 768-dim vectors; ~23 neighbour queries/s incremental; 50M queries weekly | memory | int8 vectors 38.4 GB (§4) + graph (16 links × 2 × 4 B = 128 B per vector) 6.4 GB = 45 GB; × 1.3 headroom = 58 GB; a second copy while a rebuild flips ≈ 90 GB ⇒ 128 GiB. Incremental 23 × 1 ms = 0.02 vCPU. Weekly search 14 CPU-h (§4) ÷ 16 vCPU ≈ 52 min | `r7g.4xlarge` (16 vCPU / 128 GiB), self-run HNSW or `pgvector` (managed: OpenSearch k-NN, ≈ 2×) | 1 | memory-bound, so `r`. The 154 GB float32 originals live in S3 (≈ $4 a month) and the index is rebuildable; "builder down" is survivable (§10), so no standby |
+| Embeddings (GPU) | 23 changed pages/s × 500 tokens = 11.5k tokens/s; 1B tokens/day; a full re-embed is 69 GPU-h (§4) | GPU | 1B ÷ 100k tokens/s = 10,000 s = 2.8 GPU-h a day; one GPU is ~12 % busy at peak | `g6.xlarge` (1 × L4), run ~3 h a day; a Spot burst for a model change | 1 (0 when idle) | 1B tokens a day is far above the few-million-a-day point where a hosted embeddings API wins (cheat sheet), so own the GPU. The only non-`c`/`m`/`r` box in the lesson |
+| Link builder + link-health job (Go) | weekly: blend and write 600M edges; nightly: BFS over 700M edges | memory (graph job), then CPU (blend) | blend 600M × 20 µs = 3.3 CPU-h + taxonomy candidates 50M × 0.5 ms = 6.9 CPU-h ≈ 10 CPU-h ⇒ ~1.3 h on 8 vCPU. Graph: edge list 5.6 GB + CSR 3.2 GB + counts ≈ 10 GB at peak ⇒ 16 GiB | `m7g.xlarge` (4 vCPU / 16 GiB) | 2 | `m`: neither pure CPU nor a big resident set, and a `c` node (8 GiB) cannot build the graph. Incremental builds (23 × ~10 ms = 0.2 vCPU) ride along; one node would do, the second is for availability |
+
+Data out is the real line. The block is ~8 links × ~125 B ≈ 1 KB per page view: 100k views/s × 1 KB = 100 MB/s = 0.8 Gbit/s. If that is sustained, it is ≈ 263 TB a month (an upper bound: volume tiers are cheaper, and a 3× peak-to-average ratio divides it by 3). The pages themselves, the ALB and the CDN's origin fetches belong to [32](32-block-cms.md) and [34](34-crawler-ready-spa.md); only the block's own bytes are counted here.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Renderers: 3 × `c7g.2xlarge` (3 × $212) | $640 |
+| Postgres: `db.r7g.4xlarge` ≈ $1,240 managed, Multi-AZ doubles | $2,480 |
+| gp3 300 GB (× 2 for the standby) | $50 |
+| ANN node: `r7g.4xlarge` | $620 |
+| Embeddings: `g6.xlarge` ~90 h × ≈ $0.8/h (a price the sheet does not list; check it) | $70 |
+| Builders: 2 × `m7g.xlarge` (2 × $120) | $240 |
+| Data out for the related block: 263 TB × $0.085 (sustained, first-tier price) | $22,400 |
+| **Total** | **≈ $26,500** (≈ $25,100 with a 1-year plan on the $3,980 of steady compute; ≈ $11,600 if 100k views/s is a 3× peak) |
+
+- **Biggest line and why:** the block's bytes (≈ 85 %): a feature that "adds ~0 to a cached page view" still ships ~1 KB to 100k views a second. Servers are only ≈ $4,100, of which the memory-sized Postgres is 60 %. Levers: brotli on the block (anchor lists shrink 2–3×), 6 links instead of 8, shorter titles, and a higher CDN hit rate.
+- **What changes at 10×:** 50k misses/s ⇒ 100 vCPU ⇒ N = ceil(100 ÷ 4.27) = 24 × `c7g.2xlarge`. Edges reach ~550 GB (§10), more than one node's RAM, so shard by hash of `from_id` over ~6 × `db.r7g.4xlarge`. The ANN index becomes 384 GB int8 + graph ≈ 580 GB with headroom ⇒ ~6 × `r7g.4xlarge`, sharded by tenant. One re-embed is 690 GPU-h ⇒ fan out ~23 `g6.xlarge` on Spot for 30 h. Data out, ≈ $224k at the first-tier price, is the first thing to attack.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Relational and modest: ~700M edge rows (600M computed, ~100M curated) at ~55 GB with the inbound index, ~200M text refs at ~25 GB, plus ~13 GB of page rows ≈ 80 GB (sections 4 and 15).
+- Two access paths on one table: a page's ranked outbound list (`from_id, kind, rank`; 5k reads/s on cache misses) and its inbound list (`to_id, kind`: "linked from", purge, link rot). Writes are ~560 edge rows/s plus a weekly 600M-row build.
+- Two structures that are not rows: 50M × 768-dimension embeddings searched by nearest neighbour (154 GB as float32, ~38 GB as int8), and the link graph, 3.2 GB as CSR arrays in a Go process, walked by BFS for orphans, dead ends and depth.
+- Mostly derived data: computed edges come from a weekly versioned build (`built_in`); only curated edges and text refs are authored.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for pages, edges, refs and health | key and index lookups plus upserts: the PK `(from_id, kind, to_id)` allows one row per pair and kind (a pair may be both `curated` and `similar`, 9.1), the two edge indexes serve the block and "linked from", `ON CONFLICT` upserts `broken_links`, and the partial index `link_health_orphans_idx WHERE inbound_live = 0` serves the orphan list; the ~80 GB fits the 128 GiB of the `db.r7g.4xlarge`, so a read costs no IOPS |
+| MySQL (RDS / Aurora) | ✔ works for the edges, ✖ for the vectors | the edge tables need only primary-key and secondary-index lookups and upserts; InnoDB's clustered PK keeps a page's edges together and each secondary index already carries the other id, so both reads are covered by the index; the orphan index becomes a plain `(inbound_live, page_id)`; but the managed MySQL engines have no pgvector equivalent |
+| pgvector (PostgreSQL extension) | ✔ works as the derived ANN index, if it benchmarks | HNSW over `vector` or `halfvec` columns keeps neighbour search in SQL and is one system fewer, but 50M × 768 is the size to measure (build time, recall, memory). Section 4's 38 GB is an int8 figure; pgvector's compact type is `halfvec` (2 bytes per dimension), so ≈ 77 GB plus the graph, and section 15's rebuild flip (two copies at once) would not fit one 128 GiB node |
+| Dedicated vector store (OpenSearch k-NN, a vector database) | ✔ works as the derived ANN index | dedicated engines typically offer quantisation (the int8 sizing), sharding by tenant and filtered search; the price is a second system fed by the same `page.changed` events, rebuildable from the vectors in S3 and the pages |
+| Graph database (Neptune) | ✖ poor fit | the link graph is 3.2 GB as CSR arrays and BFS over 700M edges takes minutes on one machine (9.3); one-hop questions ("linked from", the block) are index lookups, so a graph store would hold a second copy of 700M edges to answer a nightly batch |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, the `db.r7g.4xlarge` of section 15, for pages, edges, text refs, `link_health` and `broken_links`. Authored data (curated edges, text refs) is the record; computed edges, health and broken-link rows are derived from it and from the vectors, and are rebuilt by the weekly versioned build. The vector index is a separate rebuildable node (self-run HNSW or pgvector on an `r7g.4xlarge`, or OpenSearch k-NN; benchmark the two at 50M), and the graph is an in-memory CSR rebuilt nightly, so there is no graph database. What decides it: the whole relational set fits in RAM, the edge reads are two index paths, and everything heavy is a derived index that can be rebuilt.
+
+**If it were MySQL instead:** the edge, text-ref and health tables port as they are, with `INSERT … ON DUPLICATE KEY UPDATE` for the upserts and the plain composite index for orphans; the 128 GiB sizing still holds (the InnoDB buffer pool takes the place of `shared_buffers` plus the OS cache). The one real change is the vectors: with no pgvector in managed MySQL the ANN index is a dedicated engine, which section 15 already lists as the alternative.
+
+**What would flip the choice:** at 10× (500M pages) the edges reach ~550 GB: shard by hash of `from_id` over ~6 nodes (section 15), or move the edge table alone to DynamoDB, since after materialising the access is by key (a page's ranked list, plus an index on `to_id` for inbound), at the price of the state-filter join and the SQL sweeps. The vectors (~380 GB as int8) move to a dedicated engine sharded by tenant. A graph database only if editors need interactive multi-hop queries instead of a nightly batch.

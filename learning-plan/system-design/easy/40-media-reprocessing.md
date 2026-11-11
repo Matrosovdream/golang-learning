@@ -358,3 +358,54 @@ the price of a one-click undo. The admin sees `done / total` summed over ranges,
 - **Content-aware recipes:** per-asset quality search (lowest quality above a similarity target) instead of one global number.
 - **Cold-tier originals:** lifecycle to an archive class after 90 days; a redo then reads from slow storage, so schedule it and batch the retrievals.
 - **Multi-region:** originals in one region, derived files replicated or regenerated per region from a regional cache.
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Photo workers, backfill burst | 833 photos/s for ~33 h; 2.5 GB/s read (20 Gbit/s); 5k PUT/s | CPU | 833 × 0.5 CPU-s = 417 vCPU. Batch on Spot, so no zone-loss rule: 417 ÷ (0.75 × 8) = 69.5 → 72. Memory 8 slots × ~250 MB = 2 GB of 16 GiB; network 20 Gbit/s ÷ 72 = 0.28 Gbit/s a node | `c7g.2xlarge` (8 vCPU / 16 GiB) on Spot, scale to zero between runs | 72 for ~33 h per full run | decode, resize, encode is pure CPU: `c`; memory is pixels × slots, far under 16 GiB; reclaim is harmless (lease expires, deterministic keys). The 0.5 CPU-s assumes native libwebp, not the repo's WebAssembly build |
+| Photo workers, live lane | ~10 uploads/s peak (2.3 avg) | CPU | 10 × 0.5 = 5 vCPU; N = ceil(5 ÷ (0.8 × 4 × ⅔ = 2.13)) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB) | 3 | the live lane is served first even while the burst fleet runs; 10 % busy on average |
+| Video workers (1 ffmpeg per vCPU slot) | live ~52 vCPU steady, ~160 at 3× peak; a full redo 1,000 vCPU for 5.2 days | CPU (RAM: 1 GB + tmpfs a slot) | queue-fed with a 10 min SLO, so no zone-loss rule: 160 ÷ (0.8 × 16) = 12.5 → 13 → 15 nodes: 6 on-demand floor + 9 Spot. Redo: 1,000 ÷ 16 = 63 nodes × 125 h | `c7g.4xlarge` (16 vCPU / 32 GiB); managed alternative: AWS Elemental MediaConvert | 15 (6 + 9 Spot); +63 Spot per redo | `c` gives 2 GiB per vCPU, enough for ffmpeg's 1 GB + ~150 MB of tmpfs (a 100 MB original + 45 MB output); `m` only if HDR tone-mapping needs more; arm64 is fine for x264, but time the zscale/tonemap chain on real HEVC clips before committing |
+| Postgres (`media_variants`, ranges, runs) | 833 upserts/s in a run; 100M narrow rows ≈ 15 GB + assets ≈ 40 GB | memory, then IOPS | 833 × ~2 IOPS ≈ 1,700 under 3,000; ranges walk ids in order, so the hot set is a moving window, not all 55 GB | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 + standby | `r`: the index tail and the live reads stay cached; the narrow side table keeps IOPS flat |
+| S3 | 5k PUT/s over 256 prefixes ≈ 20/s each | nothing to size: request rate per prefix (limit ~3,500) | 5,000 ÷ 256 = 19.5 | S3 + a gateway endpoint (free) | none | through a NAT the 300 TB read would cost 300,000 GB × $0.045 = $13,500 a run |
+
+Delivery (CDN egress) is not sized here. Video: our cost is 90 CPU-s × $0.0363 per vCPU-hour ÷ 3,600 ≈ $0.0009 a video-minute on-demand, ≈ $0.0003 on Spot, but the live fleet at 22 % busy (52 ÷ 240 vCPU) costs $3,654 ÷ 1.52M minutes ≈ $0.0024. A managed transcoder bills per output minute and wins on price only below that, and only for the live trickle (check its price page; the sheet lists none): for the 5M-video redo the fleet is far cheaper, and nobody runs ffmpeg.
+
+**Rough monthly bill (≈, on-demand; a full redo is extra, below)**
+
+| Line | ≈ $/month |
+|---|---|
+| Photo live: 3 × `c7g.xlarge` (3 × $105) | $315 |
+| Video: 6 × `c7g.4xlarge` on-demand (6 × $420) + 9 on Spot (9 × $420 × 0.3) | $3,654 |
+| Postgres: `db.r7g.xlarge` ≈ $310, Multi-AZ doubles; gp3 200 GB × 2 = $32 | $652 |
+| S3 Standard: 300 TB + 50 TB photos, 500 TB + 225 TB videos (5M × 45 MB, the 6 Mb/s budget) = 1,075 TB × 1,000 × $0.023 | $24,725 |
+| **Total** | **≈ $29,300** (≈ $28,100 with a 1-year Savings Plan on the $3.5k steady on-demand compute; storage is not discounted) |
+
+- **Biggest line and why:** storage, 84 % (the originals alone 63 %): ≈ $18,400 to keep 800 TB of originals so any recipe can be redone. Levers: cold-tier originals after 90 days (the sheet has no cheaper-class price; check it, and mind the retrieval fee on a redo), skip videos already inside the bitrate budget, retire the old recipe's prefix after the grace period. **A full redo** (a few a year): photos ≈ $700 of compute on-demand ($210 Spot) + **600M PUTs × $0.005 per 1,000 = $3,000** + ~700M GET/HEAD ≈ $280, about $3,500-$4,000, so the request fee, not the CPU, is most of it; the video redo is 125,000 vCPU-hours ≈ $4,500 on-demand, ≈ $1,400 on Spot.
+- **What changes at 10×:** 1B photos: the same fleet takes 14 days; 33 h needs ~700 nodes (4,170 busy vCPU ÷ 6) ≈ $2,000 on Spot, but the PUTs are 6B = $30,000 a run. Postgres: 8,330 upserts/s ≈ 16.7k IOPS, over gp3's 16,000 cap, so batch the upserts or move to `io2`. Video: 520 vCPU steady, 1,600 at peak ⇒ 126 `c7g.4xlarge`, mostly Spot; a full redo is 52 days on 1,000 cores, so per-video skip rules matter. Storage ≈ $247k a month.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- Almost all the bytes are blobs, not database rows: 300 TB of photo originals, 500 TB of video originals and ~275 TB of derived files go to S3; the database keeps pointers and task state, ~55 GB (a 100M-row narrow `media_variants` ≈ 15 GB plus assets ≈ 40 GB), section 15.
+- During a full redo it takes ~833 pointer upserts/s (≈ 1.7k IOPS) and range claims by `(run_id, lo)`: 100k range rows a run, counters flushed every 50 assets, walked in id order (9.2).
+- Every statement is a tiny single-row or single-range transaction; no join is on the hot path. What must hold: a lease claim is atomic, and a pointer flip is atomic so a reader never sees half a recipe.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen for pointers and task state | the claim in 9.2 is a single `UPDATE … WHERE (run_id, lo) = (SELECT … FOR UPDATE SKIP LOCKED) RETURNING lo, hi, cursor`; `INSERT … ON CONFLICT (asset_id) DO UPDATE` flips the pointer; `integer[]` widths, `jsonb` recipe params and partial indexes (`reprocess_ranges_open_idx … WHERE status <> 'done'`) fit as written. The narrow side table keeps vacuum off the wide asset rows |
+| MySQL (RDS / Aurora) | ✔ works, small workarounds | `SKIP LOCKED` exists (8.0) but there is no `RETURNING`, so a claim is `SELECT … FOR UPDATE SKIP LOCKED` then `UPDATE` in one transaction; the pointer upsert is `ON DUPLICATE KEY UPDATE`; `widths` becomes `JSON`; partial indexes become plain ones such as `(run_id, status, lo)` on a 100k-row table. The clustered primary key suits the id-ordered walks of `media_variants` and `reprocess_ranges`, and updates happen in place with no vacuum. One trap: MySQL applies `SET` assignments left to right, so the rollback's `recipe_id ↔ prev_recipe_id` swap needs a temporary variable |
+| DynamoDB | ✔ for `media_variants`, ✖ for run bookkeeping | pointers are pure key access (`asset_id` → recipe, tiny items, 833 writes/s spread over many keys); but a pointer rollback is one `UPDATE` per range of 1,000 assets in SQL and 1,000 item writes in DynamoDB, and run totals, failures by error class and the straggler sweep by recipe are ad-hoc queries |
+| S3 | ✅ chosen for every byte of media | originals in a private versioned bucket, variants under `v/<recipe>/<sha[:2]>/…` so a retired recipe expires by prefix; 5k PUT/s over 256 prefixes is ~20/s each. Not a database, so it holds no state about which recipe is current |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (the `db.r7g.xlarge` of section 15) for pointers, runs and ranges, and S3 for all media bytes. What decides it: a one-statement lease claim (`SKIP LOCKED` with `RETURNING`), an atomic upsert for the pointer flip, and a narrow table that a backfill can rewrite without touching asset rows (9.2). System of record: the originals in S3 (irreplaceable) and the `media_assets` rows; derived and rebuildable: variants and `media_variants` (a pure function of original and recipe); transient: `reprocess_runs` and `reprocess_ranges`.
+
+**If it were MySQL instead:** the design does not move: two-statement claim, `ON DUPLICATE KEY UPDATE`, `JSON` for widths, plain indexes, and the swap written with a temporary variable. The clustered primary key is, if anything, a small gain for the id-range walks.
+
+**What would flip the choice:** at 10× the upserts reach ~8,330/s ≈ 16.7k IOPS, over gp3's cap (section 15). First batch the upserts or move to `io2`, still PostgreSQL. Only past one primary's ~10k durable writes/s would `media_variants` move to DynamoDB, which suits pure key access, while ranges and runs stay in PostgreSQL.

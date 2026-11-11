@@ -338,3 +338,57 @@ from the measured rate; users who see nothing click *Commit* again.
 - **Connector imports** (pull from a provider's API with a watermark, then the same staging pipeline): the seed's `CustomerLister` / `InvoiceLister` capabilities, and [18](18-inbound-webhook-receiver.md) for keeping them in sync afterwards.
 - **Column mapping with suggestions:** an LLM proposes the mapping from the header and five sample rows (through the gateway in [36](36-llm-gateway.md)); the user confirms.
 - **Merge-on-import:** match by email/phone fuzzy rules and hand the ambiguous rows to the dedupe flow ([25](25-contact-dedupe-merge.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API + fair scheduler + commit workers (Go, stateless) | 500 imports in flight, 2,000 a day; commit ≈ 2 chunk transactions/s at the ~8k rows/s budget (§4) | nothing: they wait on Postgres | dispatch 2–8 chunks/s × ~5 ms of Go CPU + status polls ≈ 0.1 vCPU | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | tiny, three for availability. Commit workers mostly wait on the database, so more of them would only add write contention |
+| Parse and stage workers (Go) | 11.6k rows/s at the 5× peak; ~50k rows/s per worker; a 10M-row file ≈ 200 s (§4) | CPU | average demand 11.6k ÷ 50k = 0.23 vCPU; sized for bursts instead: 6 large files parsing at once at 1 vCPU each = 6 vCPU; N = ceil(6 ÷ (0.8 × 4 × ⅔ = 2.13)) = ceil(2.8) = 3 | `c7g.xlarge` (4 vCPU / 8 GiB); a Spot fit (idempotent, staging is re-creatable) | 3, one per zone | CSV/XML parsing, hashing and normalising are CPU; the stream holds ~50 MB of buffers per worker, so `c`. Reading a 2 GB object and `COPY`ing ~6 GB into staging at ~30 MB/s is nowhere near the network limit |
+| Postgres (target tables, `import_*`, UNLOGGED staging) | ~8k rows/s commit budget (demand 11.6k) + classification joins at up to 11.6k lookups/s; staging 0.84 TB (7 d) + `import_items` 360 GB (30 d) (§4) | IOPS, then memory | assume ~1.5 IOPS per row written (a chunk is one tenant's key range) ⇒ 8k × 1.5 = 12k, plus ~1 read IOPS per classified row ⇒ up to 11.6k: ≈ 24k at the Monday peak vs gp3's 16k cap. CPU 8k × 60 µs + 11.6k × 30 µs ≈ 0.8 vCPU of 16. Hot unique-key index pages of the importing tenants ≈ 60 GB (assumption). Disk 1.2 TB + product tables ⇒ 2,000 GB | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ, `gp3` 2,000 GB at 16,000 IOPS | 1 primary + synchronous standby | RAM for the index pages, IOPS as the real ceiling. Buying `io2` for 24k IOPS is 24k × $0.065 + 2 TB × $0.125 ≈ $1,810 per copy vs $225 on gp3, for a two-hour Monday peak; the AIMD throttle stretches ETAs instead, and sustained demand means sharding by tenant (§10) |
+
+Raw uploads on S3 (30 days, 1.2 TB): nothing to size, and the presigned PUT keeps 2 GB files off our nodes. The honest picture: the parsing hardware is almost free; the shared write budget on Postgres is the product.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API, scheduler, commit workers: 3 × `c7g.large` (3 × $53) | $160 |
+| Parse workers: 3 × `c7g.xlarge` (3 × $105) | $320 |
+| Postgres: `db.r7g.4xlarge` ($620 × 2 managed), Multi-AZ doubles | $2,480 |
+| gp3 2,000 GB + 13k extra IOPS (= $225, ×2 for the standby) | $450 |
+| S3 raw uploads: 1.2 TB × $0.023 | $30 |
+| ALB (small API traffic) | $20 |
+| **Total** | **≈ $3,460** (≈ $2,420 with a 1-year Savings Plan on compute), about $0.58 per million rows imported (6B a month) |
+
+- **Biggest line and why:** Postgres with its disk (≈ 85 %), because commit is the scarce, shared resource (indexed writes, WAL, replicas) while parse and orchestration are cheap. The lever is the throttle and chunk scheduling, not a bigger node.
+- **What changes at 10×:** 120k rows/s demanded against ~8k per shard ⇒ shard imports by tenant onto ~10 clusters of this shape (≈ 10 × $2,930 ≈ $29k); each shard stays within gp3's 16k IOPS, which is why sharding beats `io2`. Parsing is 120k × 20 µs ≈ 2.4 vCPU on average, still burst-sized: double to 6 × `c7g.xlarge`. Staging moves off Postgres to a store per shard or Parquet on S3, as §10 says.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- The scarce, shared resource is commits into the product's own tables: 200M rows a day (~2.3k/s on average, ~11.6k/s at the Monday peak) against a budget of ~8k rows/s per write shard (an assumption to measure), in chunks of 5,000 rows, one transaction each (sections 4, 9.4).
+- Each chunk must be idempotent and carry its own progress: upsert by `(tenant_id, source, external_id)`, skip a row whose `content_hash` is unchanged, record created versus updated per row, and advance `cursor_row` in the same transaction (9.2).
+- Three data sets of different value: raw uploads (S3, immutable, ~1.2 TB), staging rows (0.84 TB for 7 days, 120 GB/day, re-creatable from the file) and the durable `import_runs` / `import_items` (~360 GB for 30 days) beside the target tables.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | one statement per chunk: `INSERT … ON CONFLICT (…) WHERE external_id IS NOT NULL DO UPDATE … WHERE c.content_hash IS DISTINCT FROM EXCLUDED.content_hash RETURNING …, (xmax = 0)` inside a data-modifying CTE that also feeds `import_items`; `UNLOGGED` staging loaded by `COPY` keeps 120 GB/day of re-creatable rows out of the WAL; the partial unique index `import_runs_one_active` allows one active write per tenant; `jsonb` staging rows and set-based `UPDATE … FROM` give the preview |
+| MySQL (RDS / Aurora) | ✔ works, with several workarounds | no unlogged table (staging is redo-logged and binlogged), no `RETURNING` or `xmax`, no data-modifying CTE (the one-statement chunk becomes three or four), and one partial unique index becomes a generated-column index. The idempotency key itself is portable: a plain unique index allows many NULLs, so the `WHERE external_id IS NOT NULL` is not needed |
+| S3 + Parquet / ClickHouse | ✖ now, ✔ for staging at 10× | the preview is a SQL join of staging against the live target table, which needs both in one database; at 120k rows/s of demand (section 10) staging moves to a store per shard or to Parquet, and only classified chunks reach the OLTP database |
+| DynamoDB | ✖ poor fit | a chunk is 5,000 rows in one transaction with a cursor; transactions stop at 100 items, so chunk atomicity breaks into 50 transactions, and there is no set-based `GROUP BY verdict` or join to the target for the preview |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.4xlarge` with `gp3` 2,000 GB at 16,000 IOPS (section 15), the same database as the target tables, because the commit has to be a transaction into them. Three things decide it: the one-statement idempotent chunk (conflict target on a partial unique index, `IS DISTINCT FROM`, `RETURNING`) with the cursor update in the same transaction; `UNLOGGED` staging plus `COPY`, where a crash empties staging by design and the S3 file re-creates it (9.1, section 10); and the partial unique index with `SKIP LOCKED` row locks for the one-active-write rule and the fair scheduler. System of record: the target tables and `import_runs` / `import_items` in Postgres, plus the raw files on S3. Staging is derived and disposable.
+
+**If it were MySQL instead:** the pipeline survives, but this is the lesson that leans on Postgres most.
+- Staging: `UNLOGGED` has no equivalent for a shared InnoDB table, so 120 GB a day of staging rows would be redo-logged, binlogged and replicated. Either accept that, or stage on a separate cheap database or S3 (the 10× design of section 10). `COPY` becomes `LOAD DATA` or multi-row inserts.
+- Chunk: no data-modifying CTE, `RETURNING` or `xmax = 0`. Run `SELECT … FOR UPDATE` on the existing rows by key (it also gives the before-image for `import_items.before`, 9.3), then `INSERT … ON DUPLICATE KEY UPDATE` with per-column `IF(content_hash <=> new.content_hash, col, new.col)` (there is no `WHERE` on the update branch), then `INSERT INTO import_items` from the read, all with the cursor update: 3–4 statements instead of one.
+- `import_runs_one_active` becomes a generated column (`tenant_id` while the status is queued, running or undoing, else NULL) with a unique index; chunks run at `READ COMMITTED`, since upserts on a unique key take next-key locks under the default `REPEATABLE READ` and parallel chunks of one tenant can lock-wait or deadlock.
+
+**What would flip the choice:** the number that matters is the commit budget, ~8k rows/s per primary. Sustained demand above it is answered by sharding imports by tenant onto the tenant's own shard (~10 clusters at 10×, sections 10 and 15), not by another engine, and past ~24k IOPS a shard is cheaper than `io2`. Staging leaves Postgres (S3 and Parquet, or a store per shard) once the 0.84 TB and the preview joins become the load. A move of the target tables to a store without multi-row transactions would force the chunk-atomic commit to be redesigned.

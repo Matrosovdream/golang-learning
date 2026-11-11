@@ -322,3 +322,54 @@ while a fire is in flight (`due_version`).
 - **Calendar feeds:** an ICS feed per person; cache by `ETag`.
 - **Weekly look-ahead** for managers (the seed's Monday email) as one more fire kind per person, not per deadline.
 - **Health dashboard:** dispatcher lag, late-fire histogram, and a "silent deadlines" report (open, past due, nobody told).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| API + dispatchers + outbox relay (Go, stateless) | 500 fires/s peak (154/s avg); 750 outbox rows/s; API ~1k req/s (assumed, not in section 4) | CPU, tiny | fires 500 × 1 ms (recipient join, outbox rows, `time.Date`, ~5 round trips) = 0.5 vCPU; relay 750 × 0.2 ms = 0.15; API 1k × 0.3 ms = 0.3; total ≈ 0.95 vCPU. N = ceil(0.95 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS | 3, one per zone | a fire is a ~10 ms transaction that mostly waits on Postgres, so 500/s is only ~5 in flight; memory under 1 GiB, so `c`. 16 % busy at peak, 24 % with a zone down: three nodes for availability, not load |
+| Postgres (deadlines, outbox, prefs) | 100M open deadlines ≈ 25 GB; indexes ~10 GB (assumed); outbox ≈ 20M rows/day × 3 days of dedupe ≈ 10 GB (assumed); ≈ 50 GB in all; ~1,750 row writes/s at peak (2 updates + 1.5 outbox rows per fire) | memory (the whole database fits in RAM), then CPU | ≈ 50 GB < 64 GiB, so every page is cached. `next_fire_at` is indexed, so each update is not HOT and rewrites 4 index entries: ≈ 4 IOPS per fire ⇒ 500 × 4 = 2k peak, ~600 avg, inside the 3,000 included; provision 6,000 for the 09:00 herd. CPU 500 × ~3 ms = 1.5 vCPU of 8 | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS Multi-AZ, `gp3` 150 GB at 6,000 IOPS (self-managed: `r7g.2xlarge`) | primary + sync standby | `r` because the point is to keep ~50 GB cached, with 8 GiB per vCPU while only ~2 vCPU are used; `r7g.xlarge` (32 GiB) would cache just the hot head, so try it only after measuring. IOPS and CPU are not the limit. Multi-AZ because a lost primary means silent deadlines |
+
+Message delivery is the real cost and is sized in lesson 12, not here (see the bill note). S3 and a broker are not involved: the outbox is a table.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| API + dispatchers + relay: 3 × `c7g.large` (3 × $53) | $160 |
+| Postgres: `db.r7g.2xlarge` ≈ $620, Multi-AZ doubles | $1,240 |
+| `gp3` 150 GB + 3k extra IOPS ($12 + $15 = $27) × 2 for the standby | $50 |
+| ALB | $20 |
+| **Total** | **≈ $1,470** (≈ $980 with a 1-year plan on compute) |
+
+Not in the total: delivery. 13.3M fires/day × 1.5 recipients ÷ ~6 per digest ≈ 3.3M messages/day ≈ 100M a month. If all were email at an SES-like ≈ $0.10 per 1,000 (outside the cheat sheet, re-check) that is ≈ $10k a month, about seven times the servers.
+
+- **Biggest line and why:** the database (~84 %, ~88 % with its volume). Compute for 500 fires/s is almost nothing, so the bill is one Multi-AZ memory node. The lever is a smaller node, `db.r7g.xlarge` Multi-AZ at $620, if the measured hot set is only the head of `next_fire_at` and the open rows of active tenants. Saves $620.
+- **What changes at 10×:** 5k fires/s ⇒ 5 + 1.5 + 3 = 9.5 vCPU ⇒ N = ceil(9.5 ÷ 2.13) = 5 → 6 × `c7g.xlarge` (≈ $630). One database no longer fits: 5k × 3 ms = 15 vCPU and 5k × 4 = 20k IOPS (gp3 caps at 16k), so shard by tenant hash into 3 × `db.r7g.2xlarge` Multi-AZ (≈ $3.7k, ~170 GB each, only the hot head cached). Widen the jitter window (the unjittered wave would be 4.5M in one minute) and expect delivery to reach ≈ $100k if it is all email.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 100M open deadlines ≈ 25 GB; with indexes and the outbox the whole database is ~50 GB, small enough to sit in RAM (section 15).
+- The core access is a claim: "the 1,000 oldest rows with `next_fire_at <= now()`", leased, then fired one row per transaction. 154 fires/s on average, 500/s at peak (section 4).
+- Each fire writes ~2 deadline updates and ~1.5 outbox rows (~1,750 row writes/s at peak), and the outbox `dedupe_key` must be unique.
+- UI reads are "my overdue" and "this week" by tenant and due date; recipients are one join of candidates to `alert_prefs`.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `FOR UPDATE SKIP LOCKED` inside a CTE with `UPDATE … FROM … RETURNING` claims and leases 1,000 rows in one statement (9.1); three partial indexes (`WHERE next_fire_at IS NOT NULL`, and `WHERE status = 'open'` twice) keep each index to the rows that matter; row locks serialise "complete" against "fire" (9.2); unique `dedupe_key` with `ON CONFLICT DO NOTHING`; `text[]` for `escalate_to` |
+| MySQL (RDS / Aurora) | ✔ works, small workarounds | `SKIP LOCKED` has existed since 8.0, so the dispatcher is portable: `SELECT … FOR UPDATE SKIP LOCKED`, then `UPDATE … WHERE id IN (…)` in the same transaction (the `SELECT` already returns what `RETURNING` did); partial indexes become plain or composite ones; `text[]` becomes a JSON array or a child table |
+| DynamoDB | ✖ poor fit | 25 GB is tiny, so size is not the issue; the access pattern is: "everything due" needs a GSI with a sharded partition key (all due rows share one time order, and a partition takes ~1,000 writes/s) polled several ways, and recipient resolution is a join |
+| Redis (ElastiCache) | ✖ as the record, ✔ as a derived due-index | a sorted set by `next_fire_at` could serve the claim, but claim, lease and state change would then span two stores and the set must be kept equal to the table (see 9.1); it can always be rebuilt from the table |
+
+**Pick:** PostgreSQL on RDS Multi-AZ, `db.r7g.2xlarge` with `gp3` at 6,000 IOPS and no replica (section 15). What decides it: the claim, lease and `RETURNING` in one `SKIP LOCKED` statement, one database for deadlines and outbox so a state change and its outbox row commit together, and a 50 GB database that is fully cached. Postgres is the only store; the due-index is a partial index inside the table, so there is nothing separate to rebuild.
+
+**If it were MySQL instead:** the closest to interchangeable of these lessons. The claim becomes two statements in one transaction (~30 claims a minute at peak, so one extra round trip is nothing). Run the dispatcher at `READ COMMITTED` so the range scan of the due-index takes no gap locks. The three indexes grow to hold done and cancelled rows, which costs disk rather than RAM because only the `<= now()` head is hot. In its favour: section 15 notes that Postgres rewrites 4 index entries on every `next_fire_at` update (it is not HOT), while InnoDB touches only the indexes that contain a changed column and has no vacuum to keep up with. Team skill and tooling are the tie-breakers.
+
+**What would flip the choice:** 10× is 5k fires/s and ~20k IOPS, past the 16k `gp3` cap, so section 15 shards by tenant hash into 3 nodes of the same engine. A latency target tighter than the ~1 minute the lesson accepts (sub-second fires at thousands per second) would move the due-index into Redis, with the table still the record. Nothing at 500 fires/s needs that.

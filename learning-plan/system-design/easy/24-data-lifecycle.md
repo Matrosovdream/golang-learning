@@ -342,3 +342,55 @@ func purge(ctx context.Context, db *pgxpool.Pool, sql string, batch int, pause t
 - **Legal hold:** a flag that blocks purge and erasure for records under investigation.
 - **Tenant offboarding:** erase a whole tenant (millions of rows) with the same orchestrator, plus an export first.
 - **Data inventory:** a registry of every store and column holding personal data, checked in CI so a new table cannot skip the erasure pipeline (compare the backup test in the seed project that fails if a table is in no group).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption). Honest summary: nothing in this lesson is a throughput problem (≈ 4 purge rows/s and ≈ 0.013 erasure work items/s on average), so the hardware is the database the lifecycle runs in, plus three small workers.
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Postgres (live, archived and removed rows, audit, `erasure_*`) | 500M records ≈ 2 TB with children; purge window: 10M rows in ≈ 20 min ≈ 8,300 rows/s | memory, then disk and IOPS bursts | hot set ≈ 20 % of the 0.5 TB main table with indexes ≈ 100 GB (assumed), fits in 128 GiB; disk 2 TB + ≈ 30 % for dead tuples before vacuum ≈ 3 TB; purge ≈ 1 IOPS per scattered row ≈ 8,300 ⇒ gp3 at 9,000; WAL ≈ 8,300 × up to 8 KB (full-page images, assumed) ≈ 65 MiB/s, under gp3's 125 MiB/s; the loop is one backend ≈ 1 of 16 vCPU | `db.r7g.4xlarge` (16 vCPU / 128 GiB), RDS Multi-AZ + 1 read replica | primary + standby + replica | `r`: a ≈ 100 GB hot set is bigger than an `m7g.4xlarge`'s 64 GiB; the lifecycle adds IOPS and WAL bursts, not CPU, and a bigger node does not make a 10M-row `DELETE` safe: batch size, pause (5,000 rows, 0.3 s) and `autovacuum_vacuum_scale_factor` are the knobs |
+| Lifecycle workers (Go: `trash.purge`, `archive.cold`, `partitions.drop`, erasure handlers, verifier) | purge: 1 batch per 0.6 s for ≈ 20 min a night; erasure ≈ 0.013 items/s; cold export ≈ 40 GB a month | CPU, barely | purge loop ≈ 0.1 vCPU of Go (the database does the work); Parquet export 40 GB ÷ ~20 MB/s = 2,000 s ≈ 0.8 vCPU for ~35 min a month. N = ceil(1 ÷ (0.8 × 2 × ⅔ = 1.07)) = 1 → 3 | `c7g.large` (2 vCPU / 4 GiB) on ECS/EKS, or the product's existing worker pool | 3, one per zone | tiny hardware: three small instances for availability, so an erasure deadline alert always has a worker; Spot would do for the export, not for erasure handlers that must not stall near a deadline |
+
+Nothing else needs an instance. The search index, caches, warehouse and email provider exist for other lessons and receive ≈ 140 erasure requests a day (≈ 1,100 work items across 8 systems); S3 is cleaned with `ListObjectVersions` plus deletes. The cold archive is ≈ 8 GB of Parquet a month (assuming 5× compression of 40 GB), ≈ 0.5 TB after 5 years. The 35-day backups add roughly 35 days of churn on top of the 2 TB base, priced by the provider; not a hardware choice.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Postgres: `db.r7g.4xlarge` ≈ $1,240, Multi-AZ doubles ($2,480), + 1 read replica ($1,240) | $3,720 |
+| gp3: 3 volumes × (3 TB × $0.08 = $240 + 6,000 extra IOPS × $0.005 = $30) | $810 |
+| Workers: 3 × `c7g.large` (3 × $53) | $160 |
+| S3 cold archive: ≈ 0.5 TB × $0.023 (after 5 years) | $10 |
+| **Total** | **≈ $4,700** (≈ $3,300 with 1-year commitments on the $3,880 of compute) |
+
+- **Biggest line and why:** the database nodes, ≈ 79 %, and they exist for the product's 500M records, not for the lifecycle. The lifecycle itself costs ≈ $230 a month (≈ $90 of IOPS for the purge window + ≈ 0.6 TB of dead-tuple headroom × $0.08 × 3 copies ≈ $144). Retention is not a cost problem at this size: keeping 40 GB a month of archive-eligible rows on gp3 adds ≈ $10 more each month (40 GB × $0.08 × 3). It is an index, vacuum and legal problem.
+- **What changes at 10×:** 5B rows, 20 TB (≈ $4.8k a month of gp3 across three copies) is past one primary's comfort (vacuum on 5B-row tables, one 20 TB volume), so shard by tenant, e.g. 8 shards of today's size ≈ $30k; purging 100M rows a month at 8,300 rows/s is 3.3 h a night (fine), but squeezing it into one hour needs ≈ 28k IOPS, over gp3's 16k cap, so spread it over the night or partition by time and `DROP`; erasure at ≈ 1,400 requests a day (≈ 0.13 items/s) still needs no hardware.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- 500M records ≈ 0.5 TB in the main tables, ≈ 2 TB with children; 10M archive-eligible rows a month (≈ 4/s), 2M removes a month, a Trash of ≈ 2M rows, ≈ 140 erasure requests a day (section 4).
+- The hard rules are relational: `RESTRICT` behind money, `SET NULL` for authorship, `CASCADE` for owned children; email unique among live rows only; every state change in one transaction with its audit row (9.1, 9.4).
+- The load is bursts, not a stream: default lists read live rows through partial indexes, and the nightly purge runs ≈ 8,300 rows/s for ≈ 20 minutes (section 15). Nothing here is a throughput problem.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | partial indexes on live rows (`WHERE archived_at IS NULL AND deleted_at IS NULL`) keep default lists fast as dead rows pile up; `users_email_live_key` is a partial unique expression index (`lower(email) WHERE deleted_at IS NULL`); the purge is `DELETE … USING (… FOR UPDATE SKIP LOCKED) … RETURNING`; the FK actions are the integrity rules. The cost is dead tuples: `autovacuum_vacuum_scale_factor = 0.01` (9.2) |
+| MySQL (RDS / Aurora) | ✔ works, the most workarounds of this batch | InnoDB has all three FK actions (and creates the FK-column index itself, which Postgres does not), but no partial index, no `RETURNING`, and no `SKIP LOCKED` on `DELETE` (below) |
+| DynamoDB / Cassandra | ✖ poor fit as the record | no foreign keys or joins, so `RESTRICT` ("does anything still point at it?") and uniqueness among live rows become application code; DynamoDB's TTL is free but lazy (typically within days of expiry) and cannot check references; Cassandra deletes are tombstones kept until `gc_grace_seconds` (default 10 days), exactly the wrong pattern for 2M removes and restores a month. At ≈ 4 rows/s neither needs their write scale |
+| S3 (Parquet, Athena) | ✔ for the cold tier only | `archive.cold` exports archived rows here before deleting them; after that it is the record for those rows and must be in the erasure pipeline (versions, rewritten files), so exports carry a pseudonymous id (9.3) |
+
+**Pick:** PostgreSQL on RDS Multi-AZ plus one read replica (`db.r7g.4xlarge`, section 15), one primary and no shards: 2 TB and an off-peak burst of ≈ 8,300 rows/s sit well inside a single primary's range (the cheat sheet's "a few TB, ~10k durable writes/s"). Three things decide it: partial indexes and the partial unique index over live rows, a transactional state change + audit row, and FK actions that make "money is never removed" a constraint rather than a convention. The search index, caches, warehouse and email suppression list are derived or external stores that the erasure handlers reach through the outbox; the erasure ledger stays in Postgres because it is tiny and must be transactional.
+
+**If it were MySQL instead:** every idea in sections 8–9 survives, with these edits.
+- Live-only uniqueness: a generated column `live_email = IF(deleted_at IS NULL, LOWER(email), NULL)` under a unique index (NULLs never collide); with the default case-insensitive collation `LOWER` is not even needed. Restore still re-checks.
+- Live-row indexes: lead with a generated `is_live` column (`1` when both timestamps are NULL, else `NULL`): `(tenant_id, is_live, created_at, id)`. Lists seek straight to live rows, but dead rows still occupy the index (archived rows grow by ≈ 10M a month), so it is bigger and colder than a partial index.
+- Purge: `SELECT id … ORDER BY deleted_at LIMIT 5000 FOR UPDATE SKIP LOCKED`, then `DELETE … WHERE id IN (…)`, in one transaction and at `READ COMMITTED`, so the scan takes record locks only; the default `REPEATABLE READ` takes next-key locks over the scanned range and invites lock waits and deadlocks with concurrent restores.
+- No vacuum: InnoDB purge threads remove delete-marked rows in the background. Watch purge lag (history list length) and long transactions; space is reused inside the file and returned only by a rebuild (`OPTIMIZE TABLE`, or gh-ost). That replaces the `scale_factor` tuning, not the need to batch. `ADD COLUMN` is `ALGORITHM=INSTANT`.
+
+**What would flip the choice:** 10× (5B rows, 20 TB, section 15) is past one primary's comfort: first Aurora (shared storage to 128 TiB, up to 15 readers), then shard by tenant (8 shards of today's size) by hand, with Aurora Limitless (check availability), or with MySQL under Vitess. Data whose lifetime is a function of time (audit, events, outbox history) already leaves by partition drop, whatever the engine. DynamoDB would only fit if records became key-addressed items with TTL-only lifecycles and no references; cold data that must be queried ad hoc beyond Athena points to ClickHouse.

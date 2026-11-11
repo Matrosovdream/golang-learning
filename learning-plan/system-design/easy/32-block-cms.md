@@ -360,3 +360,55 @@ redirects for URLs that were ever live. Lesson [42](../../42-trees.md) has the t
 - **Bulk import/export** of whole sites (honeydolist exports XML for every content kind): see [48 Bulk Import](48-bulk-import.md).
 - **Search over blocks:** flatten text on publish into an index ([39 Global Search](39-global-search.md)).
 - **AI drafts:** generated block text lands as a draft with an "unreviewed" flag, never auto-published ([38 AI Draft Queue](38-ai-draft-queue.md)).
+
+## 15. Hardware sizing on AWS
+
+> Prices ≈ on-demand, us-east-1, rounded; method and rules of thumb: [AWS sizing cheat sheet](../README.md#aws-sizing-cheat-sheet).
+
+**Sizing, component by component** (loads from section 4; every CPU-per-request figure is an assumption)
+
+| Component | Peak load | Bound by | Math | Pick (managed alternative) | Count | Why |
+|---|---|---|---|---|---|---|
+| Origin API (Go, stateless: render, admin, outbox relay, scheduler) | ~3k origin req/s (97 % CDN hit): ~300 renders/s + ~2,700 in-process hits/s; ~17 saves/s | memory (the in-process LRU), then CPU | hits 2,700 × 0.2 ms = 0.54 vCPU; renders 300 × 3 ms (JSONB decode, upcast, sanitise, encode) = 0.9; saves 17 × 10 ms (schema check, allowlist, sha256) = 0.17; relay + scheduler ≈ 0.1; total ≈ 1.7 vCPU. N = ceil(1.7 ÷ (0.8 × 2 × ⅔ = 1.07)) = ceil(1.6) = 2 → 3. Memory: LRU 2 GiB (~100k hot pages × 20 KB) + ~1 GiB working + 50 % GC headroom ≈ 4.5 GiB | `m7g.large` (2 vCPU / 8 GiB) on ECS/EKS | 3, one per zone | 28 % busy, 43 % with a zone down, so CPU does not pick the family, the LRU does: `c7g.large` has 4 GiB and cannot hold it, `m` gives 4 GiB per vCPU |
+| Postgres primary (pages, page_revisions, categories, outbox) | ~17 saves/s + 1.2 publishes/s; 200 GB live + up to 440 GB/yr of history | memory, then storage size (IOPS are tiny) | writes ≈ 18 × ~6 IOPS (heap + TOAST + index + WAL, assumption) ≈ 110 IOPS < gp3's 3,000 included; size ≈ (200 + 440 GB) × 1.15 indexes ≈ 740 GB ⇒ 1 TB `gp3`; hot on the primary: ~10k active drafts × 20 KB + indexes ≈ 3 GB | `db.r7g.xlarge` (4 vCPU / 32 GiB), RDS Multi-AZ | 1 + synchronous standby | no `i` family or `io2`: the write rate is trivial and disk size, not IOPS, is what grows; `r` because if the replica dies the primary takes its 600 qps and must keep the ~25 GB hot set cached |
+| Postgres read replica (published revisions for renders) | ~600 qps (300 renders/s × 2 queries) | memory | hot set: the tail that misses the LRU, 300/s × 3,600 s × 20 KB ≈ 21.6 GB an hour (upper bound, no page repeats) + ~3 GB indexes ≈ 25 GB, so RAM ≥ 25 GB with `shared_buffers` 25 % and the OS cache the rest; CPU 600 × ~1 ms = 0.6 vCPU of 8 | `db.r7g.2xlarge` (8 vCPU / 64 GiB), RDS read replica | 1 (the primary is its fallback; the CDN serves stale if both fail) | 64 GiB keeps the hour's tail resident so misses stay rare; the CPU would fit an `m7g.large`, the RAM would not; a second replica only if renders triple |
+
+The admin API and the outbox relay ride on the same three nodes (they are in the 1.7 vCPU). No Redis: three origin nodes learn about purges with `LISTEN/NOTIFY` (Redis pub/sub only at hundreds of nodes, §9.4). The CDN does the real work: 100k views/s peak × ~15 KB per page response (assumption) = 1.5 GB/s ≈ 12 Gbit/s; average ≈ peak ÷ 5 = 20k/s ⇒ 300 MB/s ≈ 780 TB a month. It has nothing to size, only egress to pay. As far as I know CloudFront invalidates by path, not by tag, so the tag purge of §9.4 means Fastly or Cloudflare in front (or tenant-versioned paths). Images and files are lesson 11.
+
+**Rough monthly bill (≈, on-demand)**
+
+| Line | ≈ $/month |
+|---|---|
+| Origin API: 3 × `m7g.large` (3 × $60) | $180 |
+| Postgres primary: `db.r7g.xlarge` ≈ $310 managed, Multi-AZ doubles | $620 |
+| Read replica: `db.r7g.2xlarge` ≈ $620 managed | $620 |
+| gp3: 3 volumes × 1 TB (primary, standby, replica) × $0.08 | $240 |
+| ALB: $16 + ~32 LCU (600 req/s average × 15 KB ≈ 32 GB/h) × $0.008 × 730 | $200 |
+| CDN egress: ~780 TB × $0.085 (first-tier price; volume tiers are lower) | $66,300 |
+| **Total** | **≈ $68,200** (≈ $67,700 with a 1-year plan on the ≈ $1,420 compute baseline) |
+
+- **Biggest line and why:** CDN egress, 97 %. The whole origin and database is ≈ $1.9k because 97 % of the 100k views/s never reach it. The lever is bytes per page: 15 KB is the design's weight, so trimming block JSON, brotli and lazy-loading rarely used blocks cut the line directly; after that, volume pricing. The CDN also bills per request (rate not in the sheet; ~52B requests a month is the same order as the bytes), so treat $68k as a floor.
+- **What changes at 10×:** 1M views/s peak (≈ 120 Gbit/s), origin 30k/s: 5.4 + 9 + 1.7 + 1 = 17 vCPU ⇒ on `m7g.2xlarge` N = ceil(17 ÷ 4.27) = 4 → 6 nodes. Renders 3,000/s ⇒ 6k qps ≈ 6 vCPU ⇒ 3 replicas (or one `db.r7g.4xlarge`, 128 GiB, as the hot set grows). 170 saves/s is still one primary. The first break is not hardware but the 1M-page purge and the revalidation stampede (§10); egress becomes ≈ $660k a month at the first-tier price, so a committed-volume CDN contract is the real project.
+
+## 16. Database choice and why
+
+> Method, comparison tables and rules: [Database choice cheat sheet](../README.md#database-choice-cheat-sheet).
+
+**What this task's data looks like:**
+- A page is one ~20 KB ordered JSON document (~15 blocks), read and written **whole**; nothing in section 8 or 9 queries inside a block (no GIN index on `blocks`). 10M live pages ≈ 200 GB, plus up to ~440 GB a year of immutable revisions (section 4).
+- Around the document sits relational structure: three nullable pointers to revisions, `UNIQUE (tenant_id, slug)`, `CHECK`s that tie `state`, `scheduled_revision_id` and `publish_at` together, a category tree (adjacency plus materialised path, depth ≤ 4), and a publish that flips a pointer **and** writes an outbox row in one transaction (9.3).
+- The load is small: ~17 saves/s at peak, ~1.2 publishes/s, ~600 replica queries/s; the CDN answers 97 % of 100k views/s (section 4). Consistency matters on the write path (a stale `version` is a 409), not on reads.
+
+| Candidate | Verdict | Why / why not here |
+|---|---|---|
+| PostgreSQL (RDS / Aurora) | ✅ chosen | `jsonb` keeps the block list in a column (large values are compressed out of line); the publish is one transaction (a `version`-conditional `UPDATE` plus the outbox insert); partial indexes keep `pages_due_idx` to the few scheduled rows and `pages_category_idx` to published ones; `FOR UPDATE SKIP LOCKED` claims due pages; `LISTEN/NOTIFY` tells the 3 origins to drop their copies; `CITEXT` for slugs |
+| MySQL (RDS / Aurora) | ✔ works, with workarounds | a `JSON` column holds the blocks just as well when read whole, and `SKIP LOCKED` exists. Workarounds: no partial indexes (`pages_due_idx` becomes a generated column that is `NULL` unless scheduled, plus a normal index; `pages_category_idx` gains `state`), no `LISTEN/NOTIFY` (a Redis channel or polling a change table for the origins), no `CITEXT` (the default collation is already case-insensitive, so `UNIQUE (tenant_id, slug)` holds) |
+| MongoDB / DocumentDB | ✔ works, no gain here | one page = one document is natural, and the schema can churn. But only the blocks are document-shaped: the pointers, the unique slug, the due-page scan, the category prefix scan and the flip-plus-outbox commit are relational, and the cheat sheet's warning applies (joins and cross-document transactions get awkward). Schema change is already handled in Go by versions and upcasters (9.1) |
+| DynamoDB | ✖ poor fit | a 20 KB page is far below the 400 KB item limit and reads by key are easy, but admin lists by category, "due pages" and revision history each need a GSI, and 17 saves/s gives no scale reason to give up ad-hoc queries |
+| S3 | ✔ for cold revisions only | immutable revisions older than a year as gzip JSON by revision id, with a pointer left in the row; S3 is $0.023 per GB-month against gp3's $0.08. Not needed while history is ~1 TB (section 15) |
+
+**Pick:** PostgreSQL on RDS Multi-AZ (`db.r7g.xlarge` primary and one `db.r7g.2xlarge` replica, section 15). The whole write path is one short transaction whose guarantees (`CHECK`s, foreign keys, the unique slug, the version-conditional update, the outbox row in the same commit) live in the database, and `jsonb` makes the document a column instead of a second store. System of record: `pages` and `page_revisions`. Everything else is derived and rebuildable from `published_revision_id`: the origin LRU, the CDN copies and the rendered HTML.
+
+**If it were MySQL instead:** the same schema with `JSON` for `blocks`, `BINARY(32)` for `content_hash`, `AUTO_INCREMENT` keys (a clustered, ever-growing primary key suits an append-only revision table), the generated-column index for due pages, a plain `(tenant_id, path)` index for prefix scans (`LIKE '/guides/%'` needs no `text_pattern_ops` there), and a pub/sub channel or a change-table poll replacing `LISTEN/NOTIFY`. That is one extra moving part (a channel to run) and nothing else material; run the scheduler's `SKIP LOCKED` scan at `READ COMMITTED` to avoid gap-lock waits on the `publish_at` range.
+
+**What would flip the choice:** history reaching a few TB (about 5 years at ~440 GB a year, section 4) moves old revisions to S3 rather than to another engine; 10× saves (~170/s) is still one primary (section 15); MongoDB or DocumentDB becomes reasonable only if blocks nest, editors need field-level updates and queries inside documents, and the schema churns weekly, that is, when whole-document access truly dominates; real-time co-editing is the hard-track problem and would also change the store.
