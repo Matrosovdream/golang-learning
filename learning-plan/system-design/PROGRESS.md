@@ -3,7 +3,7 @@
 Method, toolbox and index: [README.md](README.md). Known text issues to fix while presenting: [KNOWN-ISSUES.md](KNOWN-ISSUES.md). One task at a time; tick when you've gone
 through the task, questions, plan, solution, pros/cons and answered the check questions.
 
-> ▶ **Resume here:** 🟢 **easy** — task **10. Webhook Delivery** ([easy/10-webhook-delivery.md](easy/10-webhook-delivery.md)).
+> ▶ **Resume here:** 🟢 **easy** — task **11. Image Upload & Hosting** ([easy/11-image-upload-hosting.md](easy/11-image-upload-hosting.md)).
 
 ### 🟢 easy — [easy/](easy/)
 - [x] 01. URL Shortener
@@ -15,8 +15,8 @@ through the task, questions, plan, solution, pros/cons and answered the check qu
 - [x] 07. Leaderboard
 - [x] 08. Uptime Monitor
 - [x] 09. Feature Flags
-- [~] 10. Webhook Delivery
-- [ ] 11. Image Upload & Hosting
+- [x] 10. Webhook Delivery
+- [~] 11. Image Upload & Hosting
 - [ ] 12. Notification Service
 - [ ] 13. Shopping Cart
 - [ ] 14. Polls & Voting
@@ -103,6 +103,7 @@ _No tasks written yet. Backlog: [hard/README.md](hard/README.md)._
 - 2026-11-11 — **36 new easy tasks (16–51)** mined from the `honeydolist-site` project and written at big scale, each with a 🌱 Seed line (what the project really does, with PLAN step / migration / ADR) and a *Here, at scale* line: intake & abuse (16–19), records & integrity (20–23), lifecycle & workflow (24–27), booking & commerce (28–31), content & SEO (32–35), AI & search (36–39), platform & operations (40–43), comms, access & analytics (44–47), tooling & settings (48–51). Nine ideas that didn't get a file are listed in the README's *Easy backlog*. Resume pointer unchanged (still task 10). All 14 sections, links and the 15→16 chain checked by script; numbers and SQL were re-read by the writers but not run — expect arithmetic fixes as each task is read, as with 06–10.
 - 2026-11-11 — **9 more easy tasks (52–60)** finished from the *Easy backlog* (configurable forms, web push/PWA, programmatic location pages, order timeline, related content & interlinking, event registration & waitlist, outbound click tracking, provider adapters & fakes, business-day time zones). The honeydolist-site seed is now fully mined: easy has **60 tasks**, the backlog is empty. Same checks as 16–51 (sections, links, Prev/Next chain); the Go in 60 was actually run, the SQL anywhere was not. Resume pointer unchanged (task 10).
 - 2026-11-11 — **two new sections on all 60 easy tasks:** `15. Hardware sizing on AWS` (per component: peak load, what it is bound by — CPU / memory / IOPS / network / GPU — the math, the instance family and why, count, rough monthly bill, what changes at 10×) and `16. Database choice and why` (PostgreSQL vs MySQL and the other stores that genuinely compete, the deciding feature, what changes on MySQL, what would flip the choice). Both are driven by new README cheat sheets (*AWS sizing* and *Database choice*) and the template/checker now require 16 sections. The writers also logged ~45 inconsistencies in the older lesson text: [KNOWN-ISSUES.md](KNOWN-ISSUES.md) (several are SQL that would fail, e.g. a primary key on a partitioned table without the partition column).
+- 2026-11-11 — easy **10 Webhook Delivery** done (side questions: retry with exponential backoff + jitter, what the WAL is and why CDC reads it, HMAC signing with a constant-time compare, SSRF and DNS rebinding; Go examples for all three were run). Started 11 (fixed its text from KNOWN-ISSUES and a recheck: a presigned PUT cannot enforce `content-length-range`, so sign the exact `Content-Length` or use a presigned POST; private images now live under `private/{image_id}/` with signed URLs, never in the shared hash space or deduplicated; blob upsert + variants + `ready` in one transaction, with a 24 h zero-ref grace before deleting blobs; CloudFront egress is billed hit or miss, so hit rate is not the cost lever; ≈ 2.3 cores average; added an API-load row; $1,100 of servers). Open: 10's own KNOWN-ISSUES entries (event payload size, "1,150 fan-out commits" wording) are not fixed yet.
 - 2026-11-11 — **section 17 on all 60 easy tasks:** `17. What breaks at 100×, 1,000× and 10,000×` (a table per task: the load at each multiple from section 4, the first thing to run out with the number that proves it, the change and what you give up, a rough bill; plus *what stays the same* and a 2–4 sentence *say it in an interview*). Driven by a new README *Scaling ladder cheat sheet* (100× scale the same design out · 1,000× change the shape: cells, regions, a different store · 10,000× change the problem: approximation, edge/client compute, product limits). Template and checker now require 17 sections. Many 10,000× rows exceed the real world and say so (thought experiments about the first physical or economic limit).
 
 ---

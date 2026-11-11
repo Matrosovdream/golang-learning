@@ -53,10 +53,11 @@ storage, is where a naive design falls over.
 | Ingest | ~2 TB/day, ~730 TB/year | 1M × 2 MB |
 | Views | ~1,160/s, peaks ~10k/s | 100M/day |
 | Egress without CDN | 100M × ~200 KB (medium) = 20 TB/day ≈ 2 Gbit/s average | CDN is not optional |
-| Processing | 1M images × ~200 ms CPU = ~55 CPU-hours/day ≈ 3 cores busy | cheap, but bursty |
+| Processing | 1M images × ~200 ms CPU = ~55 CPU-hours/day ÷ 24 h ≈ 2.3 cores busy on average; at the 60/s peak 60 × 0.2 s = ~12 cores | cheap, but bursty |
 | Metadata rows | 1M/day × ~300 B = 300 MB/day | trivial |
+| API calls | ~900/s at peak (assumption): 60 uploads/s × ~3 status polls ≈ 180/s, plus ~720/s gallery and image-page metadata reads (most of the 10k views/s hit the CDN directly on known URLs) | small: presigns and reads, no bytes |
 
-What the numbers tell us: storage grows by ~0.7 PB a year (object storage, fine); egress is the
+What the numbers tell us: storage grows by ~0.73 PB a year of originals, ~0.8 PB with variants (object storage, fine); egress is the
 dominant cost and must be served by a CDN; processing is small but must be **off the request
 path** so bursts don't block uploads.
 
@@ -84,7 +85,7 @@ path** so bursts don't block uploads.
               failure → status=rejected, reason
 
  4. viewers ──GET cdn.example/i/{sha}/t.webp──► CDN ──miss──► S3 (origin)
-    private: ──GET /i/{sha}/t.webp?Expires&Signature──► CDN verifies signed URL
+    private: ──GET /p/{image_id}/t.webp?Expires&Signature──► CDN verifies signed URL
 ```
 
 The API hands out a short-lived permission to write one object; the browser uploads straight to
@@ -97,9 +98,9 @@ the CDN caches forever.
 POST /uploads
   { "filename": "cat.jpg", "content_type": "image/jpeg", "size": 2048000, "visibility": "public" }
   → 201 { "image_id": "img_01J9…", "upload_url": "https://s3…/uploads/img_01J9…?X-Amz-Signature=…",
-          "expires_in": 900, "max_size": 20971520 }
+          "expires_in": 900, "max_size": 20971520 }     (size > max_size → 413 here, before any URL is issued)
 
-PUT {upload_url}   (client → S3 directly; S3 enforces content-length-range and content-type from the presign)
+PUT {upload_url}   (client → S3 directly; S3 rejects it unless the key, Content-Length and Content-Type match what was signed)
 
 POST /uploads/{image_id}/complete        → 202 { "status": "processing" }   (optional if S3 events are used)
 GET  /images/{image_id}                  → 200 { "status": "ready", "width": 4000, "height": 3000,
@@ -119,7 +120,7 @@ CREATE TABLE images (
     status        TEXT NOT NULL,                   -- pending | processing | ready | rejected | deleted
     visibility    TEXT NOT NULL,                   -- public | private
     upload_key    TEXT NOT NULL,                   -- uploads/img_…
-    blob_id       TEXT,                            -- FK → blobs.sha256 once processed
+    blob_id       TEXT,                            -- public images only: FK → blobs.sha256 once processed (private: NULL)
     width         INTEGER, height INTEGER,
     content_type  TEXT,
     reject_reason TEXT,
@@ -133,11 +134,12 @@ CREATE TABLE blobs (                               -- content-addressed, shared 
     size_bytes    BIGINT NOT NULL,
     variants      JSONB NOT NULL,                  -- { "t": "images/<sha>/t.webp", "m": …, "o": … }
     ref_count     INTEGER NOT NULL DEFAULT 0,
+    zero_since    TIMESTAMPTZ,                     -- set when ref_count drops to 0, cleared by the upsert; sweeper deletes after 24 h
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-Object storage layout: `uploads/{image_id}` (raw, lifecycle-deleted after 1 day), `images/{sha}/{t,m,o}.{ext}` (served, immutable).
+Object storage layout: `uploads/{image_id}` (raw, lifecycle-deleted after 1 day), `images/{sha}/{t,m,o}.{ext}` (served, immutable), `private/{image_id}/{t,m,o}.{ext}` (private images: never shared or deduplicated, see 9.5).
 
 ## 9. Deep dives
 
@@ -148,8 +150,12 @@ Object storage layout: `uploads/{image_id}` (raw, lifecycle-deleted after 1 day)
 | **Proxy through the API** (`POST /images` multipart) | one request; server sees bytes immediately | every upload holds an API server connection for seconds and streams 2–20 MB through it; at peaks the API tier is sized by upload bandwidth, not by API logic; a slow mobile client ties up a server |
 | **Presigned URL, direct to object storage** | API issues a credential (~1 ms), storage handles the bytes; scales with S3, not with us; resumable/multipart uploads come free | two steps for the client; validation must happen *after* upload (we never saw the bytes); needs CORS on the bucket |
 
-**Choice: presigned.** Constrain the presign: exact key, max size (`content-length-range`),
-allowed content type, 15-minute expiry. The client can lie about the type; we verify in processing.
+**Choice: presigned.** Constrain the presign: exact key, allowed content type, 15-minute expiry,
+and the exact `Content-Length` the client declared (the API rejects anything over 20 MB before it
+signs). A presigned **PUT** can pin an exact length but cannot say "up to N bytes"; the
+`content-length-range` condition belongs to presigned **POST** policies, the alternative if you want a
+range. The client can lie about the type, and S3 only checks the length that was signed, so the
+worker re-checks the real size and content in processing.
 
 ### 9.2 Validate by content, never by name
 
@@ -168,8 +174,13 @@ original keeps it only if the product needs it (default: strip there too).
 - Trigger: an S3 event notification on `uploads/` (or the client's `/complete` call) enqueues
   `process(image_id)`. Both can fire; the worker is idempotent: if the row is already `ready`, exit.
 - Steps: download → sniff → decode with limits → re-encode original (`o`) → resize to medium
-  (`m`) and thumbnail (`t`), WebP for both → compute `sha256` of the decoded, normalised original →
-  upload variants to `images/{sha}/…` → upsert `blobs`, set `images.blob_id`, `status = ready`.
+  (`m`) and thumbnail (`t`), WebP for both → compute `sha256` of the re-encoded original (it matches
+  identical files; near-duplicates are the pHash extension) → then, in **one DB transaction**: upsert
+  `blobs` (this takes the reference), upload the variants to `images/{sha}/…` (idempotent: same bytes,
+  same keys), set `images.blob_id` and `status = ready`, commit. One transaction, so a crash and
+  retry cannot count a reference twice; taking the reference *before* relying on the objects is what
+  makes the delete race in 9.6 safe. Private images skip all of this: variants go to
+  `private/{image_id}/…`, no `blobs` row.
 - Failure: a decode error marks `rejected` with a reason the UI can show; a transient error
   (S3 timeout) retries with backoff (task 10's playbook); repeated failures dead-letter.
 - Status: the client polls `GET /images/{id}` or subscribes via SSE. "Processing" usually lasts
@@ -192,18 +203,33 @@ original keeps it only if the product needs it (default: strip there too).
 
 The CDN caches public objects for anyone. Private objects need a check per viewer, but the CDN
 cannot call our database. Standard answer: **signed URLs**. The API, after checking ownership,
-returns `https://cdn…/i/{sha}/m.webp?Expires=1760349200&Signature=…` valid for, say, 1 hour.
+returns `https://cdn…/p/{image_id}/m.webp?Expires=1760349200&Signature=…` valid for, say, 1 hour.
 The CDN verifies the signature with a key we configured and serves from cache. Trade-off: a
 signed link can be shared until it expires; make the expiry short and re-sign on each page load.
 
+**Keep private files out of the content-addressed space.** The public space (`/i/{sha}/…`) needs
+no signature, and the hash is visible in every URL we hand out. If a private image lived there, or
+were deduplicated with a public copy, anyone who ever saw its URL could keep fetching it unsigned
+after the signature expired. So private variants live under `private/{image_id}/…` (URL
+`/p/{image_id}/…`), behind a separate CDN behaviour that *requires* a valid signature (CloudFront: a
+trusted key group), and are never deduplicated. That also avoids a dedup side channel (an upload that
+finishes instantly tells you someone already stored that exact file). Delete is one step and one purge.
+"Make public later" = copy into the content-addressed space as a new upload.
+
 ### 9.6 Dedup and deletion
 
-- Dedup by `sha256` of the normalised original: two users uploading the same photo share one
+- Dedup (public images only) by `sha256` of the re-encoded original: two users uploading the same photo share one
   `blobs` row and one set of variants; `ref_count` tracks owners. Saves storage for memes and reposts
   (often 20–40% in practice).
-- **Delete** = mark the `images` row `deleted`, decrement `ref_count`; when it hits zero, a job
-  deletes the objects and purges the CDN paths. Because URLs are content-addressed and shared, a
-  deleted public image remains cached at the edge until purged: purge explicitly.
+- **Delete** = mark the `images` row `deleted`, decrement `ref_count` and set `zero_since` if it
+  reached zero; when a blob has been at zero for 24 h, a sweeper deletes the objects and purges the
+  CDN paths. Because URLs are content-addressed and shared, a deleted public image remains cached at
+  the edge until purged: purge explicitly.
+- **Why the 24 h grace:** deleting at the instant of zero races with a new upload of the same photo
+  (it finds the blob, bumps the count to 1, and the delete job then removes the objects it depends
+  on). The sweeper locks the row (`SELECT … FOR UPDATE`), re-checks `ref_count = 0`, deletes the
+  objects, then the row; the uploader's upsert (9.3) waits on that same lock, so exactly one of them
+  wins and the other sees a consistent state.
 - Raw uploads in `uploads/` are deleted by a lifecycle rule after 24 h regardless (processed or not).
 
 ## 10. Scaling, bottlenecks & failure modes
@@ -217,8 +243,10 @@ signed link can be shared until it expires; make the expiry short and re-sign on
   CDN for cached objects. Metadata API is unaffected.
 - **Queue down:** uploads land in S3 and sit at `pending`; a reconciler job lists `uploads/` older
   than 1 minute with `status = pending` and enqueues them when the queue is back.
-- **Cost:** egress dominates; CDN hit rate is the lever. Storage: tier originals to infrequent
-  access after 30 days; variants stay hot.
+- **Cost:** egress dominates. On CloudFront you pay for every byte sent to viewers, hit or miss, so
+  the levers are bytes per view (WebP, a smaller medium variant) and a committed-use contract; the
+  hit rate lowers *origin* load (S3 requests, latency), not the egress bill. Storage: tier originals
+  to infrequent access after 30 days; variants stay hot.
 - **Abuse:** per-user upload quotas (task 03), the async scanner hook, and a takedown path that
   purges the CDN.
 
@@ -264,7 +292,7 @@ signed link can be shared until it expires; make the expiry short and re-sign on
 
 - Related lessons: [19 stdlib tour](../../19-stdlib-tour.md) (`io`, streaming, `image` package), [44 Background jobs](../../44-background-jobs-queues.md) (the pipeline), [57 Web security](../../57-web-security.md) (`nosniff`, separate origin, SSRF when fetching by URL), [36 Resilience](../../36-resilience-patterns.md) (retries to S3), [55 Data pipelines](../../55-data-pipelines.md).
 - Sniffing: `net/http.DetectContentType` on the first 512 bytes. Decoding: `image.DecodeConfig` first (cheap: dimensions only) to reject bombs, then `image.Decode`. Resizing: `golang.org/x/image/draw` (stdlib-adjacent) or `disintegration/imaging`; `h2non/bimg` (libvips) for speed.
-- Presign: `aws-sdk-go-v2/service/s3` `PresignClient.PresignPutObject` with `ContentLength` and `ContentType` conditions.
+- Presign: `aws-sdk-go-v2/service/s3` `PresignClient.PresignPutObject` with `ContentLength` and `ContentType` set (they become signed headers, so S3 rejects a PUT that differs); `PresignPostObject` if you want a `content-length-range` policy.
 - Packages: `image/jpeg`, `image/png`, `golang.org/x/image/webp` (decode only; encode via `chai2010/webp` or libvips), `crypto/sha256`.
 
 ## 14. Extensions
@@ -300,11 +328,11 @@ Nothing to size: **S3** (peak ~60 PUT/s from clients + ~180/s from workers and ~
 | API: 3 × `c7g.large` ($159) + ALB (≈ $30) | $190 |
 | Postgres: `db.m7g.large` ≈ $120, Multi-AZ doubles; 200 GB gp3 × 2 = $32 | $270 |
 | SQS | $70 |
-| **Total** | **≈ $71,500** (≈ $71,100 with 1-year commitments: the $1,040 of servers hardly moves it) |
+| **Total** | **≈ $71,500** (≈ $71,100 with 1-year commitments: the $1,100 of servers hardly moves it) |
 
 Not counted (off the sheet, from memory): CloudFront request fees on ~3B views a month and S3 request fees on ~120M PUTs, each a few $k at most.
 
-- **Biggest line and why:** CloudFront data out (72 %), then S3 storage (26 %). Everything with an instance is 1.6 %. CloudFront bills the bytes it sends to viewers whether the CDN hit or missed, and S3 to CloudFront is free, so on AWS the CDN hit rate (section 10) lowers origin load, not this line. The levers are bytes per view (WebP, smaller `m` variant), a committed-use contract, and for storage tiering originals to infrequent access and dedup.
+- **Biggest line and why:** CloudFront data out (72 %), then S3 storage (26 %). Everything with an instance is 1.5 %. CloudFront bills the bytes it sends to viewers whether the CDN hit or missed, and S3 to CloudFront is free, so on AWS the CDN hit rate (section 10) lowers origin load, not this line. The levers are bytes per view (WebP, smaller `m` variant), a committed-use contract, and for storage tiering originals to infrequent access and dedup.
 - **What changes at 10×:** 600 uploads/s ⇒ 120 vCPU ⇒ N = ceil(120 ÷ 4.27) = 29 → 30 × `c7g.2xlarge` (≈ $6.4k, a lot less on Spot), still 0.67 Gbit/s per node; Postgres at ~1,800 commits/s ⇒ `db.m7g.2xlarge` with ~4k IOPS. Neither is the problem: data out ≈ 6 PB a month (≈ $0.5M at first-tier price) and ≈ 8 PB stored after a year (≈ $186k a month at the anchor) make bytes, tiering and CDN contracts the whole business.
 
 ## 16. Database choice and why
